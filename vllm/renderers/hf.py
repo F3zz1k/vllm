@@ -6,10 +6,12 @@ import asyncio
 import copy
 import inspect
 import itertools
+import json
+import os
 import weakref
 from collections import defaultdict, deque
-from collections.abc import Sequence
-from functools import lru_cache
+from collections.abc import Callable, Sequence
+from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Any, Final, Literal, cast, overload
 
 import jinja2
@@ -71,6 +73,7 @@ if TYPE_CHECKING:
         ChatTemplateContentFormatOption,
         ConversationMessage,
     )
+    from vllm.tokenizers import TokenizerLike
 
     from .inputs import DictPrompt
     from .params import ChatParams
@@ -506,6 +509,98 @@ def _detect_content_format(
         return default
     else:
         return "openai"
+
+
+# Together the spellings of these differ in their first and last characters,
+# so the common prefix and suffix of the renders stop exactly at the value.
+_TOOL_ARG_PROBES = ("x_probe", False, None, 1.5, {"k": "v"}, ["v"])
+
+
+@lru_cache(maxsize=32)
+def _detect_tool_arg_spellings(
+    chat_template: str,
+) -> dict[type, Callable[[Any], str]] | None:
+    """Learn how the template renders each JSON type in tool call arguments,
+    as ``tojson`` or as Python ``str``.  Returns ``None`` when it does not
+    render the arguments value by value."""
+    import transformers.utils.chat_template_utils as hf_chat_utils
+
+    try:
+        template = hf_chat_utils._compile_jinja_template(chat_template)
+        renders = [
+            template.render(
+                messages=[
+                    {"role": "user", "content": "probe"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_0",
+                                "type": "function",
+                                "function": {
+                                    "name": "probe",
+                                    "arguments": {"probe": value},
+                                },
+                            }
+                        ],
+                    },
+                ]
+            )
+            for value in _TOOL_ARG_PROBES
+        ]
+    except Exception:
+        logger.debug("Could not render a probe tool call", exc_info=True)
+        return None
+
+    # Templates such as MiniMax-M3's omit None arguments, so None takes no part
+    # in finding where the value starts and ends.
+    bounds = [r for v, r in zip(_TOOL_ARG_PROBES, renders) if v is not None]
+    start = len(os.path.commonprefix(bounds))
+    end = len(os.path.commonprefix([r[::-1] for r in bounds]))
+    spellings: dict[type, Callable[[Any], str]] = {}
+    for value, rendered in zip(_TOOL_ARG_PROBES, renders):
+        for spell in (partial(json.dumps, ensure_ascii=False), str):
+            if spell(value) == rendered[start : len(rendered) - end]:
+                spellings[type(value)] = spell
+                break
+    if str not in spellings:
+        return None
+    if float in spellings:
+        spellings[int] = spellings[float]
+    return spellings
+
+
+def resolve_tool_arg_spellings(
+    tokenizer: TokenizerLike,
+    chat_template: str | None,
+    model_config: ModelConfig | None,
+) -> dict[type, Callable[[Any], str]] | None:
+    """See :func:`vllm.tool_parsers.utils.coerce_if_lossless`."""
+    if not isinstance(tokenizer, HfTokenizer):
+        return None
+    if model_config is not None:
+        from vllm.renderers.registry import RENDERER_REGISTRY
+        from vllm.tokenizers.registry import tokenizer_args_from_config
+
+        renderer_mode, *_ = tokenizer_args_from_config(model_config)
+        if not issubclass(
+            RENDERER_REGISTRY.load_renderer_cls(renderer_mode), HfRenderer
+        ):
+            return None
+    try:
+        # Arguments are only parsed when the request has tools.
+        if model_config is None:
+            # Serving always passes model_config; parsers built directly don't.
+            resolved = tokenizer.get_chat_template(chat_template, tools=[])
+        else:
+            resolved = resolve_chat_template(
+                tokenizer, chat_template, tools=[], model_config=model_config
+            )
+    except Exception:
+        logger.debug("Could not resolve the chat template", exc_info=True)
+        return None
+    return None if resolved is None else _detect_tool_arg_spellings(resolved)
 
 
 @lru_cache(maxsize=32)

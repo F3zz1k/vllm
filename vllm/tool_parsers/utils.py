@@ -6,7 +6,7 @@ import json
 import keyword as _python_keyword
 import math
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
@@ -1236,6 +1236,43 @@ def coerce_to_schema_type(value: str, schema_type: str | list[str]) -> Any:
     if not _is_json_finite(parsed):
         return value
     return parsed
+
+
+def coerce_if_lossless(
+    value: Any,
+    schema_type: str | list[str],
+    spellings: dict[type, Callable[[Any], str]] | None,
+) -> Any:
+    """Coerce *value* like :func:`coerce_to_schema_type`, unless the chat
+    template would spell the result differently from the original.
+
+    The client sends the coerced value back and the template renders it into
+    the next prompt, so a respelling ("False" -> false) means the model sees
+    a history it did not write.  A lossy rewrite is worse than a type
+    mismatch the client can see, so the original is returned instead.
+
+    Args:
+        value: The raw string from the model output, or a JSON value.
+        schema_type: One or more JSON Schema type strings.
+        spellings: How the chat template renders each Python type, from
+            ``resolve_tool_arg_spellings``.  ``None`` skips the check; a
+            type with no known spelling keeps the original value.
+
+    """
+    raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    coerced = coerce_to_schema_type(raw, schema_type)
+    if spellings is None:
+        return coerced
+    if type(value) not in spellings:
+        return value
+    text = spellings[type(value)](value)
+    # "1.0" comes back as int 1, which renders as "1".
+    candidates = (coerced, float(raw)) if type(coerced) is int else (coerced,)
+    for candidate in candidates:
+        spell = spellings.get(type(candidate))
+        if spell is not None and spell(candidate) == text:
+            return candidate
+    return value
 
 
 def compute_tool_delta(

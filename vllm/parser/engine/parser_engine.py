@@ -7,9 +7,9 @@ extraction with a single :class:`StreamingParserEngine`.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import regex as re
 
@@ -28,7 +28,7 @@ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserSt
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.renderers.chat_utils import get_tool_call_id_type, make_tool_call_id
 from vllm.tool_parsers.utils import (
-    coerce_to_schema_type,
+    coerce_if_lossless,
     extract_types_from_schema,
     find_tool_name,
     find_tool_properties,
@@ -97,10 +97,17 @@ class ParserEngine(Parser):
         *,
         parser_engine_config: ParserEngineConfig,
         model_config=None,
+        chat_template: str | None = None,
+        tool_call_lossless_args: bool = False,
+        lossless_exempt_tools: frozenset[str] = frozenset(),
         **kwargs,
     ) -> None:
         self.model_tokenizer = tokenizer
         self._tools = tools
+        self._chat_template = chat_template
+        self._tool_call_lossless_args = tool_call_lossless_args
+        self._model_config = model_config
+        self._lossless_exempt_tools = lossless_exempt_tools
         self._stream_state = StreamState(
             tool_call_id_type=(
                 get_tool_call_id_type(model_config)
@@ -175,6 +182,29 @@ class ParserEngine(Parser):
     def vocab(self) -> dict[str, int]:
         return self.model_tokenizer.get_vocab()
 
+    @cached_property
+    def _arg_spellings(self) -> dict[type, Callable[[Any], str]] | None:
+        if not self._tool_call_lossless_args:
+            return None
+        from vllm.renderers.hf import resolve_tool_arg_spellings
+
+        spellings = resolve_tool_arg_spellings(
+            self.model_tokenizer, self._chat_template, self._model_config
+        )
+        if spellings is None:
+            logger.warning_once(
+                "--tool-call-lossless-args has no effect for a chat template "
+                "that is not rendered through Jinja or does not render tool "
+                "call arguments value by value."
+            )
+        return spellings
+
+    def _tool_arg_spellings(self, func_name: str) -> dict | None:
+        # A structural tag spells the arguments of strict tools, not the model.
+        if func_name in self._lossless_exempt_tools:
+            return None
+        return self._arg_spellings
+
     # ── Engine lifecycle ──────────────────────────────────────────────
 
     @property
@@ -248,14 +278,16 @@ class ParserEngine(Parser):
     # ── Schema-aware type correction ─────────────────────────────────
 
     @staticmethod
-    def _coerce_value(value: object, schema: dict) -> tuple[object, bool]:
+    def _coerce_value(
+        value: object, schema: dict, spellings: dict | None = None
+    ) -> tuple[object, bool]:
         """Coerce a single value according to its schema.
 
         Returns ``(coerced_value, changed)``.
         """
         if isinstance(value, str):
             types = extract_types_from_schema(schema)
-            coerced = coerce_to_schema_type(value, types)
+            coerced = coerce_if_lossless(value, types, spellings)
             if coerced is not value:
                 return coerced, True
             return value, False
@@ -263,7 +295,7 @@ class ParserEngine(Parser):
         if isinstance(value, dict):
             nested_props = schema.get("properties")
             if isinstance(nested_props, dict):
-                _, changed = ParserEngine._coerce_dict(value, nested_props)
+                _, changed = ParserEngine._coerce_dict(value, nested_props, spellings)
                 return value, changed
             return value, False
 
@@ -273,7 +305,7 @@ class ParserEngine(Parser):
                 changed = False
                 for i, item in enumerate(value):
                     coerced, item_changed = ParserEngine._coerce_value(
-                        item, items_schema
+                        item, items_schema, spellings
                     )
                     if item_changed:
                         value[i] = coerced
@@ -282,21 +314,22 @@ class ParserEngine(Parser):
             return value, False
 
         types = extract_types_from_schema(schema)
-        as_str = json.dumps(value, ensure_ascii=False)
-        coerced = coerce_to_schema_type(as_str, types)
+        coerced = coerce_if_lossless(value, types, spellings)
         if type(coerced) is not type(value) or coerced != value:
             return coerced, True
         return value, False
 
     @staticmethod
-    def _coerce_dict(args: dict, properties: dict) -> tuple[dict, bool]:
+    def _coerce_dict(
+        args: dict, properties: dict, spellings: dict | None = None
+    ) -> tuple[dict, bool]:
         """Coerce all values in *args* using *properties* schemas."""
         changed = False
         for key, value in args.items():
             prop = properties.get(key)
             if not isinstance(prop, dict):
                 continue
-            coerced, val_changed = ParserEngine._coerce_value(value, prop)
+            coerced, val_changed = ParserEngine._coerce_value(value, prop, spellings)
             if val_changed:
                 args[key] = coerced
                 changed = True
@@ -388,10 +421,10 @@ class ParserEngine(Parser):
     def _fix_arg_types(self, args_json: str, func_name: str) -> str:
         """Correct parameter types using the tool schema.
 
-        String values are coerced via :func:`coerce_to_schema_type`.
-        Nested objects and arrays are recursed into when the schema
-        defines ``properties`` or ``items``.  Without a schema, values
-        stay as strings.
+        String values are coerced via :func:`coerce_if_lossless`, so a
+        value keeps its spelling in the chat template.  Nested objects and
+        arrays are recursed into when the schema defines ``properties`` or
+        ``items``.  Without a schema, values stay as strings.
         """
         if not self._tools or not func_name:
             return args_json
@@ -406,7 +439,9 @@ class ParserEngine(Parser):
         if not properties:
             return args_json
 
-        _, changed = self._coerce_dict(args, properties)
+        _, changed = self._coerce_dict(
+            args, properties, self._tool_arg_spellings(func_name)
+        )
 
         if changed:
             return json.dumps(args, ensure_ascii=False)

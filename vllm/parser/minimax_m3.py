@@ -34,7 +34,7 @@ from vllm.parser.engine.parser_engine_config import (
     Transition,
 )
 from vllm.tool_parsers.utils import (
-    coerce_to_schema_type,
+    coerce_if_lossless,
     extract_types_from_schema,
     find_tool_properties,
 )
@@ -148,7 +148,9 @@ def _container_schema(schema: dict[str, Any]) -> tuple[str, dict[str, Any]] | No
     return None
 
 
-def _convert_element(value: _Element, schema: Any) -> Any:
+def _convert_element(
+    value: _Element, schema: Any, spellings: dict | None = None
+) -> Any:
     if not isinstance(schema, dict):
         schema = None
     container = _container_schema(schema) if schema is not None else None
@@ -160,16 +162,20 @@ def _convert_element(value: _Element, schema: Any) -> Any:
         # The template renders an empty list or dict as an empty element.
         if container is not None and "string" not in types and not value.strip():
             return [] if container[0] == "array" else {}
-        return coerce_to_schema_type(value, types)
+        return coerce_if_lossless(value, types, spellings)
 
     if container is not None and container[0] == "array":
         items = container[1].get("items")
-        return [_convert_element(child, items) for _, child in value]
-    return _convert_object(value, container[1] if container is not None else None)
+        return [_convert_element(child, items, spellings) for _, child in value]
+    return _convert_object(
+        value, container[1] if container is not None else None, spellings
+    )
 
 
 def _convert_object(
-    elements: list[tuple[str, _Element]], schema: dict[str, Any] | None
+    elements: list[tuple[str, _Element]],
+    schema: dict[str, Any] | None,
+    spellings: dict | None = None,
 ) -> dict[str, Any]:
     """Convert named elements to an object; repeated names collect into a list."""
     properties = (schema or {}).get("properties") or {}
@@ -177,7 +183,9 @@ def _convert_object(
     result: dict[str, Any] = {}
     repeated: set[str] = set()
     for name, element in elements:
-        converted = _convert_element(element, properties.get(name, additional))
+        converted = _convert_element(
+            element, properties.get(name, additional), spellings
+        )
         if name not in result:
             result[name] = converted
         elif name in repeated:
@@ -192,9 +200,10 @@ def _minimax_m3_arg_converter(
     raw_args: str,
     partial: bool,
     properties: dict[str, Any] | None = None,
+    spellings: dict | None = None,
 ) -> str:
     params = _parse_invoke_params(raw_args)
-    arguments = _convert_object(params, {"properties": properties or {}})
+    arguments = _convert_object(params, {"properties": properties or {}}, spellings)
     return json.dumps(arguments, ensure_ascii=False)
 
 
@@ -290,4 +299,6 @@ class MinimaxM3Parser(ParserEngine):
             (slot.name for slot in self._tool_slots if slot.args == raw_args), ""
         )
         properties = find_tool_properties(self._tools, func_name.strip())
-        return _minimax_m3_arg_converter(raw_args, partial, properties)
+        return _minimax_m3_arg_converter(
+            raw_args, partial, properties, self._tool_arg_spellings(func_name.strip())
+        )

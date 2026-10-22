@@ -89,6 +89,7 @@ async def init_render_app_state(
         exclude_tools_when_tool_choice_none=args.exclude_tools_when_tool_choice_none,
         tool_parser=args.tool_call_parser,
         tool_strict_level=args.tool_strict_level,
+        tool_call_lossless_args=args.tool_call_lossless_args,
         reasoning_parser=reasoning_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
         log_error_stack=args.log_error_stack,

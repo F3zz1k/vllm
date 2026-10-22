@@ -156,6 +156,12 @@ vllm serve ... --tool-strict-level function
 
 The floor never relaxes a constraint the request would already receive: tools the client marked `strict: true` keep their schemas at every level. With `tool_choice="auto"`, the grammar does not force a tool call; a plain text response stays valid. `VLLM_ENFORCE_STRICT_TOOL_CALLING=false` disables structural tags entirely and takes precedence over this option.
 
+### Lossless Argument Types
+
+Tool parsers coerce argument values to the types their parameter schemas declare, which can respell what the model wrote: the client sends the typed value back, and the chat template renders it into the next prompt differently from the model's own output. With `--tool-call-lossless-args`, a value is coerced only when the chat template renders the typed value back as exactly the model's text, and otherwise stays a string, so clients see a type mismatch instead of a silent rewrite of the conversation. For example, under Qwen3.6 and later templates `False` stays `"False"`, and under Qwen3-Coder style templates lowercase `true` and `null` stay strings. Arguments of tools whose schemas a structural tag enforces are always coerced; this is decided from the tools and `--tool-strict-level`, so a strict tool is coerced even on a request where no structural tag applies, for example `tool_choice="auto"` with a structured output constraint xgrammar does not support. The option is off by default.
+
+The option applies only to tool parsers built on the parser engine (such as `qwen3_coder` and `minimax_m3`) and to prompts rendered through a Jinja chat template that renders tool call arguments value by value, in the Python API server. With another tool parser, a Python renderer (such as DeepSeek V3.2 or Mistral) or a template it cannot probe, it logs a warning and arguments are coerced as without it.
+
 ## Automatic Function Calling
 
 To enable this feature, you should set the following flags:

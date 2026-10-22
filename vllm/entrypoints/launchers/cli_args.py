@@ -135,6 +135,13 @@ class BaseFrontendArgs:
     tool-call envelope (markup and function name) for every request with
     tools; `parameter` additionally pins argument schemas, as if every tool
     were `strict: true`."""
+    tool_call_lossless_args: bool = False
+    """Coerce a tool call argument to its schema type only when the chat
+    template renders the typed value back as the text the model wrote, so the
+    next prompt repeats the model's own tokens. Values the template would
+    respell stay strings, so clients may see a type mismatch. Applies only to
+    parser engine tool parsers with a Jinja chat template; otherwise a warning
+    is logged."""
     tool_server: str | None = None
     """Comma-separated list of host:port pairs (IPv4, IPv6, or hostname).
     Examples: 127.0.0.1:8000, [::1]:8000, localhost:1234. Or `demo` for

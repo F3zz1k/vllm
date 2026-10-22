@@ -133,6 +133,7 @@ class OpenAIServingChat(GenerateBaseServing):
         exclude_tools_when_tool_choice_none: bool = False,
         tool_parser: str | None = None,
         tool_strict_level: str = "auto",
+        tool_call_lossless_args: bool = False,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
         enable_log_outputs: bool = False,
@@ -150,6 +151,7 @@ class OpenAIServingChat(GenerateBaseServing):
         self.online_renderer = online_renderer
         self.response_role = response_role
         self.chat_template = chat_template
+        self.tool_call_lossless_args = tool_call_lossless_args
         self.chat_template_content_format: Final = chat_template_content_format
         self.trust_request_chat_template = trust_request_chat_template
         self.default_chat_template_kwargs = default_chat_template_kwargs or {}
@@ -213,6 +215,10 @@ class OpenAIServingChat(GenerateBaseServing):
             request.tools,
             chat_template_kwargs=chat_template_kwargs,
             model_config=self.model_config,
+            **Parser.lossless_args_kwargs(
+                self.tool_call_lossless_args,
+                request.chat_template or self.chat_template,
+            ),
         )
 
     def _engine_chat_template_kwargs(

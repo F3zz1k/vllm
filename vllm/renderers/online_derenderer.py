@@ -70,6 +70,7 @@ class OnlineDerenderer:
         tool_parser: str | None = None,
         reasoning_parser: str | None = None,
         tool_strict_level: str = "auto",
+        tool_call_lossless_args: bool = False,
         default_chat_template_kwargs: dict[str, Any] | None = None,
         log_error_stack: bool = False,
     ) -> None:
@@ -91,6 +92,7 @@ class OnlineDerenderer:
         )
 
         self.chat_template = chat_template
+        self.tool_call_lossless_args = tool_call_lossless_args
         self.chat_template_content_format: ChatTemplateContentFormatOption = (
             chat_template_content_format
         )
@@ -257,6 +259,10 @@ class OnlineDerenderer:
             chat_request.tools,
             chat_template_kwargs=chat_template_kwargs,
             model_config=self.model_config,
+            **Parser.lossless_args_kwargs(
+                self.tool_call_lossless_args,
+                chat_request.chat_template or self.chat_template,
+            ),
         )
         if prompt_token_ids is not None:
             parser.set_prompt_token_ids(prompt_token_ids)
@@ -544,6 +550,10 @@ class OnlineDerenderer:
             chat_request.tools,
             chat_template_kwargs=self._resolve_chat_template_kwargs(chat_request),
             model_config=self.model_config,
+            **Parser.lossless_args_kwargs(
+                self.tool_call_lossless_args,
+                chat_request.chat_template or self.chat_template,
+            ),
         )
 
         # Ephemeral incremental detok window, local to this call. Threaded

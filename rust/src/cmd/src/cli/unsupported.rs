@@ -452,6 +452,16 @@ pub struct ServerUnsupportedArgs {
     )]
     pub exclude_tools_when_tool_choice_none: Option<Unsupported>,
 
+    /// Coerce a tool call argument to its schema type only when the chat
+    /// template renders the typed value back as the text the model wrote.
+    #[arg(
+        long,
+        visible_alias = "no-tool-call-lossless-args",
+        default_missing_value = "true",
+        num_args = 0..=1
+    )]
+    pub tool_call_lossless_args: Option<Unsupported>,
+
     /// Special the tool parser plugin write to parse the model-generated tool
     /// into OpenAI API format, the name register in this plugin can be used in
     /// `--tool-call-parser`.

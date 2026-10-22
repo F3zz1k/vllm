@@ -7,7 +7,7 @@ from abc import abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
-from openai.types.responses import ToolChoiceCustom, ToolChoiceFunction
+from openai.types.responses import FunctionTool, ToolChoiceCustom, ToolChoiceFunction
 from pydantic import TypeAdapter, ValidationError
 from xgrammar import Grammar, StructuralTag
 from xgrammar.structural_tag import (
@@ -21,6 +21,7 @@ from xgrammar.structural_tag import (
     TriggeredTagsFormat,
 )
 
+from vllm import envs
 from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
@@ -30,6 +31,7 @@ from vllm.entrypoints.generate.base.protocol import (
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
+    ChatCompletionToolsParam,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.exceptions import VLLMValidationError
@@ -54,6 +56,7 @@ from vllm.tool_parsers.streaming import (
     extract_required_tool_call_streaming,
 )
 from vllm.tool_parsers.structural_tag_registry import (
+    _tool_is_strict,
     get_structural_tag_tools,
     limit_to_single_tool_call,
     resolve_tool_strictness,
@@ -142,10 +145,18 @@ class Parser:
             # the reasoning parser (e.g. chat_template_kwargs for per-request
             # thinking toggles); legacy ToolParser classes take none.
             if issubclass(self.__class__.tool_parser_cls, ParserEngineToolAdapter):
+                if kwargs.get("tool_call_lossless_args"):
+                    kwargs["lossless_exempt_tools"] = self._strict_tool_names(tools)
                 self._tool_parser = self.__class__.tool_parser_cls(
                     tokenizer, tools, model_config=model_config, **kwargs
                 )
             else:
+                if kwargs.get("tool_call_lossless_args"):
+                    logger.warning_once(
+                        "--tool-call-lossless-args has no effect with %s, "
+                        "which is not built on the parser engine.",
+                        self.__class__.tool_parser_cls.__name__,
+                    )
                 self._tool_parser = self.__class__.tool_parser_cls(tokenizer, tools)
 
         self._engine_based = (
@@ -170,6 +181,40 @@ class Parser:
                 else "random"
             ),
             engine_based=self._engine_based,
+        )
+
+    @staticmethod
+    def lossless_args_kwargs(enabled: bool, chat_template: str | None) -> dict:
+        """Constructor kwargs for --tool-call-lossless-args, none when off."""
+        if not enabled:
+            return {}
+        return {"tool_call_lossless_args": True, "chat_template": chat_template}
+
+    def _strict_tool_names(self, tools: list[Tool] | None) -> frozenset[str]:
+        """Names of the tools whose arguments a structural tag constrains."""
+        tool_parser = self.__class__.tool_parser_cls
+        if (
+            not tools
+            or tool_parser is None
+            or tool_parser.structural_tag_model is None
+            or not envs.VLLM_ENFORCE_STRICT_TOOL_CALLING
+        ):
+            return frozenset()
+        strict_level = self.tool_strict_level
+        if (
+            strict_level == ToolStrictLevel.AUTO
+            and tool_parser.default_tool_strict_level is not None
+        ):
+            strict_level = tool_parser.default_tool_strict_level
+        tag_tools = get_structural_tag_tools(
+            tool_parser.structural_tag_model, tools, "auto"
+        )
+        return frozenset(
+            tool.name if isinstance(tool, FunctionTool) else tool.function.name
+            for tool in resolve_tool_strictness(tag_tools, "required", strict_level)
+            or ()
+            if isinstance(tool, (FunctionTool, ChatCompletionToolsParam))
+            and _tool_is_strict(tool)
         )
 
     @property

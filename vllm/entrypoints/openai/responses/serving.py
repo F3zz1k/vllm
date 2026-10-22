@@ -114,6 +114,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         enable_auto_tools: bool = False,
         tool_parser: str | None = None,
         tool_strict_level: str = "auto",
+        tool_call_lossless_args: bool = False,
         tool_server: ToolServer | None = None,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
@@ -130,6 +131,7 @@ class OpenAIServingResponses(GenerateBaseServing):
 
         self.online_renderer = online_renderer
         self.chat_template = chat_template
+        self.tool_call_lossless_args = tool_call_lossless_args
         self.chat_template_content_format: Final = chat_template_content_format
         self.chat_template_kwargs = default_chat_template_kwargs or {}
         self.enable_log_outputs = enable_log_outputs
@@ -224,6 +226,9 @@ class OpenAIServingResponses(GenerateBaseServing):
             request.tools,
             chat_template_kwargs=chat_template_kwargs,
             model_config=self.model_config,
+            **Parser.lossless_args_kwargs(
+                self.tool_call_lossless_args, self.chat_template
+            ),
         )
 
     def _validate_generator_input(
