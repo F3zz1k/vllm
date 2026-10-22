@@ -2022,6 +2022,7 @@ class VllmConfig:
         self._validate_profiler_config()
         self._validate_batch_sharded_sampling()
         self._validate_adaptive_verification()
+        self._validate_mamba_finish_checkpoint()
 
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
@@ -2996,6 +2997,9 @@ class VllmConfig:
         if self.parallel_config.enable_batch_sharded_sampling:
             unsupported.append("batch-sharded sampling")
 
+        if self.cache_config.enable_mamba_finish_checkpoint:
+            unsupported.append("mamba finish checkpoint")
+
         return unsupported
 
     def _validate_adaptive_verification(self) -> None:
@@ -3080,6 +3084,59 @@ class VllmConfig:
                 "the --enable-batch-sharded-sampling flag, but is not supported "
                 "in this configuration for the following reason(s): "
                 f"{'; '.join(blockers)}."
+            )
+
+    def _validate_mamba_finish_checkpoint(self) -> None:
+        """Validate `enable_mamba_finish_checkpoint` against the rest of the config."""
+        if not self.cache_config.enable_mamba_finish_checkpoint:
+            return
+
+        blockers: list[str] = []
+        if not (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            blockers.append("it needs prefix caching with mamba_cache_mode='align'")
+        if self.model_config is not None and not self.model_config.is_hybrid:
+            blockers.append("it needs a hybrid attention and Mamba model")
+        if self.parallel_config.pipeline_parallel_size > 1:
+            blockers.append("pipeline parallelism is not supported")
+        if (
+            self.parallel_config.decode_context_parallel_size > 1
+            or self.parallel_config.prefill_context_parallel_size > 1
+        ):
+            blockers.append("context parallelism is not supported")
+        if self.kv_transfer_config is not None and (
+            self.kv_transfer_config.kv_connector
+            not in (None, "OffloadingConnector", "SimpleCPUOffloadConnector")
+        ):
+            blockers.append("only the offloading KV connectors are supported")
+        spec = self.speculative_config
+        if (
+            spec is not None
+            and (spec.use_eagle() or spec.uses_draft_model())
+            and (
+                spec.draft_model_config.is_hybrid
+                or spec.draft_model_config.is_attention_free
+            )
+        ):
+            blockers.append("a draft model with Mamba layers is not supported")
+        if self.cache_config.use_replayssm:
+            blockers.append("ReplaySSM defers the Mamba state writes")
+        if self.num_prefill_lookahead_tokens > 1:
+            blockers.append(
+                "multi-module MTP draft KV depends on tokens past the last one"
+            )
+        if (
+            self.kv_events_config is not None
+            and self.kv_events_config.enable_kv_cache_events
+        ):
+            blockers.append("its cache entries are not published as KV events")
+
+        if blockers:
+            raise ValueError(
+                "--enable-mamba-finish-checkpoint is not supported in this "
+                f"configuration: {'; '.join(blockers)}."
             )
 
     def _get_dbo_unsupported_features(self) -> list[str]:

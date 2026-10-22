@@ -169,6 +169,7 @@ class ModelState(ABC):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor,
         num_computed_tokens: torch.Tensor | None = None,
+        sampled_tokens: torch.Tensor | None = None,
     ) -> None:
         return None
 

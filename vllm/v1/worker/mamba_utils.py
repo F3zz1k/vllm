@@ -409,6 +409,9 @@ def postprocess_mamba_fused_kernel(
     # PRECOMPUTED_NEW_COMPUTED: when True, num_computed_tokens_ptr already holds
     # the post-step new_num_computed value (V2 supplies the advanced count).
     PRECOMPUTED_NEW_COMPUTED: tl.constexpr = False,
+    # FINALIZE: save the state after new_num_computed tokens rather than the
+    # block-aligned one (the final state of a finished request).
+    FINALIZE: tl.constexpr = False,
     # TEMPORAL_TILES: when > 1, the temporal copy body is partitioned across
     # TEMPORAL_TILES CTAs along the u64 inner range. Callers must launch a
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
@@ -456,6 +459,14 @@ def postprocess_mamba_fused_kernel(
         new_num_computed = num_tokens_running_state + num_accepted - 1
 
     aligned_new_computed = (new_num_computed // block_size) * block_size
+    dest_block_idx = aligned_new_computed // block_size - 1
+    if FINALIZE:
+        # Save the state after the last computed token to the block holding
+        # that token. A block-aligned state is already saved by the postprocess.
+        if aligned_new_computed == new_num_computed:
+            return
+        aligned_new_computed = new_num_computed
+        dest_block_idx += 1
 
     needs_copy = aligned_new_computed >= num_tokens_running_state
 
@@ -464,7 +475,6 @@ def postprocess_mamba_fused_kernel(
 
     # Compute copy parameters
     accept_token_bias = aligned_new_computed - num_tokens_running_state
-    dest_block_idx = aligned_new_computed // block_size - 1
 
     # Update accepted-token count before early exits (per-request, so only
     # state_idx == 0 writes). Also guard on tile_idx == 0 so tiles > 0
@@ -1252,9 +1262,11 @@ class MambaSpecDecodeGPUContext:
         state_idx_gpu: torch.Tensor,
         new_num_computed_tokens_gpu: torch.Tensor,
         idx_mapping: torch.Tensor,
+        finalize: bool = False,
     ) -> None:
         """V2 align postprocess: save the running state to the block-aligned
         position after spec-decode acceptance leaves the sequence non-aligned.
+        With ``finalize``, save the state after the last computed token instead.
 
         ``num_accepted_tokens_gpu`` is updated in place while the kernel reads
         from a snapshot to avoid cross-program races when the accepted position
@@ -1297,6 +1309,7 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
+            FINALIZE=finalize,
             TEMPORAL_TILES=_TEMPORAL_TILES,
         )
 

@@ -2,24 +2,38 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import Any, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
+from vllm.utils.hashing import sha256
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    finish_stop_token_ids,
+    generate_block_hash_extra_keys,
+    hash_block_tokens,
+    make_block_hash_with_group_id,
+)
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+    SingleTypeKVCacheManager,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     get_kv_cache_spec_kind,
@@ -29,6 +43,9 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# Marks a finished request's tail key so that it never equals a full-unit key.
+_FINISH_TAIL_EXTRA_KEY = "finish_tail"
 
 
 @dataclass
@@ -146,6 +163,8 @@ class KVCacheManager:
         metrics_collector: KVCacheMetricsCollector | None = None,
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
+        enable_mamba_finish_checkpoint: bool = False,
+        caching_hash_fn: Callable[[Any], bytes] = sha256,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -193,6 +212,29 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.shared_prefix_checkpoint = True
+        self.mamba_finish_checkpoint = enable_mamba_finish_checkpoint
+        if enable_mamba_finish_checkpoint:
+            # The KV cache groups and block sizes are only known here.
+            coordinator = self.coordinator
+            if not (
+                isinstance(coordinator, HybridKVCacheCoordinator)
+                and coordinator.full_attention_group_id is not None
+                and all(
+                    type(manager) in (FullAttentionManager, MambaManager)
+                    for manager in coordinator.single_type_managers
+                    if manager.kv_cache_spec.prefix_cacheable
+                )
+            ):
+                raise ValueError(
+                    "--enable-mamba-finish-checkpoint supports only models whose "
+                    "KV cache groups are full attention and Mamba."
+                )
+            if not coordinator.enable_partial_hash_hits:
+                raise ValueError(
+                    "--enable-mamba-finish-checkpoint requires a prefix match "
+                    "unit smaller than the Mamba block size."
+                )
+        self.caching_hash_fn = caching_hash_fn
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
         self.retained_hit_group_ids = tuple(
@@ -298,6 +340,14 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if self.mamba_finish_checkpoint:
+            tail_hit = self._find_finish_tail_hit(
+                request, max_cache_hit_length, num_new_computed_tokens
+            )
+            if tail_hit is not None:
+                num_longest_hit = num_new_computed_tokens + num_uncached
+                computed_blocks, num_new_computed_tokens = tail_hit
+                num_uncached = max(0, num_longest_hit - num_new_computed_tokens)
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -319,6 +369,147 @@ class KVCacheManager:
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
+
+    def _finish_tail_parent(self, request: Request, start: int) -> BlockHash | None:
+        """The hash a tail starting at ``start`` is chained on."""
+        if not start:
+            return None
+        return request.block_hashes[start // self.block_pool.hash_block_size - 1]
+
+    def _finish_tail_hash(self, request: Request, start: int, end: int) -> BlockHash:
+        """Hash a finished request's tail ``all_token_ids[start:end]``."""
+        extra_keys, _ = generate_block_hash_extra_keys(request, start, end, 0)
+        return hash_block_tokens(
+            self.caching_hash_fn,
+            self._finish_tail_parent(request, start),
+            request.all_token_ids[start:end],
+            (*(extra_keys or ()), _FINISH_TAIL_EXTRA_KEY),
+        )
+
+    def _find_finish_tail_hit(
+        self, request: Request, max_cache_hit_length: int, num_computed_tokens: int
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        """Find a finished request's tail that ``request`` repeats.
+
+        Probes the tails registered by ``cache_finished_request`` from the
+        deepest prefix match unit full attention holds down to the normal hit,
+        longest first, so a hit is always longer than the normal one. A hit
+        needs every group and ends one token before the finished request's
+        last token, which the key covers, so it skips the EAGLE drop.
+        """
+        coordinator = self.coordinator
+        assert isinstance(coordinator, HybridKVCacheCoordinator)
+        lengths_by_parent = self.block_pool.finish_tail_lengths_by_parent
+        if not lengths_by_parent:
+            return None
+        hash_block_size = self.block_pool.hash_block_size
+        anchor_blocks: list[list[KVCacheBlock]] = [
+            [] for _ in range(self.num_kv_cache_groups)
+        ]
+        start = max_cache_hit_length
+        for spec, group_ids, manager_cls, _ in coordinator.attention_groups:
+            if not isinstance(spec, FullAttentionSpec):
+                continue
+            blocks, num_hit_tokens = manager_cls.find_longest_cache_hit(
+                block_hashes=request.block_hashes,
+                max_length=max_cache_hit_length,
+                kv_cache_group_ids=group_ids,
+                block_pool=self.block_pool,
+                kv_cache_spec=spec,
+                drop_eagle_block=False,
+                alignment_tokens=hash_block_size,
+            )
+            start = min(start, num_hit_tokens)
+            for group_id, group_blocks in zip(group_ids, blocks):
+                anchor_blocks[group_id] = group_blocks
+
+        # The tail covers the hit plus the finished request's last token.
+        tails = sorted(
+            (tail_start + length, tail_start)
+            for tail_start in range(
+                start,
+                round_down(num_computed_tokens, hash_block_size) - 1,
+                -hash_block_size,
+            )
+            for length in lengths_by_parent.get(
+                self._finish_tail_parent(request, tail_start), ()
+            )
+            if num_computed_tokens + 1 < tail_start + length <= request.num_tokens
+        )
+        for end, tail_start in reversed(tails):
+            tail_hash = self._finish_tail_hash(request, tail_start, end)
+            hit_blocks: list[list[KVCacheBlock]] = [
+                [] for _ in range(self.num_kv_cache_groups)
+            ]
+            for spec, group_ids, _, _ in coordinator.attention_groups:
+                tail_blocks = self.block_pool.get_cached_block(tail_hash, group_ids)
+                if tail_blocks is None:
+                    break
+                for group_id, tail_block in zip(group_ids, tail_blocks):
+                    num_blocks = (end - 2) // coordinator.group_block_sizes[group_id]
+                    if isinstance(spec, MambaSpec):
+                        prefix = [self.block_pool.null_block] * num_blocks
+                    else:
+                        prefix = anchor_blocks[group_id][:num_blocks]
+                    hit_blocks[group_id] = [*prefix, tail_block]
+            else:
+                logger.debug(
+                    "Request %s hit a finished request's tail at %d tokens.",
+                    request.request_id,
+                    end - 1,
+                )
+                return tuple(hit_blocks), end - 1
+        return None
+
+    def cache_finished_request(self, request: Request) -> None:
+        """Register the final state of a request that finished on its EOS, a
+        stop token or its length limit.
+
+        The worker keeps the state before the last token in block
+        ``(num_tokens - 2) // block_size`` of every Mamba group. That block and
+        the attention block holding the same position get a tail key covering
+        the tokens after the last full prefix match unit, the last token
+        included, and full attention also registers that unit as a lookup-only
+        entry. Must run before the request's blocks are freed.
+        """
+        params = request.sampling_params
+        if params is None or finish_stop_token_ids(params) is None:
+            # The worker does not keep the final state of this request.
+            return
+        num_tokens = request.num_tokens
+        hash_block_size = self.block_pool.hash_block_size
+        start = round_down(num_tokens - 1, hash_block_size)
+        tail_blocks: list[tuple[SingleTypeKVCacheManager, list[KVCacheBlock]]] = []
+        for manager in self.coordinator.single_type_managers:
+            if not manager.kv_cache_spec.prefix_cacheable:
+                continue
+            blocks = manager.req_to_blocks.get(request.request_id, [])
+            block_idx = (num_tokens - 2) // manager.block_size
+            if block_idx >= len(blocks) or blocks[block_idx].is_null:
+                return
+            tail_blocks.append((manager, blocks))
+
+        tail_hash = self._finish_tail_hash(request, start, num_tokens)
+        tail = (self._finish_tail_parent(request, start), num_tokens - start)
+        for manager, blocks in tail_blocks:
+            if isinstance(manager, FullAttentionManager) and start:
+                self.block_pool.cache_finish_tail(
+                    make_block_hash_with_group_id(
+                        request.block_hashes[start // hash_block_size - 1],
+                        manager.kv_cache_group_id,
+                    ),
+                    blocks[(start - 1) // manager.block_size],
+                )
+            self.block_pool.cache_finish_tail(
+                make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id),
+                blocks[(num_tokens - 2) // manager.block_size],
+                tail,
+            )
+        logger.debug(
+            "Registered the final state of request %s at %d tokens.",
+            request.request_id,
+            num_tokens - 1,
+        )
 
     def get_computed_blocks_for_connector(
         self, request: Request

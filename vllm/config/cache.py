@@ -200,6 +200,16 @@ class CacheConfig:
     prompt tail. Off by default; only takes effect with `mamba_cache_mode`
     "align", EAGLE on the Mamba group, and a prefix match unit smaller than the
     Mamba block size."""
+    enable_mamba_finish_checkpoint: bool = False
+    """Keep the Mamba "align" state of a request that finishes on an EOS, stop
+    token or length limit, so that a follow-up request repeating the whole
+    output hits the prefix cache at the end of that output. Off by default.
+    Requires prefix caching with mamba_cache_mode "align", the V2 model runner,
+    a model whose KV cache groups are full attention and Mamba, and a prefix
+    match unit smaller than the Mamba block size. Not supported with pipeline
+    or context parallelism, a KV connector other than the offloading ones, a
+    draft model with Mamba layers, ReplaySSM, multi-module MTP or KV cache
+    events."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
@@ -297,6 +307,7 @@ class CacheConfig:
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
+            "enable_mamba_finish_checkpoint",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",

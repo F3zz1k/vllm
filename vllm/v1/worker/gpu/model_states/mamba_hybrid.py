@@ -17,11 +17,17 @@ from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionMetadataBuilder,
     ShortConvAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
+from vllm.v1.core.kv_cache_utils import (
+    MAX_FINISH_STOP_TOKEN_IDS,
+    finish_stop_token_ids,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -108,6 +114,32 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+        # Stop tables for the finish checkpoint, see _detect_finish_kernel.
+        self._finish_checkpoint = (
+            self._align_mode and self.cache_config.enable_mamba_finish_checkpoint
+        )
+        if self._finish_checkpoint:
+            self._finish_max_len = UvaBackedTensor(self.max_num_reqs, dtype=torch.int32)
+            self._num_finish_stop_ids = UvaBackedTensor(
+                self.max_num_reqs, dtype=torch.int32
+            )
+            self._finish_stop_ids = StagedWriteTensor(
+                (self.max_num_reqs, MAX_FINISH_STOP_TOKEN_IDS),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._finish_stopped_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._finish_num_computed_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._finish_num_accepted_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._finish_idx_mapping_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -123,6 +155,30 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_state_idx_gpu[req_index].fill_(
                 (new_req_data.num_computed_tokens - 1) // mamba_block_size
             )
+        if self._finish_checkpoint:
+            self._finish_stopped_gpu[req_index].fill_(0)
+            sampling_params = new_req_data.sampling_params
+            if sampling_params is None:
+                return
+            stop_token_ids = finish_stop_token_ids(sampling_params)
+            assert sampling_params.max_tokens is not None
+            max_len = min(
+                new_req_data.prompt_len + sampling_params.max_tokens,
+                self.max_model_len,
+            )
+            if stop_token_ids is None:
+                stop_token_ids = []
+                max_len = torch.iinfo(torch.int32).max
+            self._finish_max_len.np[req_index] = max_len
+            self._num_finish_stop_ids.np[req_index] = len(stop_token_ids)
+            self._finish_stop_ids.stage_write(req_index, 0, stop_token_ids)
+
+    def apply_staged_writes(self) -> None:
+        super().apply_staged_writes()
+        if self._finish_checkpoint:
+            self._finish_max_len.copy_to_uva()
+            self._num_finish_stop_ids.copy_to_uva()
+            self._finish_stop_ids.apply_write()
 
     def _get_mamba_group_info(
         self, kv_cache_config: KVCacheConfig
@@ -195,7 +251,7 @@ class MambaHybridModelState(DefaultModelState):
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
             return
-        _, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
         ctx = self._mamba_ctx
         assert ctx is not None
 
@@ -219,6 +275,16 @@ class MambaHybridModelState(DefaultModelState):
             BLOCK_SIZE=block,
             MAMBA_BLOCK_SIZE=mamba_spec.block_size,
         )
+        if self._finish_checkpoint:
+            # A request that stopped in an earlier step can still be in this
+            # batch under async scheduling. Point its Mamba rows at the null
+            # block, which the kernels skip, and skip its pre-copy.
+            stopped = self._finish_stopped_gpu[input_batch.idx_mapping] != 0
+            for group_id in mamba_group_ids:
+                block_tables[group_id][:num_reqs].masked_fill_(
+                    stopped[:, None], NULL_BLOCK_ID
+                )
+            self._mamba_src_col_gpu.masked_fill_(self._finish_stopped_gpu != 0, -1)
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -352,6 +418,7 @@ class MambaHybridModelState(DefaultModelState):
         idx_mapping: torch.Tensor,
         num_sampled: torch.Tensor | int,
         num_computed_tokens: torch.Tensor | None = None,
+        sampled_tokens: torch.Tensor | None = None,
     ) -> None:
         # Chunked prefill does not sample a token, so num_sampled can be 0.
         # Mamba treats num_accepted_tokens=1 as the neutral non-spec value.
@@ -393,6 +460,29 @@ class MambaHybridModelState(DefaultModelState):
             and num_computed_tokens is not None
             and self._mamba_ctx is not None
         ):
+            if self._finish_checkpoint:
+                assert sampled_tokens is not None
+                assert not isinstance(num_sampled, int)
+                postprocess_idx_mapping = self._finish_idx_mapping_gpu[:num_reqs]
+                _detect_finish_kernel[(num_reqs,)](
+                    idx_mapping,
+                    sampled_tokens,
+                    sampled_tokens.stride(0),
+                    num_sampled,
+                    num_computed_tokens,
+                    self._finish_stop_ids.gpu,
+                    self._finish_stop_ids.gpu.stride(0),
+                    self._num_finish_stop_ids.gpu,
+                    self._finish_max_len.gpu,
+                    self._finish_stopped_gpu,
+                    self.num_accepted_tokens_gpu,
+                    self._finish_num_computed_gpu,
+                    self._finish_num_accepted_gpu,
+                    postprocess_idx_mapping,
+                    BLOCK_SIZE=triton.next_power_of_2(sampled_tokens.shape[1]),
+                )
+                idx_mapping = postprocess_idx_mapping
+                num_computed_tokens = self._finish_num_computed_gpu
             self._mamba_ctx.run_fused_postprocess_align(
                 num_reqs,
                 self.num_accepted_tokens_gpu,
@@ -400,6 +490,73 @@ class MambaHybridModelState(DefaultModelState):
                 num_computed_tokens,
                 idx_mapping,
             )
+            if self._finish_checkpoint:
+                self._mamba_ctx.run_fused_postprocess_align(
+                    num_reqs,
+                    self._finish_num_accepted_gpu,
+                    self._mamba_state_idx_gpu,
+                    num_computed_tokens,
+                    idx_mapping,
+                    finalize=True,
+                )
+
+
+@triton.jit
+def _detect_finish_kernel(
+    idx_mapping_ptr,  # [num_reqs] batch_idx -> req_state_idx (-1 to skip)
+    sampled_tokens_ptr,  # [num_reqs, num_speculative_steps + 1]
+    sampled_tokens_stride,
+    num_sampled_ptr,  # [num_reqs]
+    num_computed_ptr,  # [max_num_reqs] post-step
+    stop_ids_ptr,  # [max_num_reqs, MAX_FINISH_STOP_TOKEN_IDS]
+    stop_ids_stride,
+    num_stop_ids_ptr,  # [max_num_reqs]
+    max_len_ptr,  # [max_num_reqs]
+    stopped_ptr,  # [max_num_reqs]
+    num_accepted_ptr,  # [max_num_reqs]
+    finish_num_computed_ptr,  # [max_num_reqs] out
+    finish_num_accepted_ptr,  # [max_num_reqs] out, 0 if not finishing
+    postprocess_idx_mapping_ptr,  # [num_reqs] out
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Find the first sampled token that ends the request, as check_stop does,
+    and truncate the step there: the stop token is never fed through the
+    model, so the state to keep is the one before it. Requests that stopped in
+    an earlier step are masked out of the postprocess.
+    """
+    row = tl.program_id(0)
+    req_state_idx = tl.load(idx_mapping_ptr + row)
+    stopped = tl.load(stopped_ptr + req_state_idx, mask=req_state_idx >= 0, other=1)
+    if stopped != 0:
+        tl.store(postprocess_idx_mapping_ptr + row, -1)
+        return
+    tl.store(postprocess_idx_mapping_ptr + row, req_state_idx)
+
+    num_computed = tl.load(num_computed_ptr + req_state_idx)
+    num_sampled = tl.load(num_sampled_ptr + row)
+    # Sequence length before the first sampled token.
+    seq_len = num_computed - num_sampled + 1
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_sampled
+    tokens = tl.load(
+        sampled_tokens_ptr + row * sampled_tokens_stride + offsets, mask=mask
+    )
+    max_len = tl.load(max_len_ptr + req_state_idx)
+    is_stop = seq_len + offsets + 1 >= max_len
+    num_stop_ids = tl.load(num_stop_ids_ptr + req_state_idx)
+    for i in range(num_stop_ids):
+        stop_id = tl.load(stop_ids_ptr + req_state_idx * stop_ids_stride + i)
+        is_stop = is_stop | (tokens == stop_id)
+    stop_idx = tl.min(tl.where(is_stop & mask, offsets, BLOCK_SIZE))
+    finishes = stop_idx < BLOCK_SIZE
+    if finishes:
+        tl.store(stopped_ptr + req_state_idx, 1)
+        tl.store(num_accepted_ptr + req_state_idx, stop_idx + 1)
+        num_computed = seq_len + stop_idx
+    tl.store(finish_num_computed_ptr + req_state_idx, num_computed)
+    tl.store(
+        finish_num_accepted_ptr + req_state_idx, tl.where(finishes, stop_idx + 1, 0)
+    )
 
 
 @triton.jit

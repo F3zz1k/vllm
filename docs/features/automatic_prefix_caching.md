@@ -35,6 +35,8 @@ vllm serve <hybrid-model> \
 
 Choose a value that divides the block size of every prefix-cacheable KV cache group, and that is a multiple of the per-state compression ratio for models that use one, such as sparse MLA. vLLM validates both at startup and names the offending sizes in the error. Read the served block size from the startup log. 64 is a reasonable starting point.
 
+`--enable-mamba-finish-checkpoint` also keeps the Mamba state of a request that finishes on its EOS token, a stop token or its length limit. A follow-up request that repeats the whole conversation, such as the next turn of a chat or an agent loop, then hits the prefix cache one token before the end of the previous output instead of at the last block boundary. It is off by default and requires the V2 model runner, prefix caching with `--mamba-cache-mode align` (the default with prefix caching), a prefix match unit smaller than the Mamba block size (usually set with `--prefix-match-unit`), and a model whose KV cache groups are full attention and Mamba only. vLLM rejects it at startup with pipeline or context parallelism, a KV connector other than `OffloadingConnector` and `SimpleCPUOffloadConnector`, a draft model with Mamba layers, ReplaySSM, multi-module MTP and KV cache events. A request whose EOS and stop token ids exceed 128 is served normally without keeping its state. Models with KDA layers are supported: their kernels write the masked rows of a finished request into the null block instead of skipping them, which is harmless because the null block is never read.
+
 ## Example workloads
 
 We describe two example workloads, where APC can provide huge performance benefit:

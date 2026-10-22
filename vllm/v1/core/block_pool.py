@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -180,6 +181,14 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        # Lookup-only keys of finished requests' final states. They are never a
+        # block's primary hash, so they are neither offloaded nor published.
+        # Values are the tail's parent hash and length, None for other keys.
+        self.finish_tail_hashes_by_block: dict[
+            int, dict[BlockHashWithGroupId, tuple[BlockHash | None, int] | None]
+        ] = {}
+        # Registered tail lengths by the hash their key is chained on.
+        self.finish_tail_lengths_by_parent: dict[BlockHash | None, Counter[int]] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -595,6 +604,18 @@ class BlockPool:
         if block.block_hash is not None:
             block_hashes.append(block.block_hash)
         block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
+        finish_tails = self.finish_tail_hashes_by_block.pop(block.block_id, None)
+        if finish_tails is not None:
+            block_hashes.extend(finish_tails)
+            for tail in finish_tails.values():
+                if tail is not None:
+                    parent, length = tail
+                    lengths = self.finish_tail_lengths_by_parent[parent]
+                    lengths[length] -= 1
+                    if not lengths[length]:
+                        del lengths[length]
+                        if not lengths:
+                            del self.finish_tail_lengths_by_parent[parent]
         if not block_hashes:
             return []
 
@@ -643,6 +664,32 @@ class BlockPool:
             self.cached_block_hashes_by_block.setdefault(block.block_id, set()).add(
                 block_hash_with_group_id
             )
+        self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
+
+    def cache_finish_tail(
+        self,
+        block_hash_with_group_id: BlockHashWithGroupId,
+        block: KVCacheBlock,
+        tail: tuple[BlockHash | None, int] | None = None,
+    ) -> None:
+        """Make ``block`` reachable from a finished request's tail key.
+
+        ``tail`` is the parent hash and length of a tail key, indexed so that
+        lookups probe only the registered tails.
+        """
+        assert not block.is_null
+        if block.block_hash == block_hash_with_group_id or (
+            self.cached_block_hash_to_block.contain(
+                block_hash_with_group_id, block.block_id
+            )
+        ):
+            return
+        tails = self.finish_tail_hashes_by_block.setdefault(block.block_id, {})
+        tails[block_hash_with_group_id] = tail
+        if tail is not None:
+            parent, length = tail
+            lengths = self.finish_tail_lengths_by_parent.setdefault(parent, Counter())
+            lengths[length] += 1
         self.cached_block_hash_to_block.insert(block_hash_with_group_id, block)
 
     def move_block_hashes(
@@ -790,7 +837,10 @@ class BlockPool:
                 continue
             block.ref_cnt -= 1
             if block.ref_cnt == 0 and not block.is_null:
-                if block.block_hash is None or not self.enable_caching:
+                if not self.enable_caching or (
+                    block.block_hash is None
+                    and block.block_id not in self.finish_tail_hashes_by_block
+                ):
                     # LIFO reuse of non-cached blocks for better GPU locality.
                     blocks_to_evict_first.append(block)
                 else:
@@ -846,6 +896,8 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self.finish_tail_hashes_by_block.clear()
+        self.finish_tail_lengths_by_parent.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]

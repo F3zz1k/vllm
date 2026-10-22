@@ -52,6 +52,7 @@ from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
 
 if TYPE_CHECKING:
+    from vllm.sampling_params import SamplingParams
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 
@@ -237,6 +238,21 @@ class KVCacheBlock:
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"
         )
+
+
+# Per-request stop token table of the Mamba finish checkpoint in the worker.
+MAX_FINISH_STOP_TOKEN_IDS = 128
+
+
+def finish_stop_token_ids(params: "SamplingParams") -> list[int] | None:
+    """The token ids check_stop ends a request on (eos_token_id is None under
+    ignore_eos), or None if they do not fit the worker's table, in which case
+    the request's final state is neither kept nor registered."""
+    stop_token_ids = [] if params.eos_token_id is None else [params.eos_token_id]
+    stop_token_ids.extend(params.stop_token_ids or ())
+    if len(stop_token_ids) > MAX_FINISH_STOP_TOKEN_IDS:
+        return None
+    return stop_token_ids
 
 
 class KVCacheBlockCopy(NamedTuple):

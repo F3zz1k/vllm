@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
@@ -348,6 +349,12 @@ class Scheduler(SchedulerInterface):
             watermark=self.scheduler_config.watermark,
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
+            ),
+            enable_mamba_finish_checkpoint=(
+                self.cache_config.enable_mamba_finish_checkpoint
+            ),
+            caching_hash_fn=get_hash_fn_by_name(
+                self.cache_config.prefix_caching_hash_algo
             ),
         )
         # Mamba managers already account for their speculative state blocks.
@@ -2273,6 +2280,20 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
+                    if (
+                        self.kv_cache_manager.mamba_finish_checkpoint
+                        and new_token_ids
+                        and status_before_stop == RequestStatus.RUNNING
+                        and not output_is_stale
+                        and not request.resumable
+                        and request.status
+                        in (
+                            RequestStatus.FINISHED_STOPPED,
+                            RequestStatus.FINISHED_LENGTH_CAPPED,
+                        )
+                    ):
+                        # Only these stops are detected by the worker too.
+                        self.kv_cache_manager.cache_finished_request(request)
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                     if (
                         prefill_stats is not None
