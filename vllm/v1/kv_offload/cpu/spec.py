@@ -98,11 +98,7 @@ class CPUOffloadingSpec(OffloadingSpec):
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
 
-        cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
-        if not cpu_bytes_to_use:
-            raise Exception(
-                "cpu_bytes_to_use must be specified in kv_connector_extra_config"
-            )
+        cpu_bytes_to_use = self._cpu_bytes_to_use()
 
         world_size = config.parallel.world_size
         self.num_chunks = 0
@@ -140,6 +136,15 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
+
+    def _cpu_bytes_to_use(self) -> int:
+        """Host bytes for the CPU tier; sizes num_chunks."""
+        cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
+        if not cpu_bytes_to_use:
+            raise Exception(
+                "cpu_bytes_to_use must be specified in kv_connector_extra_config"
+            )
+        return int(cpu_bytes_to_use)
 
     @override
     def get_manager(self) -> OffloadingManager:

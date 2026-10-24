@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
+import queue
+import threading
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -75,6 +78,55 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    # Set by the copy thread once it has recorded the transfer's events; None
+    # when the transfer was submitted on the calling thread.
+    submitted: threading.Event | None = None
+
+
+# Copy thread (2026-10-23): submit each transfer's copies from a background
+# thread instead of the caller (the engine's forward thread). On XPU the pool's
+# D2H path waits per descriptor and its H2D path does a CPU staging memcpy, both
+# inside the copy call, so on the caller they block the forward for the whole
+# copy. The caller still orders the copy after the compute stream
+# (wait_stream), so the data copied is the same.
+COPY_THREAD = os.environ.get("VLLM_KV_OFFLOAD_COPY_THREAD", "0") == "1"
+
+
+class _CopyThread:
+    """One FIFO thread running submitted copy closures in order."""
+
+    def __init__(self, name: str, device: torch.device | None) -> None:
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self._device = device
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def submit(self, fn) -> threading.Event:
+        done = threading.Event()
+        self._q.put((fn, done))
+        return done
+
+    def _run(self) -> None:
+        if self._device is not None and self._device.type == "xpu":
+            torch.xpu.set_device(self._device)
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            fn, done = item
+            try:
+                if self.error is None:
+                    fn()
+            except BaseException as e:  # noqa: BLE001
+                logger.exception("KV offload copy thread failed")
+                self.error = e
+            finally:
+                done.set()
+
+    def stop(self) -> None:
+        self._q.put(None)
+        self._thread.join(timeout=60)
 
 
 def compute_sub_block_ptrs(
@@ -258,6 +310,10 @@ class SingleDirectionOffloadingHandler:
     Each transfer uses a unique CUDA stream, and its stream will start
     executing only after the streams of previous transfers have finished.
     """
+
+    # Started on the first transfer when COPY_THREAD is set. Declared on the
+    # class so a handler built without __init__ still reads None.
+    _copy_thread: "_CopyThread | None" = None
 
     def __init__(
         self,
@@ -663,11 +719,7 @@ class SingleDirectionOffloadingHandler:
         # shipped in an earlier step for a since-reallocated block; with async
         # scheduling nothing else orders that zeroing against this copy.
         stream.wait_stream(current_platform.current_stream())
-        if self._transfers:
-            last_transfer: Transfer = self._transfers[-1]
-            last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
-            stream.wait_event(last_event)
+        last_event = self._transfers[-1].end_event if self._transfers else None
         # CPU->GPU reads from host memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
@@ -675,16 +727,32 @@ class SingleDirectionOffloadingHandler:
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
         is_src_access_order_any = not self.gpu_to_cpu
-        with current_platform.stream(stream):
-            start_event.record(stream)
-            if op_idx > 0:
-                self._swap_blocks_batch(
-                    src,
-                    dst,
-                    sizes,
-                    is_src_access_order_any=is_src_access_order_any,
+
+        def copy() -> None:
+            if last_event is not None:
+                # assure job will start only after the previous one completes
+                stream.wait_event(last_event)
+            with current_platform.stream(stream):
+                start_event.record(stream)
+                if op_idx > 0:
+                    self._swap_blocks_batch(
+                        src,
+                        dst,
+                        sizes,
+                        is_src_access_order_any=is_src_access_order_any,
+                    )
+                end_event.record(stream)
+
+        submitted = None
+        if COPY_THREAD:
+            if self._copy_thread is None:
+                self._copy_thread = _CopyThread(
+                    f"kv-copy-{'d2h' if self.gpu_to_cpu else 'h2d'}",
+                    getattr(stream, "device", None),
                 )
-            end_event.record(stream)
+            submitted = self._copy_thread.submit(copy)
+        else:
+            copy()
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -697,15 +765,31 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                submitted=submitted,
             )
         )
 
         # success
         return True
 
+    def _submitted(self, transfer: Transfer, wait: bool = False) -> bool:
+        if transfer.submitted is None:
+            return True
+        if wait:
+            transfer.submitted.wait()
+        elif not transfer.submitted.is_set():
+            return False
+        if self._copy_thread is not None and self._copy_thread.error is not None:
+            raise RuntimeError("KV offload copy failed") from self._copy_thread.error
+        return True
+
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0].end_event.query():
+        while (
+            self._transfers
+            and self._submitted(self._transfers[0])
+            and self._transfers[0].end_event.query()
+        ):
             transfer = self._transfers.popleft()
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
@@ -728,9 +812,13 @@ class SingleDirectionOffloadingHandler:
         return results
 
     def wait(self, job_ids: set[int]):
+        by_id = {t.job_id: t for t in self._transfers}
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
+                transfer = by_id.get(job_id)
+                if transfer is not None:
+                    self._submitted(transfer, wait=True)
                 event.synchronize()
 
     def shutdown(self) -> None:
@@ -739,6 +827,7 @@ class SingleDirectionOffloadingHandler:
         while self._transfers:
             transfer = self._transfers[0]
             try:
+                self._submitted(transfer, wait=True)
                 transfer.end_event.synchronize()
             except Exception as e:
                 logger.exception(
@@ -751,6 +840,9 @@ class SingleDirectionOffloadingHandler:
                 break
             self._transfers.popleft()
 
+        if self._copy_thread is not None:
+            self._copy_thread.stop()
+            self._copy_thread = None
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()

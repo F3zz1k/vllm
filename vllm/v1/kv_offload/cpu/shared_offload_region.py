@@ -82,6 +82,10 @@ class SharedOffloadRegion:
 
     Creator-only population pre-faults the entire region before the barrier
     and requires that barrier to keep joiners from using unpopulated pages.
+
+    ``external_path`` maps a region another process owns (the shared KV pool
+    server): the file must already exist at full size, already pre-faulted,
+    and it is never created, populated or unlinked here.
     """
 
     BLOCK_SIZE_ALIGNMENT: int = mmap.PAGESIZE
@@ -97,6 +101,7 @@ class SharedOffloadRegion:
         *,
         creator_memory_check: Callable[[int], None] | None = None,
         populate_only_on_creator: bool = False,
+        external_path: str | None = None,
     ) -> None:
         if populate_only_on_creator and barrier is None:
             raise ValueError("Creator-only population requires a barrier.")
@@ -106,6 +111,10 @@ class SharedOffloadRegion:
         self.num_chunks = num_chunks
         self._row_stride = kv_bytes_per_chunk
         self.total_size_bytes = self.num_chunks * self._row_stride
+
+        if external_path is not None:
+            self._init_external(external_path, rank, cpu_page_size)
+            return
 
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
@@ -235,6 +244,42 @@ class SharedOffloadRegion:
             logger.debug(
                 "MADV_POPULATE_WRITE entire region: %.3f s", time.perf_counter() - _t0
             )
+
+    def _init_external(self, path: str, rank: int | None, cpu_page_size: int) -> None:
+        self.mmap_path = path
+        self._creator = False
+        self.rank = rank
+        if rank is not None:
+            self._worker_offset = rank * cpu_page_size
+            self._worker_area_end = (rank + 1) * cpu_page_size
+        self.fd = os.open(path, os.O_RDWR)
+        try:
+            size = os.fstat(self.fd).st_size
+            if size < self.total_size_bytes:
+                raise RuntimeError(
+                    f"External offload region {path} has {size} bytes, "
+                    f"expected {self.total_size_bytes}"
+                )
+            self.mmap_obj = mmap.mmap(
+                self.fd,
+                self.total_size_bytes,
+                flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE,
+            )
+        except Exception:
+            os.close(self.fd)
+            self.fd = None
+            raise
+        logger.info(
+            "Mapped external offload region %s (%.2f GB)",
+            path,
+            self.total_size_bytes / 1e9,
+        )
+        self._base = torch.frombuffer(memoryview(self.mmap_obj), dtype=torch.int8)
+        self._views = []
+        self._canonical_offset = 0
+        self.is_pinned = False
+        self.pinned_addresses = []
 
     @property
     def base_tensor(self) -> torch.Tensor:

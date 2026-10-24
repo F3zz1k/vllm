@@ -147,6 +147,10 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_worker.build_connector_worker_meta()
         return None
 
+    def bind_gpu_block_pool(self, gpu_block_pool) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)

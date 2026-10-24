@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import time
-from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections import Counter, OrderedDict
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -33,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.kv_cache_interface import (
@@ -66,6 +68,21 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+# Exclusive RAM tier (2026-10-23). Write-back band: each step, the hashed GPU
+# blocks among the first WRITE_BACK_SCAN positions of the free queue (the next
+# to be evicted) that the pool does not hold yet are held, copied to the pool
+# and released back to the queue head, so the pool receives what the GPU is
+# about to drop. While the pool has fewer than WRITE_THROUGH_MIN_FREE of its
+# chunks free, compute-time stores stop: new content reaches the pool only
+# through the band, so the pool converges on holding what the GPU does not.
+WRITE_BACK = os.environ.get("VLLM_KV_WRITE_BACK", "0") == "1"
+WRITE_BACK_SCAN = int(os.environ.get("VLLM_KV_WRITE_BACK_SCAN", "64"))
+WRITE_BACK_MAX_HELD = int(os.environ.get("VLLM_KV_WRITE_BACK_MAX_HELD", "256"))
+# Conversations ("runs") remembered for whole-run write-back.
+WRITE_BACK_MAX_RUNS = 4096
+WRITE_THROUGH_MIN_FREE = float(os.environ.get("VLLM_KV_WRITE_THROUGH_MIN_FREE", "0.02"))
+_WRITE_BACK_REQ = "__kv_write_back__"
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
@@ -649,6 +666,17 @@ class OffloadingConnectorScheduler:
         # be freed before a request finishes).
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
+        # Write-back band (see WRITE_BACK): the GPU block pool, the blocks each
+        # write-back job holds, and the key each block was last written under.
+        self._gpu_block_pool: Any = None
+        self._wb_held: dict[int, list[Any]] = {}
+        self._wb_written: dict[int, tuple[OffloadKey, float]] = {}
+        # Finished requests' key chains: run tag (the request's last attention
+        # key) -> keys root first, and key -> its newest run.
+        self._run_keys: "OrderedDict[OffloadKey, list[OffloadKey]]" = OrderedDict()
+        self._key_run: dict[OffloadKey, OffloadKey] = {}
+        self._write_through = True
+
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
         # B70 0014 (env-gated; every flag off = upstream behaviour).
@@ -857,6 +885,166 @@ class OffloadingConnectorScheduler:
             time.monotonic() - start_time,
         )
 
+    def bind_gpu_block_pool(self, gpu_block_pool: Any) -> None:
+        self._gpu_block_pool = gpu_block_pool
+
+    def _write_through_enabled(self) -> bool:
+        """Compute-time stores run unless the band is on and the pool is full."""
+        if not WRITE_BACK or self._gpu_block_pool is None:
+            return True
+        pool_stats = getattr(self.manager, "pool_stats", None)
+        stats = pool_stats() if pool_stats is not None else None
+        if not isinstance(stats, dict) or not stats.get("num_chunks"):
+            return True
+        return stats.get("free", 0) >= WRITE_THROUGH_MIN_FREE * stats["num_chunks"]
+
+    def _record_run(self, req_status: "RequestOffloadState") -> None:
+        """Remember a finished request's chain so the band can write it whole."""
+        if not WRITE_BACK:
+            return
+        by_group = [gs.offload_keys for gs in req_status.group_states]
+        attn = next((keys for cfg, keys in zip(self.config.kv_group_configs, by_group)
+                     if cfg.group_idx in self._full_attention_groups and keys), None)
+        if not attn:
+            return
+        tag = attn[-1]
+        chain = [keys[i] for i in range(len(attn)) for keys in by_group if i < len(keys)]
+        old = self._run_keys.pop(tag, None)
+        if old is not None:
+            for key in old:
+                if self._key_run.get(key) == tag:
+                    del self._key_run[key]
+        self._run_keys[tag] = chain
+        for key in chain:
+            self._key_run[key] = tag
+        while len(self._run_keys) > WRITE_BACK_MAX_RUNS:
+            gone_tag, gone = self._run_keys.popitem(last=False)
+            for key in gone:
+                if self._key_run.get(key) == gone_tag:
+                    del self._key_run[key]
+
+    def _storable_free_block(self, key: OffloadKey, config_idx_by_group: dict[int, int]):
+        """(block, config_idx, num_tokens) for key if its GPU block is free (settled,
+        the next eviction candidates) and chunk-aligned; else None."""
+        group = int.from_bytes(bytes(key)[-4:], "big")
+        config_idx = config_idx_by_group.get(group)
+        if config_idx is None:
+            return None
+        found = self._gpu_block_pool.get_cached_block(BlockHash(bytes(key)[:-4]), [group])
+        if not found:
+            return None
+        block = found[0]
+        num_tokens = block.block_hash_num_tokens
+        if (block.ref_cnt != 0 or not num_tokens
+                or num_tokens % self.config.kv_group_configs[config_idx].tokens_per_chunk):
+            return None
+        return block, config_idx, num_tokens
+
+    def _build_write_back_jobs(self) -> dict[int, TransferJob]:
+        """Write whole conversations that are about to leave the GPU, root first.
+
+        A hashed block among the first WRITE_BACK_SCAN free-queue positions
+        triggers its run (the finished request it belongs to): every free,
+        chunk-aligned block of that run is offered to the pool in one tagged,
+        all-or-nothing store, held while copied, and released to the queue head.
+        Blocks of no known run are offered alone."""
+        pool = self._gpu_block_pool
+        if not WRITE_BACK or pool is None or self.config.blocks_per_chunk != 1:
+            return {}
+        budget = WRITE_BACK_MAX_HELD - sum(len(b) for b in self._wb_held.values())
+        if budget <= 0:
+            return {}
+        config_idx_by_group = {
+            config.group_idx: idx for idx, config in enumerate(self.config.kv_group_configs)
+        }
+        now = time.monotonic()
+        queue = pool.free_block_queue
+        node = queue.fake_free_list_head.next_free_block
+        units: list[tuple[OffloadKey | None, list]] = []
+        seen_runs: set[OffloadKey] = set()
+        taken = 0
+        for _ in range(WRITE_BACK_SCAN):
+            if node is None or node is queue.fake_free_list_tail or taken >= budget:
+                break
+            block, node = node, node.next_free_block
+            if block.block_hash is None:
+                continue
+            key = OffloadKey(bytes(block.block_hash))
+            written = self._wb_written.get(block.block_id)
+            if written is not None and written[0] == key and now - written[1] < 10.0:
+                continue  # confirmed in the pool recently
+            tag = self._key_run.get(key)
+            if tag is not None:
+                if tag in seen_runs:
+                    continue
+                seen_runs.add(tag)
+                members = []
+                for run_key in self._run_keys[tag]:
+                    found = self._storable_free_block(run_key, config_idx_by_group)
+                    if found is not None:
+                        members.append((run_key, *found))
+                if not members or taken + len(members) > budget:
+                    continue
+            else:
+                found = self._storable_free_block(key, config_idx_by_group)
+                if found is None:
+                    continue
+                members = [(key, *found)]
+            units.append((tag, members))
+            taken += len(members)
+
+        num_groups = len(self.config.kv_group_configs)
+        store_jobs: dict[int, TransferJob] = {}
+        for tag, members in units:
+            keys = [m[0] for m in members]
+            if tag is not None and hasattr(self.manager, "prepare_store_run"):
+                store_output = self.manager.prepare_store_run(keys, tag)
+            else:
+                store_output = self.manager.prepare_store(keys, None)
+            if store_output is None:
+                self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
+                continue
+            chunk_by_key = dict(
+                zip(store_output.keys_to_store, store_output.store_spec.block_ids.tolist())
+            )
+            for key, block, config_idx, num_tokens in members:  # root first
+                self._wb_written[block.block_id] = (key, now)
+                chunk = chunk_by_key.get(key)
+                if chunk is None:
+                    continue  # already in the pool (joined the run there)
+                pool.touch([block])
+                job_id = self._generate_job_id()
+                self._jobs[job_id] = TransferJobStatus(
+                    req_id=_WRITE_BACK_REQ,
+                    pending_count=self.config.num_workers,
+                    keys={key},
+                    is_store=True,
+                )
+                self._wb_held[job_id] = [block]
+                group_sizes = [0] * num_groups
+                group_sizes[config_idx] = 1
+                block_indices = [0] * num_groups
+                block_indices[config_idx] = (
+                    num_tokens // self.config.kv_group_configs[config_idx].tokens_per_block - 1
+                )
+                store_jobs[job_id] = TransferJob(
+                    req_id=_WRITE_BACK_REQ,
+                    src_spec=GPULoadStoreSpec(
+                        [block.block_id], group_sizes=group_sizes, block_indices=block_indices
+                    ),
+                    dst_spec=type(store_output.store_spec)([chunk]),
+                )
+        return store_jobs
+
+    def _release_write_back(self, job_id: int) -> None:
+        """Return a write-back job's blocks to the queue HEAD (still hashed), so
+        the hold did not change their eviction order."""
+        pool = self._gpu_block_pool
+        for block in self._wb_held.pop(job_id, ()):
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                pool.free_block_queue.prepend_n([block])
+
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
         self._job_counter += 1
@@ -880,6 +1068,24 @@ class OffloadingConnectorScheduler:
             num = min(num, req_status.req.num_prompt_tokens)
         return num
 
+    def _lookup_results(
+        self,
+        keys: Iterable[OffloadKey],
+        req_context: ReqContext,
+        stop_at_miss: bool,
+    ) -> Iterator[tuple[OffloadKey, LookupResult]]:
+        """Pair each key with its lookup result. A manager that answers many
+        keys in one call (``lookup_batch``, e.g. a remote shared pool) gets one
+        call per scan instead of one per key; with ``stop_at_miss`` it may stop
+        after the first MISS, as a prefix scan would."""
+        lookup_batch = getattr(self.manager, "lookup_batch", None)
+        if lookup_batch is None:
+            for key in keys:
+                yield key, self.manager.lookup(key, req_context)
+            return
+        keys = list(keys)
+        yield from zip(keys, lookup_batch(keys, req_context, stop_at_miss))
+
     def _maximal_prefix_lookup(
         self,
         keys: Iterable[OffloadKey],
@@ -892,8 +1098,9 @@ class OffloadingConnectorScheduler:
         or None if the backend deferred a lookup."""
         hit_count = 0
         defer_lookup = False
-        for local_idx, key in enumerate(keys):
-            result = self.manager.lookup(key, req_context)
+        for local_idx, (key, result) in enumerate(
+            self._lookup_results(keys, req_context, stop_at_miss=True)
+        ):
             if self._b70_counts is not None:
                 self._b70_counts[result] += 1
             match result:
@@ -931,8 +1138,21 @@ class OffloadingConnectorScheduler:
         pending_in_window = False
         consecutive_hits = 0
         required_window = initial_window_size or sliding_window_size
+        # A batching manager answers the whole span in one call; any other
+        # keeps the lazy per-key lookups (a lookup may start promotions, so a
+        # scan that stops early must not look up keys it never reached).
+        lookup_batch = getattr(self.manager, "lookup_batch", None)
+        batch = (
+            lookup_batch(list(keys), req_context, False)
+            if lookup_batch is not None
+            else None
+        )
         for idx in range(len(keys) - 1, -1, -1):
-            result = self.manager.lookup(keys[idx], req_context)
+            result = (
+                batch[idx]
+                if batch is not None
+                else self.manager.lookup(keys[idx], req_context)
+            )
             if self._b70_counts is not None:
                 self._b70_counts[result] += 1
             match result:
@@ -1656,6 +1876,8 @@ class OffloadingConnectorScheduler:
                 ):
                     continue
 
+                if not self._write_through:
+                    continue
                 key = self._make_boundary_key(
                     req, group_idx, boundary, req_status.req_context
                 )
@@ -2056,6 +2278,11 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
+            if not self._write_through:
+                # Pool full: the band writes these when the GPU is about to
+                # drop them.
+                req_status.advance_stored_idx(num_offloadable_tokens)
+                continue
             store_output = self.manager.prepare_store(
                 new_offload_keys, req_status.req_context
             )
@@ -2233,11 +2460,13 @@ class OffloadingConnectorScheduler:
                 for jid in self._block_id_to_pending_jobs[bid]
             )
 
+        self._write_through = self._write_through_enabled()
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
+        write_back_jobs = self._build_write_back_jobs()
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=partial_store_jobs | normal_store_jobs,
+            store_jobs=partial_store_jobs | normal_store_jobs | write_back_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
 
@@ -2248,6 +2477,7 @@ class OffloadingConnectorScheduler:
             if req_status is None:
                 continue
             req_status.finished_signaled = True
+            self._record_run(req_status)
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
@@ -2324,6 +2554,12 @@ class OffloadingConnectorScheduler:
             assert job_status.pending_count == 0
             if self._b70_trace:
                 self._b70_job_completed(job_status)
+
+            if job_status.req_id == _WRITE_BACK_REQ:
+                self.manager.complete_store(job_status.keys, None)
+                self._release_write_back(job_id)
+                del self._jobs[job_id]
+                continue
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
@@ -2448,6 +2684,9 @@ class OffloadingConnectorScheduler:
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
+        for job_id in list(self._wb_held):
+            self._release_write_back(job_id)
+        self._wb_written.clear()
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
 
