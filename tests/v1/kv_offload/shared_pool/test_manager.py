@@ -11,7 +11,18 @@ from typing import Any
 import pytest
 import torch
 
-from vllm.v1.kv_offload.base import LookupResult, ReqContext, make_offload_key
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
+    _opaque_fallback_mapping,
+)
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalPageMapping,
+    CopyRun,
+    LookupResult,
+    ReqContext,
+    make_offload_key,
+)
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
     OffloadingConfig,
@@ -59,6 +70,8 @@ def make_config(
     dtype: str = "float16",
     engine_id: str = "engine-a",
     worker_kv_bytes_per_block: int = 8,
+    canonical: bool = False,
+    portable: bool = False,
 ) -> OffloadingConfig:
     extra: dict[str, Any] = {
         "spec_name": "SharedPoolOffloadingSpec",
@@ -82,8 +95,10 @@ def make_config(
             data_parallel_index=0,
             data_parallel_size=1,
             data_parallel_rank_local=None,
-            is_parallelism_agnostic=False,
+            is_parallelism_agnostic=portable,
         ),
+        canonical_layout=canonical,
+        kv_cache_layout="LBHNC",
     )
 
 
@@ -120,6 +135,38 @@ def test_layout_key_ignores_rank_and_engine_but_not_layout(server):
     )
     assert make_spec(sock, dtype="fp8").layout_key != base
     assert make_spec(sock, worker_kv_bytes_per_block=8192).layout_key != base
+
+
+def test_portable_canonical_layout_key_spans_tp_sizes(server):
+    _, sock = server
+
+    def key_at(tp: int, rank: int = 0, **kw) -> str:
+        # The same 16 bytes per block, split over tp workers
+        kw = {"canonical": True, "portable": True, **kw}
+        return make_spec(
+            sock, rank=rank, world_size=tp, worker_kv_bytes_per_block=16 // tp, **kw
+        ).layout_key
+
+    assert key_at(2) == key_at(4) == key_at(4, rank=3)
+    # Canonical pages not certified portable stay one pool per TP size
+    assert key_at(2, portable=False) != key_at(4, portable=False)
+    # Canonical rows never share a pool with direct-layout rows
+    assert key_at(2) != key_at(2, canonical=False, portable=False)
+
+
+def test_canonical_worker_refuses_layers_the_key_does_not_promise(server):
+    _, sock = server
+    spec = make_spec(sock, world_size=2, canonical=True, portable=True)
+
+    def caches(mapping: CanonicalPageMapping | None) -> CanonicalKVCaches:
+        return CanonicalKVCaches([], [[CanonicalKVCacheRef(0, 8, mapping)]])
+
+    portable = CanonicalPageMapping(16, 8, (CopyRun(0, 0, 8, 1, 8, 8),), 1, 0, True)
+    spec._check_canonical_refs(caches(portable))
+    with pytest.raises(RuntimeError, match="no canonical mapping"):
+        spec._check_canonical_refs(caches(None))
+    with pytest.raises(RuntimeError, match="not portable"):
+        spec._check_canonical_refs(caches(_opaque_fallback_mapping(8, 2, 0)))
 
 
 def test_two_engines_share_one_chunk(server):

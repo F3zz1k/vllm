@@ -12,6 +12,10 @@ Engines share a pool only when their layout key matches: the same model, KV
 dtype, cache groups, block and chunk geometry and parallel layout, so a chunk
 row written by any of them has the same meaning to all of them. The server
 refuses an engine whose key differs from the pool's.
+
+With "canonical_layout": true in kv_connector_extra_config, and every layer
+certified portable, rows hold canonical (TP=1) pages and the parallel layout
+leaves the key: engines of different TP sizes share one pool.
 """
 
 import hashlib
@@ -80,18 +84,32 @@ class SharedPoolOffloadingSpec(CPUOffloadingSpec):
         # Sized by the server once the row size is known (_ensure_pool).
         return 0
 
+    @property
+    def _portable(self) -> bool:
+        """Whether every row holds canonical pages certified identical under
+        any TP size, so engines of different TP sizes share the pool."""
+        return (
+            self.config.canonical_layout
+            and self.config.parallel.is_parallelism_agnostic
+        )
+
     def _layout_key(self) -> str:
-        fields = FileMapper.from_offloading_spec("", self).get_run_config()
+        fields = FileMapper.from_offloading_spec(
+            "", self, parallel_agnostic=self._portable
+        ).get_run_config()
         fields.update(
             layout_version=_LAYOUT_VERSION,
             kv_bytes_per_chunk=self.kv_bytes_per_chunk,
-            cpu_page_size_per_worker=self.cpu_page_size_per_worker,
             blocks_per_chunk=self.blocks_per_chunk,
-            world_size=self.config.parallel.world_size,
             replicated_layout=self.replicated_layout,
             kv_cache_layout=self.config.kv_cache_layout,
             **_build_identity(self.config.model.name),
         )
+        if not self._portable:
+            fields.update(
+                cpu_page_size_per_worker=self.cpu_page_size_per_worker,
+                world_size=self.config.parallel.world_size,
+            )
         blob = json.dumps(fields, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -149,6 +167,8 @@ class SharedPoolOffloadingSpec(CPUOffloadingSpec):
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         if not self._uses_shared_region():
             raise RuntimeError("The shared KV pool needs a CUDA or XPU platform")
+        if self.config.canonical_layout:
+            self._check_canonical_refs(kv_caches)
         self._ensure_pool()
         assert self._region_path is not None
         worker_index = self.config.parallel.rank
@@ -166,7 +186,31 @@ class SharedPoolOffloadingSpec(CPUOffloadingSpec):
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_chunks=self.num_chunks,
                 mmap_region=mmap_region,
+                canonical_layout=self.config.canonical_layout,
             )
         except Exception:
             mmap_region.cleanup()
             raise
+
+    def _check_canonical_refs(self, kv_caches: CanonicalKVCaches) -> None:
+        """Refuse to write anything but what the layout key promised: canonical
+        pages for every layer, portable ones when the key is shared across TP
+        sizes (the static gate certified them before any worker existed)."""
+        refs = [ref for group_refs in kv_caches.group_data_refs for ref in group_refs]
+        if any(ref.mapping is None for ref in refs):
+            raise RuntimeError(
+                "canonical_layout: a KV cache layer has no canonical mapping "
+                "(packed or cross-layer KV layout); remove canonical_layout"
+            )
+        if self._portable and not all(
+            ref.mapping is not None and ref.mapping.parallelism_agnostic
+            for ref in refs
+        ):
+            raise RuntimeError(
+                "canonical_layout: a layer is not portable across TP sizes, "
+                "but the pool layout key is shared across them"
+            )
+        logger.info(
+            "Shared KV pool rows are canonical (shared across TP sizes: %s)",
+            self._portable,
+        )
