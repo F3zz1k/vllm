@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     SchedulerOffloadConfig,
 )
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     kv_cache_groups_tp_replicas,
@@ -246,6 +247,18 @@ def _mamba_spec() -> MambaSpec:
         block_size=16,
         shapes=((1, 1),),
         dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+
+def _gdn_spec() -> MambaSpec:
+    # Gated delta net at tp=1: (state_len, [Q | K | V]) conv rows, then
+    # (value heads, v_dim, k_dim)
+    return MambaSpec(
+        block_size=16,
+        shapes=((3, 32), (4, 4, 4)),
+        dtypes=(torch.float16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
         mamba_cache_mode="align",
     )
 
@@ -1167,6 +1180,9 @@ def test_parallelism_agnostic_excluded(kv_cache_groups: list[KVCacheGroupSpec]):
             list(_make_mamba_hybrid_kv_cache_config().kv_cache_groups),
             False,
             id="mamba-hybrid",
+        ),
+        pytest.param(
+            _groups(_full_attention_spec(), _gdn_spec()), True, id="gdn-hybrid"
         ),
         pytest.param(
             [_uniform_group(_mla_spec(head_size=576), _mla_spec(head_size=128))],

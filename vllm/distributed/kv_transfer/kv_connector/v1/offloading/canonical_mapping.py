@@ -6,7 +6,8 @@ The only place in the offloading stack that reasons about parallelism
 (TP/DCP/PCP); everything downstream consumes byte mappings. The canonical
 page of a layer is the full offloaded block without parallelism: all KV
 heads, all block_size * dcp * pcp tokens, in the worker's page encoding.
-Uncertifiable layers get an opaque fallback mapping (fail closed).
+For a gated delta net layer it is the TP=1 state page. Uncertifiable layers
+get an opaque fallback mapping (fail closed).
 """
 
 from dataclasses import dataclass, replace
@@ -14,6 +15,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import (
+    derive_mamba_conv_split,
+)
+from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
@@ -265,6 +271,70 @@ def _attention_byte_regions(
     return None
 
 
+def mamba_state_runs(
+    spec: MambaSpec, tp_size: int, tp_rank: int
+) -> tuple[CopyRun, ...] | None:
+    """Runs placing one rank's gated delta net state page into the TP=1 page,
+    or None when the layer cannot be certified.
+
+    The state page is the conv state, (state_len, conv_dim) rows of
+    [Q | K | V], then the recurrent state, (num_v_heads, v_dim, k_dim). TP
+    shards every sub-projection of each conv row and the recurrent state's
+    value heads, so rank r holds slice r of each. Only GDN is certified: its
+    sub-projections always shard evenly (Mamba2 may replicate B and C). Only
+    the SD conv layout is: a DS page holds different bytes for the same state,
+    so it would need its own canonical format id.
+    """
+    if (
+        spec.mamba_type != MambaAttentionBackendEnum.GDN_ATTN
+        or spec.tp_replicated
+        or len(spec.shapes) != 2
+        or is_conv_state_dim_first()
+    ):
+        return None
+    conv = derive_mamba_conv_split(spec, tp_size, require_dim_first=False)
+    conv_bytes, ssm_bytes = conv.ssm_sizes
+    row_bytes = conv.local_conv_dim * conv.conv_dtype_size
+    runs: list[CopyRun] = []
+    for row in range(conv.conv_rows):
+        local_offset = row * row_bytes
+        canonical_offset = row * tp_size * row_bytes
+        for dim in conv.local_proj_dims:
+            size = dim * conv.conv_dtype_size
+            runs.append(
+                CopyRun(
+                    local_offset, canonical_offset + tp_rank * size, size, 1, size, size
+                )
+            )
+            local_offset += size
+            canonical_offset += tp_size * size
+    runs.append(
+        CopyRun(
+            conv_bytes,
+            tp_size * conv_bytes + tp_rank * ssm_bytes,
+            ssm_bytes,
+            1,
+            ssm_bytes,
+            ssm_bytes,
+        ),
+    )
+    return _coalesce_runs(runs)
+
+
+def _is_packed_state_page(
+    spec: MambaSpec, kv_cache: torch.Tensor | list[torch.Tensor] | None, num_blocks: int
+) -> bool:
+    """Whether the layer cache is the raw (num_blocks, 1, 1, bytes) page view
+    that MambaBase.bind_kv_cache unpacks, with the states packed from byte 0."""
+    return (
+        isinstance(kv_cache, torch.Tensor)
+        and kv_cache.ndim == 4
+        and tuple(kv_cache.shape[:3]) == (num_blocks, 1, 1)
+        and kv_cache.stride(3) == 1
+        and kv_cache.shape[3] * kv_cache.element_size() == spec.state_content_size_bytes
+    )
+
+
 def _layer_mapping(
     spec: KVCacheSpec,
     kv_cache: torch.Tensor | list[torch.Tensor] | None,
@@ -272,6 +342,23 @@ def _layer_mapping(
     ctx: _RankContext,
 ) -> CanonicalPageMapping | None:
     """Certified mapping for one layer at one rank, or None (fail closed)."""
+    if isinstance(spec, MambaSpec):
+        # A state is per request, not per token: CP has nothing to shard.
+        if ctx.cp_size > 1 or not _is_packed_state_page(spec, kv_cache, num_blocks):
+            return None
+        runs = mamba_state_runs(spec, ctx.tp_size, ctx.tp_rank)
+        if runs is None:
+            return None
+        page = spec.state_content_size_bytes
+        return CanonicalPageMapping(
+            canonical_page_size_bytes=ctx.tp_size * page,
+            local_page_size_bytes=page,
+            runs=runs,
+            num_writers=1,
+            writer_index=0,
+            parallelism_agnostic=True,
+        )
+
     if not isinstance(spec, AttentionSpec):
         return None
     bs = spec.block_size

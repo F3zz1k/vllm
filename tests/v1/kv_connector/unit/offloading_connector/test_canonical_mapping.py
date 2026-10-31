@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from unittest.mock import MagicMock
+from dataclasses import replace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import canonical_mapping
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     _layer_mapping,
     _opaque_fallback_mapping,
@@ -12,12 +14,15 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping i
     _verify_tiling,
     derive_canonical_mappings,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVQuantMode,
+    MambaSpec,
     MLAAttentionSpec,
 )
 from vllm.v1.kv_offload.base import CanonicalPageMapping, CopyRun
@@ -408,6 +413,119 @@ def test_opaque_fallback_places_page_whole():
     assert _triples(mapping.runs) == [(0, 2048, 1024)]
     assert mapping.num_writers == 1
     _verify_tiling("opaque", [_opaque_fallback_mapping(1024, 4, r) for r in range(4)])
+
+
+# ---------------------------------------------------------------------------
+# Gated delta net state
+# ---------------------------------------------------------------------------
+
+# 4 key heads of dim 2, 8 value heads of dim 3, kernel 4 plus 1 draft slot
+GDN_K_HEADS, GDN_V_HEADS, GDN_K_DIM, GDN_V_DIM, GDN_ROWS = 4, 8, 2, 3, 4
+
+
+def _gdn_spec(tp: int, **kwargs) -> MambaSpec:
+    shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+        tp, GDN_K_HEADS, GDN_V_HEADS, GDN_K_DIM, GDN_V_DIM, 4, num_spec=1
+    )
+    return MambaSpec(
+        block_size=4,
+        shapes=shapes,
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        **kwargs,
+    )
+
+
+def _state_cache(spec: MambaSpec) -> torch.Tensor:
+    return torch.zeros(
+        NUM_BLOCKS, 1, 1, spec.state_content_size_bytes, dtype=torch.int8
+    )
+
+
+def _gdn_pages(tp: int) -> tuple[bytes, list[bytes]]:
+    """The TP=1 state page and each rank's page, sharded the way the GDN
+    weight loaders shard conv1d ([Q | K | V] per rank) and the value heads."""
+    key_dim, value_dim = GDN_K_HEADS * GDN_K_DIM, GDN_V_HEADS * GDN_V_DIM
+    conv_dim = 2 * key_dim + value_dim
+    # int16 / int32 hold the bf16 / f32 element bytes with unique values
+    conv = torch.arange(GDN_ROWS * conv_dim, dtype=torch.int16).view(GDN_ROWS, -1)
+    ssm = torch.arange(GDN_V_HEADS * GDN_V_DIM * GDN_K_DIM, dtype=torch.int32)
+    ssm = (ssm + (1 << 20)).view(GDN_V_HEADS, GDN_V_DIM, GDN_K_DIM)
+
+    def page(conv_part: torch.Tensor, ssm_part: torch.Tensor) -> bytes:
+        return (
+            conv_part.contiguous().numpy().tobytes()
+            + ssm_part.contiguous().numpy().tobytes()
+        )
+
+    q, k, v = conv.split([key_dim, key_dim, value_dim], dim=1)
+    pages = [
+        page(
+            torch.cat([t.chunk(tp, dim=1)[rank] for t in (q, k, v)], dim=1),
+            ssm.chunk(tp, dim=0)[rank],
+        )
+        for rank in range(tp)
+    ]
+    return page(conv, ssm), pages
+
+
+def _gdn_mappings(tp: int) -> list[CanonicalPageMapping]:
+    spec = _gdn_spec(tp)
+    return [_mapping(spec, _state_cache(spec), _ctx(rank, tp=tp)) for rank in range(tp)]
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_gdn_cross_tp_store_load(tp):
+    """Every TP size stores exactly the TP=1 state page and loads its shard."""
+    reference, pages = _gdn_pages(tp)
+    mappings = _gdn_mappings(tp)
+    _verify_tiling("gdn", mappings)
+    assert all(m.parallelism_agnostic and m.num_writers == 1 for m in mappings)
+    assert mappings[0].canonical_page_size_bytes == len(reference)
+    assert _store_all(mappings, pages, len(reference)) == reference
+    assert [_load_one(m, reference) for m in mappings] == pages
+
+
+def test_gdn_single_rank_is_one_run():
+    (mapping,) = _gdn_mappings(1)
+    size = _gdn_spec(1).state_content_size_bytes
+    assert _triples(mapping.runs) == [(0, 0, size)]
+
+
+def test_gdn_fail_closed_cases():
+    spec = _gdn_spec(2)
+    cache = _state_cache(spec)
+    assert _try_mapping(spec, cache, _ctx(0, tp=2)) is not None
+    # Context parallelism
+    assert _try_mapping(spec, cache, _ctx(0, tp=2, dcp=2)) is None
+    # Other Mamba types, and state every rank holds whole
+    mamba2 = replace(spec, mamba_type=MambaAttentionBackendEnum.MAMBA2)
+    assert _try_mapping(mamba2, cache, _ctx(0, tp=2)) is None
+    assert _try_mapping(replace(spec, tp_replicated=True), cache, _ctx(0, tp=2)) is None
+    # A page view that is not the packed state page
+    assert _try_mapping(spec, cache[:, :, :, :-2], _ctx(0, tp=2)) is None
+    split_bytes = cache.view(NUM_BLOCKS, 1, 1, -1, 2)
+    assert _try_mapping(spec, split_bytes, _ctx(0, tp=2)) is None
+    # The DS conv layout holds the state in other bytes
+    with patch.object(canonical_mapping, "is_conv_state_dim_first", return_value=True):
+        assert _try_mapping(spec, cache, _ctx(0, tp=2)) is None
+
+
+def test_derive_gdn_hybrid():
+    attn_spec = _full_spec(num_kv_heads=1)
+    gdn_spec = _gdn_spec(2)
+    kv_cache_config = _kv_cache_config(
+        [
+            KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=attn_spec),
+            KVCacheGroupSpec(layer_names=["gdn"], kv_cache_spec=gdn_spec),
+        ]
+    )
+    kv_caches = {"attn": _split_nhd_cache(attn_spec), "gdn": _state_cache(gdn_spec)}
+    mappings = derive_canonical_mappings(
+        _vllm_config(tp=2, total_kv_heads=2), kv_cache_config, kv_caches
+    )
+    assert set(mappings) == {"attn", "gdn"}
+    assert all(m.parallelism_agnostic for m in mappings.values())
 
 
 # ---------------------------------------------------------------------------
