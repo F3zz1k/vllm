@@ -91,6 +91,33 @@ class Transfer:
 # (wait_stream), so the data copied is the same.
 COPY_THREAD = os.environ.get("VLLM_KV_OFFLOAD_COPY_THREAD", "0") == "1"
 
+# Debug (2026-10-31): check every canonical copy descriptor against the storage
+# of the tensor it was computed from before submitting it, so an address the
+# copy engine would fault on raises here with the offending descriptor instead.
+CHECK_BOUNDS = os.environ.get("VLLM_KV_OFFLOAD_CHECK_BOUNDS", "0") == "1"
+
+
+def _check_descriptor_bounds(
+    src: np.ndarray,
+    dst: np.ndarray,
+    sizes: np.ndarray,
+    src_tensor: torch.Tensor,
+    dst_tensor: torch.Tensor,
+    what: str,
+) -> None:
+    for name, addrs, tensor in (("src", src, src_tensor), ("dst", dst, dst_tensor)):
+        storage = tensor.untyped_storage()
+        lo = storage.data_ptr()
+        hi = lo + storage.nbytes()
+        bad = (addrs < lo) | (addrs + sizes.astype(np.uint64) > hi)
+        if bad.any():
+            i = int(np.argmax(bad))
+            raise RuntimeError(
+                f"KV offload {name} descriptor {i} of {what} lies outside its "
+                f"storage: {int(addrs[i]):#x} + {int(sizes[i])} not in "
+                f"[{lo:#x}, {hi:#x}), {int(bad.sum())} of {len(addrs)} bad"
+            )
+
 
 class _CopyThread:
     """One FIFO thread running submitted copy closures in order."""
@@ -562,6 +589,15 @@ class SingleDirectionOffloadingHandler:
             all_sizes[op_idx:end_idx].reshape(num_active_blocks, plan.num_frags)[:] = (
                 plan.frag_sizes
             )
+            if CHECK_BOUNDS:
+                _check_descriptor_bounds(
+                    all_src_u64[op_idx:end_idx],
+                    all_dst_u64[op_idx:end_idx],
+                    all_sizes[op_idx:end_idx],
+                    self.src_tensors[t_idx],
+                    self.dst_tensors[t_idx],
+                    f"group {g_idx} tensor {t_idx}",
+                )
             num_bytes += num_active_blocks * plan.total_bytes
             op_idx = end_idx
         return op_idx, num_bytes
