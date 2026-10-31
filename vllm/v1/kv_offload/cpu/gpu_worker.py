@@ -96,6 +96,10 @@ COPY_THREAD = os.environ.get("VLLM_KV_OFFLOAD_COPY_THREAD", "0") == "1"
 # copy engine would fault on raises here with the offending descriptor instead.
 CHECK_BOUNDS = os.environ.get("VLLM_KV_OFFLOAD_CHECK_BOUNDS", "0") == "1"
 
+# Experiment (2026-10-31): VLLM_KV_OFFLOAD_REGISTER=0 leaves the offload region
+# unregistered with the device, so copies go through the driver's own staging.
+REGISTER_REGION = os.environ.get("VLLM_KV_OFFLOAD_REGISTER", "1") == "1"
+
 
 def _check_descriptor_bounds(
     src: np.ndarray,
@@ -274,7 +278,9 @@ def _canonical_block_sizes(
 
 
 # Bound registration size to avoid driver limits on large host allocations.
-MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
+MAX_HOST_REGISTER_CHUNK_BYTES = int(
+    os.environ.get("VLLM_KV_OFFLOAD_REGISTER_CHUNK_BYTES", 64 * 1024**3)
+)
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
@@ -285,7 +291,17 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     # Chunks end on block-row boundaries, which are page aligned, so neither the
     # driver's page rounding nor any single block transfer straddles two
     # registrations.
-    rows_per_chunk = max(MAX_HOST_REGISTER_CHUNK_BYTES // region._row_stride, 1)
+    # A region shared by several engines (the shared KV pool) registers one
+    # row per call. On XPU, registering a multi-GiB shared region in one call
+    # made the copy engine fault intermittently (CAT errors) once several
+    # engines shared it; with the region unregistered the faults stopped
+    # (2026-10-31).
+    max_chunk = (
+        min(MAX_HOST_REGISTER_CHUNK_BYTES, region._row_stride)
+        if region.external
+        else MAX_HOST_REGISTER_CHUNK_BYTES
+    )
+    rows_per_chunk = max(max_chunk // region._row_stride, 1)
     chunk_size = rows_per_chunk * region._row_stride
 
     # Register, drain and roll back through the same helper, so a failed
@@ -912,7 +928,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         self._mmap_region = mmap_region
         pin_memory = PIN_MEMORY
         logger.info("Allocating %d CPU tensors...", len(kv_caches.tensors))
-        if mmap_region is not None and pin_memory:
+        if mmap_region is not None and pin_memory and REGISTER_REGION:
             pin_mmap_region(mmap_region)
         host_memory_is_pinned = pin_memory and (
             mmap_region is None or mmap_region.is_pinned

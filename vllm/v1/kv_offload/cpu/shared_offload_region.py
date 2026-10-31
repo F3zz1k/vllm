@@ -111,6 +111,8 @@ class SharedOffloadRegion:
         self.num_chunks = num_chunks
         self._row_stride = kv_bytes_per_chunk
         self.total_size_bytes = self.num_chunks * self._row_stride
+        # Mapped from a file another process owns and other engines share.
+        self.external = external_path is not None
 
         if external_path is not None:
             self._init_external(external_path, rank, cpu_page_size)
