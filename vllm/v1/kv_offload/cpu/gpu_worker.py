@@ -96,8 +96,9 @@ COPY_THREAD = os.environ.get("VLLM_KV_OFFLOAD_COPY_THREAD", "0") == "1"
 # copy engine would fault on raises here with the offending descriptor instead.
 CHECK_BOUNDS = os.environ.get("VLLM_KV_OFFLOAD_CHECK_BOUNDS", "0") == "1"
 
-# Experiment (2026-10-31): VLLM_KV_OFFLOAD_REGISTER=0 leaves the offload region
-# unregistered with the device, so copies go through the driver's own staging.
+# Debug (2026-10-31): VLLM_KV_OFFLOAD_REGISTER=0 leaves the offload region
+# unregistered with the device, so copies go through the driver's own staging;
+# it tells a registration fault (copy engine CAT errors) from any other.
 REGISTER_REGION = os.environ.get("VLLM_KV_OFFLOAD_REGISTER", "1") == "1"
 
 
@@ -278,9 +279,7 @@ def _canonical_block_sizes(
 
 
 # Bound registration size to avoid driver limits on large host allocations.
-MAX_HOST_REGISTER_CHUNK_BYTES = int(
-    os.environ.get("VLLM_KV_OFFLOAD_REGISTER_CHUNK_BYTES", 64 * 1024**3)
-)
+MAX_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
 
 
 def pin_mmap_region(region: SharedOffloadRegion) -> None:

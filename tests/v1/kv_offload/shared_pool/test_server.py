@@ -571,6 +571,33 @@ def test_compaction_keeps_every_byte(tmp_path):
     arena.close()
 
 
+def test_a_failed_move_gives_up_draining_its_superpage():
+    arena, big, small, b, s = two_classes(superpages=3)
+    for i in range(8):  # two small superpages
+        store(arena, s, [key(i)], f"S{i}".encode())
+    store(arena, b, [key(100)], b"B0")
+    for i in (1, 3, 5, 7):
+        arena.evict_run(small.runs[f"S{i}".encode()])
+    assert arena.prepare_store(b, [key(101)], b"B1") is None  # starts compaction
+    assert len(small.draining) == 1
+
+    def fail(job):
+        raise OSError("injected")
+    arena.mover._execute = fail
+    arena.mover.run_pending()
+    assert small.counters["move_failed"] == 2
+    assert not small.draining  # back to allocatable, no longer counted as supply
+    check(arena)
+    # Compaction is planned again instead of waiting on a superpage that
+    # never empties.
+    arena.mover._execute = arena._move_execute
+    assert arena.prepare_store(b, [key(101)], b"B1") is None
+    assert len(small.draining) == 1
+    arena.mover.run_pending()
+    assert store(arena, b, [key(101)], b"B1")[0] == [key(101)]
+    check(arena)
+
+
 def test_held_rows_are_not_moved():
     arena, big, small, b, s = two_classes(superpages=3)
     for i in range(8):

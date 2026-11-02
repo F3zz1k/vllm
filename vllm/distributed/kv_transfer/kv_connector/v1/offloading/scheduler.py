@@ -387,6 +387,9 @@ class RequestOffloadState:
     max_load_tokens: int | None = None
     # upper bound on tokens to offload for this request; None means no cap
     max_offload_tokens: int | None = None
+    # Store at compute time even while the pool is full (the write-through
+    # gate is closed), e.g. for a prefix that is primed in order to be pinned.
+    write_through: bool = False
     # number of hits in the GPU cache
     num_locally_computed_tokens: int = 0
     # In-flight job IDs. Per the connector's invariant, at any given time
@@ -440,6 +443,8 @@ class RequestOffloadState:
             logger.warning(
                 "max_offload_tokens must be a non-negative int, got %r; ignoring", raw
             )
+
+        self.write_through = bool(params) and params.get("write_through") is True
 
     def update_offload_keys(self) -> None:
         for group_config, group_state in zip(
@@ -1895,7 +1900,7 @@ class OffloadingConnectorScheduler:
                 ):
                     continue
 
-                if not self._write_through:
+                if not (self._write_through or req_status.write_through):
                     continue
                 key = self._make_boundary_key(
                     req, group_idx, boundary, req_status.req_context
@@ -2026,6 +2031,10 @@ class OffloadingConnectorScheduler:
             ]
             assert all(block_id != 0 for block_id in block_ids)
 
+            # No write-through gate here: a partial-tail state exists only in
+            # this hand-off (its key names a sub-block hash, which the band,
+            # keyed by GPU block hashes, never offers), so it is stored now or
+            # never; it costs one chunk per group.
             store_output = self.manager.prepare_store(keys, req_status.req_context)
             if store_output is None:
                 self._connector_stats.increase_counter(
@@ -2297,7 +2306,7 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            if not self._write_through:
+            if not (self._write_through or req_status.write_through):
                 # Pool full: the band writes these when the GPU is about to
                 # drop them.
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -2688,6 +2697,7 @@ class OffloadingConnectorScheduler:
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
                 if not status.finished_signaled:
+                    self._record_run(status)
                     self.manager.on_request_finished(status.req_context)
                 del self._req_status[req_id]
 

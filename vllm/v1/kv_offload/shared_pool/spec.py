@@ -35,8 +35,13 @@ from typing_extensions import override
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingManager
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    OffloadingManager,
+    OffloadingMetricMetadata,
+)
 from vllm.v1.kv_offload.config import OffloadingConfig
+from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec, envs_b70_private_pinned
@@ -53,6 +58,10 @@ from vllm.v1.kv_offload.shared_pool.manager import SharedPoolOffloadingManager
 logger = init_logger(__name__)
 
 DEFAULT_SOCKET = "/run/kvpool/kvpool.sock"
+# Bump when a commit changes what the bytes of a chunk mean (a KV kernel, a
+# cache format, the canonical layout) without changing the vLLM release: the
+# layout key carries the release, not the build, so a rebuild of the same
+# release keeps the pool's chunks and its spilled runs.
 _LAYOUT_VERSION = 2
 # A reattach of a running engine must not stall its scheduler for long.
 _REATTACH_TIMEOUT_SEC = 5.0
@@ -65,16 +74,17 @@ ArenaIdentity = tuple[tuple[int, int], int]
 
 def _build_identity(model_name: str) -> dict[str, Any]:
     """What else decides the meaning of a chunk's bytes beyond its geometry:
-    the vLLM build (kernels and KV formats) and the checkpoint behind the model
-    path. The KV cache dtype is already in the FileMapper fields (model.dtype).
-    Every part must come out the same in the scheduler and in the workers, so
-    nothing here may depend on per-process state such as the current config.
-    Each part is best effort: a missing one is recorded as None."""
+    the vLLM release (without the local build suffix, see _LAYOUT_VERSION) and
+    the checkpoint behind the model path. The KV cache dtype is already in the
+    FileMapper fields (model.dtype). Every part must come out the same in the
+    scheduler and in the workers, so nothing here may depend on per-process
+    state such as the current config. Each part is best effort: a missing one
+    is recorded as None."""
     out: dict[str, Any] = {}
     try:
         import vllm
 
-        out["vllm_version"] = vllm.__version__
+        out["vllm_version"] = vllm.__version__.split("+", 1)[0]
     except Exception:
         out["vllm_version"] = None
     try:
@@ -111,6 +121,23 @@ class SharedPoolOffloadingSpec(CPUOffloadingSpec):
         self._scheduler_arena: ArenaIdentity | None = None
         # Worker side: what this worker mapped, for its handshake.
         self._mapped_arena: ArenaIdentity | None = None
+
+    @classmethod
+    @override
+    def build_metric_definitions(
+        cls, extra_config: dict[str, Any]
+    ) -> dict[str, OffloadingMetricMetadata]:
+        # The transfer-occupancy gauges of the private CPU tier have no
+        # counterpart in a pool shared by several engines: drop them rather
+        # than export zeros. The server's STATE reports the pool's occupancy.
+        definitions = super().build_metric_definitions(extra_config)
+        for name in (
+            CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC,
+            CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC,
+            CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC,
+        ):
+            definitions.pop(name, None)
+        return definitions
 
     @override
     def _cpu_bytes_to_use(self) -> int:

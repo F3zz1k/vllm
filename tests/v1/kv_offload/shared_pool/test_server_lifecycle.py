@@ -287,6 +287,33 @@ def test_a_second_spill_writes_only_new_chunks_and_drops_unused_files(tmp_path):
         srv.stop()
 
 
+def test_a_chunk_file_that_fails_to_restore_is_written_again(tmp_path):
+    srv = Server(tmp_path)
+    try:
+        a = connect(srv.sock)
+        path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
+        put(a, path, [key(1)], b"X", 1)
+        a.close()
+        b = connect(srv.sock)
+        call(b, P.OP_RELEASE, {})
+        wait_state(srv.sock, P.ABSENT)
+        (chunk,) = (tmp_path / "spill").rglob("*.bin")
+        chunk.write_bytes(b"short")  # unreadable as a row
+        call(b, P.OP_ATTACH, attach_args())
+        cls = srv.srv.arena.classes["p"]
+        assert key(1) not in cls.index
+        assert cls.counters["spill_restore_failed"] == 1
+        put(b, path, [key(1)], b"X", 4)
+        b.close()
+        c = connect(srv.sock)
+        call(c, P.OP_RELEASE, {})
+        wait_state(srv.sock, P.ABSENT)
+        assert chunk.read_bytes() == bytes([4]) * ROW  # a fresh copy, not the bad file
+        c.close()
+    finally:
+        srv.stop()
+
+
 def test_spill_cap_keeps_the_newest_whole_runs(tmp_path):
     srv = Server(tmp_path, spill_max_bytes=2 * ROW)
     try:

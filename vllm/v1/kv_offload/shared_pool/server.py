@@ -625,6 +625,16 @@ class LayoutClass:
                 self.partial[sp] = None
             self.free_rows += 1
 
+    def undrain(self, sp: int) -> None:
+        """Give up draining a superpage (a row move failed, so it can never
+        empty): its free rows become allocatable again and compaction no
+        longer counts it as supply."""
+        self.draining.discard(sp)
+        free = self.sp_free[sp]
+        if free:
+            self.partial[sp] = None
+            self.free_rows += len(free)
+
     def add_entry(self, key: bytes, entry: Entry) -> None:
         self.index[key] = entry
         self.row_key[entry.row] = key
@@ -1117,6 +1127,8 @@ class Arena:
             logger.warning("moving %s failed: %s", key.hex(), err)
             cls.counters["move_failed"] += 1
             cls.give_back(dst)
+            if cls.sp_of(src) in cls.draining:
+                cls.undrain(cls.sp_of(src))
             return
         del cls.row_key[src]
         cls.row_key[dst] = key
@@ -1610,6 +1622,12 @@ class SpillStore:
             except OSError as exc:
                 logger.warning("spilled chunk %s not restored: %s", rel, exc)
                 failed.append((cls.name, key))
+                # Forget the file, so the next spill writes a fresh copy.
+                self.files.pop(rel, None)
+                try:
+                    os.unlink(os.path.join(self.dir, rel))
+                except OSError:
+                    pass
         logger.info("restored %d spilled chunks in %.1f s (%d failed)",
                     len(jobs) - len(failed), time.monotonic() - t0, len(failed))
         return failed

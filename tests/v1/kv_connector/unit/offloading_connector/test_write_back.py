@@ -13,7 +13,11 @@ import pytest
 
 import vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler as sched_mod
 from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
+    _make_partial_tail_request,
     _make_partial_tail_scheduler,
+)
+from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    generate_store_output,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
@@ -201,3 +205,46 @@ def test_a_finished_request_merges_into_its_conversation(band, monkeypatch, writ
     (ctx, tag), _ = scheduler.manager.merge_tag.call_args
     assert ctx.req_id == "req" and tag == keys_by_group[attn_idx][-1]
     assert (tag in scheduler._run_keys) == write_back
+
+
+@pytest.mark.parametrize(
+    "params, forced",
+    [(None, False), ({}, False), ({"write_through": "yes"}, False),
+     ({"write_through": True}, True)],
+)
+def test_write_through_param_is_read_per_request(params, forced):
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler, params)
+    assert scheduler._req_status["req"].write_through is forced
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_a_forced_request_stores_while_the_gate_is_closed(forced):
+    # A pin prime (router: kv_transfer_params.write_through) must reach the
+    # pool even when it is full, or the primed prefix is pinned nowhere.
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler, {"write_through": True} if forced else None)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    scheduler._write_through = False
+    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 98, 16)]})
+    assert bool(jobs) is forced
+    assert scheduler.manager.prepare_store.called is forced
+
+
+def test_reset_cache_merges_a_finished_unsignalled_request(band):
+    scheduler, _, _ = band
+    request = _make_partial_tail_request(scheduler)
+    request.is_finished.return_value = True
+    status = scheduler._req_status["req"]
+    attn_idx = next(
+        idx for idx, cfg in enumerate(scheduler.config.kv_group_configs)
+        if not isinstance(cfg.kv_cache_spec, MambaSpec)
+    )
+    status.group_states[attn_idx].offload_keys.append(OffloadKey(b"tip"))
+    scheduler.manager.merge_tag = MagicMock()
+    scheduler.reset_cache()
+    (ctx, tag), _ = scheduler.manager.merge_tag.call_args
+    assert ctx.req_id == "req" and tag == OffloadKey(b"tip")
+    assert "req" not in scheduler._req_status
