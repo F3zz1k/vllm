@@ -81,6 +81,8 @@ def band(monkeypatch):
     blocks[4].set_block_hash(make_block_hash_with_group_id(BlockHash(b"p5"), group), chunk + 1)
     pool = FakeGPUPool(blocks)
     scheduler.bind_gpu_block_pool(pool)
+    # Band mechanics on lone blocks; the state-class rule has its own test.
+    scheduler._has_state_groups = False
     scheduler.manager.pool_free_fraction = MagicMock(return_value=0.0)
     present = {OffloadKey(bytes(blocks[3].block_hash))}
 
@@ -218,19 +220,79 @@ def test_write_through_param_is_read_per_request(params, forced):
     assert scheduler._req_status["req"].write_through is forced
 
 
+def _cpu_store_output(keys, req_context=None):
+    keys = list(keys)
+    return PrepareStoreOutput(keys_to_store=keys,
+                              store_spec=CPULoadStoreSpec(list(range(len(keys)))),
+                              evicted_keys=[])
+
+
 @pytest.mark.parametrize("forced", [False, True])
-def test_a_forced_request_stores_while_the_gate_is_closed(forced):
-    # A pin prime (router: kv_transfer_params.write_through) must reach the
-    # pool even when it is full, or the primed prefix is pinned nowhere.
+def test_a_boundary_state_is_stored_while_the_gate_is_closed(forced):
+    # A boundary state exists only in its hand-off (the band cannot offer
+    # interior states), so the gate never drops it; with the gate closed the
+    # attention blocks at that boundary go with it, making the run restorable
+    # at once instead of a state-only run that is evicted first.
     scheduler = _make_partial_tail_scheduler()
     _make_partial_tail_request(scheduler, {"write_through": True} if forced else None)
-    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
-        generate_store_output(keys)
+    status = scheduler._req_status["req"]
+    attn_idx, attn_cfg = next(
+        (idx, cfg) for idx, cfg in enumerate(scheduler.config.kv_group_configs)
+        if not isinstance(cfg.kv_cache_spec, MambaSpec)
     )
+    status.group_states[attn_idx].block_ids[:] = list(
+        range(41, 41 + 16 // attn_cfg.tokens_per_block)
+    )
+    scheduler.manager.prepare_store.side_effect = _cpu_store_output
     scheduler._write_through = False
     jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 98, 16)]})
-    assert bool(jobs) is forced
-    assert scheduler.manager.prepare_store.called is forced
+    srcs = sorted(j.src_spec.block_ids.tolist()[0] for j in jobs.values())
+    if forced:
+        assert srcs == [98]       # write-through request: normal stores carry attention
+    else:
+        assert srcs == sorted([98, 41 + 16 // attn_cfg.tokens_per_block - 1])
+    assert all(j in status.transfer_jobs for j in jobs)
+
+
+def test_a_lone_block_is_not_stored_for_a_class_with_state(band):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True  # the fixture's config is hybrid
+    scheduler.manager.prepare_store_run = MagicMock()
+    assert scheduler._build_write_back_jobs() == {}
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert all(b.ref_cnt == 0 for b in blocks)
+
+
+def _register_run(scheduler, blocks, idxs):
+    chain = [OffloadKey(bytes(blocks[i].block_hash)) for i in idxs]
+    scheduler._run_keys[chain[-1]] = chain
+    for k in chain:
+        scheduler._key_run[k] = chain[-1]
+    return chain
+
+
+def test_a_run_larger_than_the_budget_is_written_once_nothing_is_held(band, monkeypatch):
+    scheduler, pool, blocks = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 2)
+    chain = _register_run(scheduler, blocks, (1, 2, 5))  # 3 storable members > 2
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+    scheduler._has_state_groups = True  # no lone blocks: only the run
+    jobs = scheduler._build_write_back_jobs()
+    (keys, tag), kwargs = scheduler.manager.prepare_store_run.call_args
+    assert list(keys) == chain and tag == chain[-1] and kwargs["whole"]
+    assert sorted(j.src_spec.block_ids.tolist()[0] for j in jobs.values()) == [2, 3, 6]
+    assert scheduler._wb_counts["run_oversize"] == 1
+
+
+def test_an_oversize_run_waits_while_other_blocks_are_held(band, monkeypatch):
+    scheduler, pool, blocks = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 2)
+    _register_run(scheduler, blocks, (1, 2, 5))
+    scheduler._wb_held[999] = [KVCacheBlock(99)]
+    scheduler.manager.prepare_store_run = MagicMock()
+    assert scheduler._build_write_back_jobs() == {}
+    assert scheduler._wb_counts["run_deferred_budget"] == 1
 
 
 def test_reset_cache_merges_a_finished_unsignalled_request(band):

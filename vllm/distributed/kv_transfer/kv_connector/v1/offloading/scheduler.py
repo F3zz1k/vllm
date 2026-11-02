@@ -681,6 +681,13 @@ class OffloadingConnectorScheduler:
         self._run_keys: "OrderedDict[OffloadKey, list[OffloadKey]]" = OrderedDict()
         self._key_run: dict[OffloadKey, OffloadKey] = {}
         self._write_through = True
+        # A class with recurrent state restores only from a run holding every
+        # state group at some boundary; a lone block can never be one.
+        self._has_state_groups = any(
+            isinstance(config.kv_cache_spec, MambaSpec)
+            for config in self.config.kv_group_configs
+        )
+        self._wb_counts: Counter = Counter()
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
@@ -735,6 +742,7 @@ class OffloadingConnectorScheduler:
         return (
             _b70.cpu_tier_snapshot(self.manager, self._b70_kind, slot_bytes)
             + f" inflight_store_jobs={n_store}"
+            f" write_back={dict(self._wb_counts)}"
             f" inflight_load_jobs={len(jobs) - n_store}"
             f" tracked_reqs={len(self._req_status)}"
         )
@@ -1003,9 +1011,20 @@ class OffloadingConnectorScheduler:
                     found = self._storable_free_block(run_key, config_idx_by_group)
                     if found is not None:
                         members.append((run_key, *found))
-                if not members or taken + len(members) > budget:
+                if not members:
                     continue
+                if taken + len(members) > budget:
+                    # A run larger than the whole budget is written alone
+                    # once nothing else is held, rather than never.
+                    if taken or self._wb_held:
+                        self._wb_counts["run_deferred_budget"] += 1
+                        continue
+                    self._wb_counts["run_oversize"] += 1
+                self._wb_counts["run_offered"] += 1
             else:
+                if self._has_state_groups:
+                    self._wb_counts["lone_block_skipped"] += 1
+                    continue
                 found = self._storable_free_block(key, config_idx_by_group)
                 if found is None:
                     continue
@@ -1026,6 +1045,7 @@ class OffloadingConnectorScheduler:
             else:
                 store_output = self.manager.prepare_store(keys, None)
             if store_output is None:
+                self._wb_counts["store_refused"] += 1
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
                 continue
             chunk_by_key = dict(
@@ -1888,6 +1908,7 @@ class OffloadingConnectorScheduler:
             req = req_status.req
             max_boundary = self._calc_num_offloadable_tokens(req_status, req.num_tokens)
             b70_stored: list[tuple[int, int, int]] = []
+            handed: set[int] = set()
             for group_idx, block_id, boundary in entries:
                 config_idx = config_idx_by_group.get(group_idx)
                 if config_idx is None:
@@ -1900,8 +1921,10 @@ class OffloadingConnectorScheduler:
                 ):
                     continue
 
-                if not (self._write_through or req_status.write_through):
-                    continue
+                # No write-through gate: a boundary state is stored only
+                # here (interior states carry no GPU hash under sparse
+                # retention, so the band cannot offer them).
+                handed.add(boundary)
                 key = self._make_boundary_key(
                     req, group_idx, boundary, req_status.req_context
                 )
@@ -1948,6 +1971,10 @@ class OffloadingConnectorScheduler:
                     boundary // group_config.tokens_per_chunk - 1,
                     key,
                 )
+            if handed and not (self._write_through or req_status.write_through):
+                store_jobs.update(
+                    self._build_boundary_attention_jobs(req_status, handed, b70_stored)
+                )
             if self._b70_trace and entries:
                 b70_offered = Counter(
                     (self._b70_kind(g), b) for g, _, b in entries
@@ -1963,6 +1990,89 @@ class OffloadingConnectorScheduler:
                     {f"{k}@{b}": n for (k, b), n in sorted(b70_offered.items())},
                     {f"{k}@{b}": n for (k, b), n in sorted(b70_done.items())},
                     [j for _, _, j in b70_stored],
+                )
+        return store_jobs
+
+    def _build_boundary_attention_jobs(
+        self,
+        req_status: "RequestOffloadState",
+        boundaries: set[int],
+        stored: list[tuple[int, int, int]],
+    ) -> dict[int, TransferJob]:
+        """With compute-time stores off, store the attention blocks at each
+        boundary whose state was just handed off, so the run holds a complete
+        boundary at once (a state-only run is unrestorable and is the first
+        thing evicted) and the band adds the rest of the prefix later."""
+        store_jobs: dict[int, TransferJob] = {}
+        num_groups = len(self.config.kv_group_configs)
+        req = req_status.req
+        for boundary in sorted(boundaries):
+            members = []
+            for config_idx, (group_config, group_state) in enumerate(
+                zip(self.config.kv_group_configs, req_status.group_states)
+            ):
+                if isinstance(group_config.kv_cache_spec, MambaSpec):
+                    continue
+                if boundary % group_config.tokens_per_chunk != 0:
+                    continue
+                block_idx = boundary // group_config.tokens_per_block - 1
+                if not 0 <= block_idx < len(group_state.block_ids):
+                    continue
+                block_id = group_state.block_ids[block_idx]
+                if block_id == 0:
+                    continue
+                key = self._make_boundary_key(
+                    req, group_config.group_idx, boundary, req_status.req_context
+                )
+                members.append((config_idx, group_config, block_id, block_idx, key))
+            if not members:
+                continue
+            store_output = self.manager.prepare_store(
+                [m[4] for m in members], req_status.req_context
+            )
+            if store_output is None:
+                self._wb_counts["boundary_set_refused"] += 1
+                self._connector_stats.increase_counter(
+                    _ConnectorMetricName.ALLOCATION_FAILURE
+                )
+                continue
+            self._wb_counts["boundary_set_stored"] += 1
+            chunk_by_key = dict(
+                zip(store_output.keys_to_store, store_output.store_spec.block_ids.tolist())
+            )
+            for config_idx, group_config, block_id, block_idx, key in members:
+                chunk = chunk_by_key.get(key)
+                if chunk is None:
+                    continue
+                job_id = self._generate_job_id()
+                req_status.transfer_jobs.add(job_id)
+                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+                self._jobs[job_id] = TransferJobStatus(
+                    req_id=req.request_id,
+                    pending_count=self.config.num_workers,
+                    keys={key},
+                    is_store=True,
+                    fenced_block_ids=[block_id],
+                )
+                if self._b70_trace:
+                    self._b70_job_submitted(req.request_id, True)
+                    stored.append((group_config.group_idx, boundary, job_id))
+                group_sizes = [0] * num_groups
+                group_sizes[config_idx] = 1
+                block_indices = [0] * num_groups
+                block_indices[config_idx] = block_idx
+                store_jobs[job_id] = TransferJob(
+                    req_id=req.request_id,
+                    src_spec=GPULoadStoreSpec(
+                        [block_id], group_sizes=group_sizes, block_indices=block_indices
+                    ),
+                    dst_spec=type(store_output.store_spec)([chunk]),
+                )
+                self._events_tracker.record_store(
+                    req,
+                    group_config,
+                    boundary // group_config.tokens_per_chunk - 1,
+                    key,
                 )
         return store_jobs
 
