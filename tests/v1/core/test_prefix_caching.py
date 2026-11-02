@@ -510,6 +510,7 @@ def test_hisparse_indexer_offload_is_capped_by_missing_host_prefix():
     _, num_local, _ = manager.get_computed_blocks(resumed)
     connector = object.__new__(OffloadingConnector)
     connector._kv_cache_config = manager.kv_cache_config
+    connector.connector_scheduler = None
     connector.bind_kv_cache_manager(manager)
     assert num_local == 0
     assert connector._max_loadable_tokens(resumed, num_local) == 0
@@ -548,7 +549,10 @@ def test_connector_completes_partial_prefix_without_importing_missing_host_kv(
 
     connector = object.__new__(OffloadingConnector)
     connector._kv_cache_config = manager.kv_cache_config
-    connector.connector_scheduler = SimpleNamespace(get_num_new_matched_tokens=lookup)
+    # bind_kv_cache_manager hands the scheduler side the GPU block pool.
+    connector.connector_scheduler = SimpleNamespace(
+        get_num_new_matched_tokens=lookup, bind_gpu_block_pool=lambda pool: None
+    )
     if nested:
         for _ in range(2):
             outer = object.__new__(MultiConnector)
