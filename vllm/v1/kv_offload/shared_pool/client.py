@@ -7,12 +7,6 @@ import socket
 
 from vllm.v1.kv_offload.shared_pool import protocol as P
 
-# TODO(kvpool protocol contract v2): these belong in protocol.py, which the
-# server side owns; integration moves them there and drops this block.
-PROTOCOL_VERSION = 2
-OP_MERGE_TAG = "merge_tag"  # (src_tag, dst_tag)
-OP_STATE = "state"  # no attach needed
-
 # How long an engine waits for the server to answer ATTACH or INFO. The server
 # defers both until its arena is ready (created, populated, spill restored).
 ATTACH_TIMEOUT_SEC = float(os.environ.get("VLLM_KVPOOL_ATTACH_TIMEOUT_SEC", "900"))

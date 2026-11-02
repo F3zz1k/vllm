@@ -86,6 +86,12 @@ def build_offloading_config(
                 parallel_config.decode_context_parallel_size,
             ),
             layer_names=tuple(group.layer_names),
+            holds_state=isinstance(
+                group.kv_cache_spec.first_spec
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else group.kv_cache_spec,
+                MambaSpec,
+            ),
         )
         for group_id, group in selected_groups
     )

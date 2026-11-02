@@ -1013,8 +1013,10 @@ class OffloadingConnectorScheduler:
         for tag, members in units:
             keys = [m[0] for m in members]
             if hasattr(self.manager, "prepare_store_run"):
+                # A known run is a whole conversation; a block of no known
+                # run is stored alone, as a run of its own.
                 store_output = self.manager.prepare_store_run(
-                    keys, tag if tag is not None else keys[0]
+                    keys, tag if tag is not None else keys[0], whole=tag is not None
                 )
             else:
                 store_output = self.manager.prepare_store(keys, None)

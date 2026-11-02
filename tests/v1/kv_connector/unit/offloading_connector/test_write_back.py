@@ -152,27 +152,27 @@ def test_whole_run_is_written_root_first_under_its_tag(band):
     for k in chain:
         scheduler._key_run[k] = tag
     calls = []
-    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t: (
-        calls.append((list(keys), t)) or PrepareStoreOutput(
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t, whole: (
+        calls.append((list(keys), t, whole)) or PrepareStoreOutput(
             keys_to_store=list(keys), store_spec=CPULoadStoreSpec(list(range(len(keys)))),
             evicted_keys=[])))
     jobs = scheduler._build_write_back_jobs()
     # One tagged store for the whole run, root first, even though the queue
-    # holds the tip nearest eviction.
+    # holds the tip nearest eviction; only a known run is marked whole.
     lone = OffloadKey(bytes(blocks[3].block_hash))
-    assert calls == [(chain, tag), ([lone], lone)]
+    assert calls == [(chain, tag, True), ([lone], lone, False)]
     assert [j.src_spec.block_ids.tolist()[0] for j in jobs.values()] == [2, 3, 6, 4]
 
 
 def test_a_block_of_no_known_run_is_a_run_of_its_own(band):
     scheduler, pool, blocks = band
     calls = []
-    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t: (
-        calls.append((list(keys), t)) or PrepareStoreOutput(
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t, whole: (
+        calls.append((list(keys), t, whole)) or PrepareStoreOutput(
             keys_to_store=list(keys), store_spec=CPULoadStoreSpec([0]),
             evicted_keys=[])))
     scheduler._build_write_back_jobs()
-    assert calls and all(keys == [tag] for keys, tag in calls)
+    assert calls and all(keys == [tag] and not whole for keys, tag, whole in calls)
 
 
 def _finished(scheduler, keys_by_group):

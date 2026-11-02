@@ -667,6 +667,7 @@ def test_dcp_scales_attention_but_not_mamba_group_blocks():
         32,
         16,
     )
+    assert tuple(g.holds_state for g in offloading_config.groups) == (False, True)
     scheduler_config = SchedulerOffloadConfig.from_spec(
         MockOffloadingSpec(offloading_config),
         config,
@@ -739,6 +740,11 @@ def test_dcp_scales_uniform_type_group_alongside_mamba(spec_kind, expected):
     assert tuple(group.tokens_per_block for group in offloading_config.groups) == (
         expected,
         16,
+    )
+    # A uniform wrapper is unwrapped to tell whether it holds recurrent state.
+    assert tuple(g.holds_state for g in offloading_config.groups) == (
+        spec_kind == "mamba",
+        True,
     )
 
 

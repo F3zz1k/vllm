@@ -232,18 +232,21 @@ class SharedPoolOffloadingManager(OffloadingManager):
         return self._prepare_store(keys, self._request_tag(req_context))
 
     def prepare_store_run(
-        self, keys: Collection[OffloadKey], tag: OffloadKey
+        self, keys: Collection[OffloadKey], tag: OffloadKey, whole: bool = False
     ) -> PrepareStoreOutput | None:
-        """Store keys in the run of conversation ``tag``, all or nothing."""
-        return self._prepare_store(keys, bytes(tag))
+        """Store keys in the run of ``tag``, all or nothing. ``whole`` marks a
+        whole conversation, which the server refuses when the run could not
+        restore anything (no recurrent state at any of its boundaries)."""
+        return self._prepare_store(keys, bytes(tag), whole)
 
     def _prepare_store(
-        self, keys: Collection[OffloadKey], tag: str | bytes
+        self, keys: Collection[OffloadKey], tag: str | bytes, whole: bool = False
     ) -> PrepareStoreOutput | None:
+        args: list[Any] = [[bytes(k) for k in keys], tag]
+        if whole:
+            args.append(True)
         try:
-            result = self._call_soft(
-                P.OP_PREPARE_STORE_TAGGED, [[bytes(k) for k in keys], tag]
-            )
+            result = self._call_soft(P.OP_PREPARE_STORE_TAGGED, args)
         except ConnectionError:
             return None
         if result is None:
@@ -268,7 +271,7 @@ class SharedPoolOffloadingManager(OffloadingManager):
         conversation ``tag``."""
         try:
             self._call_soft(
-                C.OP_MERGE_TAG, (self._request_tag(req_context), bytes(tag))
+                P.OP_MERGE_TAG, (self._request_tag(req_context), bytes(tag))
             )
         except ConnectionError:
             pass
@@ -327,7 +330,7 @@ class SharedPoolOffloadingManager(OffloadingManager):
         if now - self._state_at >= max_age:
             self._state_at = now
             try:
-                state: Any = self._call_soft(C.OP_STATE)
+                state: Any = self._call_soft(P.OP_STATE)
                 self._free_fraction = float(
                     state["classes"][self._pool]["free_fraction"]
                 )

@@ -5,6 +5,7 @@ contract v2), against a scripted pool server running in a thread. The real
 server has its own tests; these check what the engine sends and how it
 behaves when the pool is slow, absent or replaced."""
 
+import dataclasses
 import os
 import socket
 import threading
@@ -75,7 +76,7 @@ class ScriptedServer:
         self.handlers: dict[str, Callable[[Any], Any]] = {
             P.OP_ATTACH: lambda a: self.info(),
             P.OP_INFO: lambda a: self.info(),
-            C.OP_STATE: lambda a: {
+            P.OP_STATE: lambda a: {
                 "state": "READY",
                 "classes": {"p": {"free_fraction": self.free_fraction}},
             },
@@ -271,6 +272,23 @@ def test_attach_sends_protocol_v2_and_sizes_from_the_reply(server):
     assert op == P.OP_ATTACH
     assert args["version"] == 2 and args["pool"] == "p"
     assert args["row_stride"] == PAGE and args["name"] == "engine-a"
+    assert args["state_groups"] == []
+
+
+def test_attach_and_info_name_the_recurrent_groups(server):
+    config = make_config(server.sock_path)
+    config = dataclasses.replace(
+        config,
+        groups=(
+            OffloadingGroupConfig(16, ("attn",), 0),
+            OffloadingGroupConfig(16, ("gdn",), 1, holds_state=True),
+        ),
+    )
+    spec = OffloadingSpecFactory.create_spec(config)
+    assert isinstance(spec, SharedPoolOffloadingSpec)
+    manager_of(spec)
+    assert spec._pool_args()["state_groups"] == [1]
+    assert server.calls[0][1]["state_groups"] == [1]
 
 
 def test_every_store_names_a_run(server):
@@ -278,20 +296,22 @@ def test_every_store_names_a_run(server):
     out = manager.prepare_store([key(1), key(2)], CTX)
     assert out is not None and out.keys_to_store == [key(1), key(2)]
     manager.prepare_store_run([key(3)], key(9))
+    manager.prepare_store_run([key(4)], key(9), whole=True)
     stores = [a for op, a in server.calls if op == P.OP_PREPARE_STORE_TAGGED]
     # A compute-time store is in its request's run, a write-back store in its
-    # conversation's; untagged stores are gone.
+    # conversation's (marked whole when it is one); untagged stores are gone.
     assert stores == [
         [[bytes(key(1)), bytes(key(2))], "e1/r"],
         [[bytes(key(3))], bytes(key(9))],
+        [[bytes(key(4))], bytes(key(9)), True],
     ]
-    assert P.OP_PREPARE_STORE not in server.ops()
+    assert "prepare_store" not in server.ops()
 
 
 def test_merge_tag_moves_the_request_run_into_its_conversation(server):
     manager = manager_of(make_spec(server.sock_path, engine_id="e1"))
     manager.merge_tag(CTX, key(5))
-    assert server.calls[-1] == (C.OP_MERGE_TAG, ("e1/r", bytes(key(5))))
+    assert server.calls[-1] == (P.OP_MERGE_TAG, ("e1/r", bytes(key(5))))
 
 
 def test_requests_offer_loaded_chunks_so_runs_start_at_the_root(server):
@@ -316,7 +336,7 @@ def test_free_fraction_comes_from_state_at_most_once_a_second(server):
     assert manager.pool_free_fraction(max_age=0) == 0.01
     server.free_fraction = 0.9
     assert manager.pool_free_fraction() == 0.01
-    assert server.ops().count(C.OP_STATE) == 1
+    assert server.ops().count(P.OP_STATE) == 1
 
 
 # --- running without the pool ---

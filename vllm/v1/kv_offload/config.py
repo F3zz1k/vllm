@@ -16,6 +16,9 @@ class OffloadingGroupConfig:
     layer_names: tuple[str, ...]
     # Original KVCacheConfig group index.
     group_id: int
+    # Whether the group holds recurrent state (Mamba, gated delta net): a
+    # prefix restores only up to a block whose state was offloaded too.
+    holds_state: bool = False
 
 
 @dataclass(frozen=True)

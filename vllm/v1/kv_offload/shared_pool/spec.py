@@ -165,12 +165,14 @@ class SharedPoolOffloadingSpec(CPUOffloadingSpec):
             "pool": self.pool_name,
             "layout_key": self.layout_key,
             "row_stride": self.kv_bytes_per_chunk,
+            # Recurrent groups: the server evicts first a run that restores nothing.
+            "state_groups": [g.group_id for g in self.config.groups if g.holds_state],
         }
 
     def _attach_args(self) -> dict[str, Any]:
         return {
             **self._pool_args(),
-            "version": C.PROTOCOL_VERSION,
+            "version": P.PROTOCOL_VERSION,
             "name": self.config.engine_id,
         }
 
