@@ -6,6 +6,7 @@ stores the ones the pool lacks, and on completion returns them to the queue
 HEAD with their hash, so the hold does not change eviction order.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,7 +24,8 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     make_block_hash_with_group_id,
 )
-from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput
+from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput, ReqContext
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -75,7 +77,7 @@ def band(monkeypatch):
     blocks[4].set_block_hash(make_block_hash_with_group_id(BlockHash(b"p5"), group), chunk + 1)
     pool = FakeGPUPool(blocks)
     scheduler.bind_gpu_block_pool(pool)
-    scheduler.manager.pool_stats = MagicMock(return_value={"num_chunks": 100, "free": 0})
+    scheduler.manager.pool_free_fraction = MagicMock(return_value=0.0)
     present = {OffloadKey(bytes(blocks[3].block_hash))}
 
     def prepare_store(keys, req_context):
@@ -107,7 +109,7 @@ def test_completion_releases_to_queue_head_with_hash(band):
     for job_id in jobs:
         for _ in range(scheduler.config.num_workers):
             meta.mark_completed(job_id)
-    scheduler._update_connector_output(KVConnectorOutput(kv_connector_worker_meta=meta))
+    scheduler.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=meta))
     assert scheduler.manager.complete_store.call_count == 3
     assert not scheduler._wb_held and not scheduler._jobs
     assert all(b.ref_cnt == 0 for b in blocks)
@@ -126,7 +128,10 @@ def test_held_budget_caps_the_band(band, monkeypatch):
 def test_write_through_stops_only_when_pool_is_full(band):
     scheduler, _, _ = band
     assert not scheduler._write_through_enabled()
-    scheduler.manager.pool_stats.return_value = {"num_chunks": 100, "free": 50}
+    scheduler.manager.pool_free_fraction.return_value = 0.5
+    assert scheduler._write_through_enabled()
+    # Unknown (pool unreachable): stores run and fail softly.
+    scheduler.manager.pool_free_fraction.return_value = None
     assert scheduler._write_through_enabled()
 
 
@@ -154,5 +159,45 @@ def test_whole_run_is_written_root_first_under_its_tag(band):
     jobs = scheduler._build_write_back_jobs()
     # One tagged store for the whole run, root first, even though the queue
     # holds the tip nearest eviction.
-    assert calls == [(chain, tag)]
-    assert [j.src_spec.block_ids.tolist()[0] for j in jobs.values()] == [2, 3, 6]
+    lone = OffloadKey(bytes(blocks[3].block_hash))
+    assert calls == [(chain, tag), ([lone], lone)]
+    assert [j.src_spec.block_ids.tolist()[0] for j in jobs.values()] == [2, 3, 6, 4]
+
+
+def test_a_block_of_no_known_run_is_a_run_of_its_own(band):
+    scheduler, pool, blocks = band
+    calls = []
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t: (
+        calls.append((list(keys), t)) or PrepareStoreOutput(
+            keys_to_store=list(keys), store_spec=CPULoadStoreSpec([0]),
+            evicted_keys=[])))
+    scheduler._build_write_back_jobs()
+    assert calls and all(keys == [tag] for keys, tag in calls)
+
+
+def _finished(scheduler, keys_by_group):
+    return SimpleNamespace(
+        group_states=[SimpleNamespace(offload_keys=k) for k in keys_by_group],
+        req_context=ReqContext(req_id="req"),
+    )
+
+
+@pytest.mark.parametrize("write_back", [False, True])
+def test_a_finished_request_merges_into_its_conversation(band, monkeypatch, write_back):
+    scheduler, _, _ = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK", write_back)
+    num_groups = len(scheduler.config.kv_group_configs)
+    attn_idx = next(
+        idx for idx, cfg in enumerate(scheduler.config.kv_group_configs)
+        if not isinstance(cfg.kv_cache_spec, MambaSpec)
+    )
+    keys_by_group = [
+        [OffloadKey(b"g%d-%d" % (g, i)) for i in range(3)] for g in range(num_groups)
+    ]
+    scheduler.manager.merge_tag = MagicMock()
+    scheduler._record_run(_finished(scheduler, keys_by_group))
+    # The run is named after the conversation's last attention key, whatever
+    # the band does.
+    (ctx, tag), _ = scheduler.manager.merge_tag.call_args
+    assert ctx.req_id == "req" and tag == keys_by_group[attn_idx][-1]
+    assert (tag in scheduler._run_keys) == write_back

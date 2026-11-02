@@ -4,16 +4,23 @@
 
 All index state lives in the server; this class translates the manager calls
 into requests. A lookup HIT is held by the server for this client until the
-manager lock region that made it closes, which is the window in which the
-scheduler relies on the chunk staying present (see OffloadingManager.lock).
+end of the scheduler step that made it (on_schedule_end), which covers the
+window in which the scheduler relies on the chunk staying present: the
+prepare_load of a hit runs in the same step.
+
+Every store names a run: a compute-time store the request that makes it, a
+write-back store the conversation it belongs to. When a request finishes, the
+scheduler moves the request's run into its conversation (merge_tag), so the
+server evicts whole conversations.
 
 If the server goes away, the manager degrades instead of failing the engine:
 every lookup misses and nothing is stored, so requests prefill from scratch.
+While degraded it retries through ``reconnect`` (set by the spec), which only
+succeeds when the server again serves the arena the workers mapped.
 """
 
 import time
-from collections.abc import Collection, Iterable, Sequence
-from types import TracebackType
+from collections.abc import Callable, Collection, Iterable, Sequence
 from typing import Any
 
 from typing_extensions import override
@@ -23,22 +30,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
-    ConfigInfoMapping,
     LoadStoreSpec,
     LookupResult,
     Medium,
     OffloadingEvent,
     OffloadingManager,
     OffloadKey,
+    OffloadPolicy,
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    ScheduleEndContext,
 )
-from vllm.v1.kv_offload.cpu.common import (
-    CPULoadStoreSpec,
-    CPUOffloadingInfo,
-    CPUOffloadingMetrics,
-)
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec, CPUOffloadingMetrics
+from vllm.v1.kv_offload.shared_pool import client as C
 from vllm.v1.kv_offload.shared_pool import protocol as P
 from vllm.v1.kv_offload.shared_pool.client import PoolClient, PoolServerError
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
@@ -51,46 +56,32 @@ _LOOKUP_RESULTS = {
     P.HIT_PENDING: LookupResult.HIT_PENDING,
     P.RETRY: LookupResult.RETRY,
 }
-_STATS_INTERVAL_SEC = 1.0
-
-
-class _Session:
-    """The manager lock: closing it ends the server-side lookup holds."""
-
-    def __init__(self, manager: "SharedPoolOffloadingManager") -> None:
-        self._manager = manager
-
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self._manager._end_session()
+_STATE_INTERVAL_SEC = 1.0
+_RECONNECT_INTERVAL_SEC = 30.0
 
 
 class SharedPoolOffloadingManager(OffloadingManager):
     def __init__(
         self,
-        client: PoolClient,
-        num_chunks: int,
+        client: PoolClient | None,
+        pool: str,
+        engine_tag: str,
         enable_events: bool = False,
+        free_fraction: float | None = None,
+        reconnect: Callable[[], PoolClient | None] | None = None,
     ) -> None:
         self.medium: Medium = Medium.CPU
-        self._client: PoolClient | None = client
-        self._num_chunks = num_chunks
-        self._config_info: ConfigInfoMapping = CPUOffloadingInfo(
-            cpu_num_chunks=num_chunks
-        ).as_config_info()
+        self._client = client
+        self._pool = pool
+        self._engine_tag = engine_tag
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
-        self._session = _Session(self)
         self._holds_open = False
-        self._stats: dict[str, Any] | None = None
-        self._stats_at = 0.0
+        self._free_fraction = free_fraction
+        self._state_at = time.monotonic()
         self._allocation_sizes: list[int] = []
+        # Called while degraded; returns an attached client or None.
+        self.reconnect = reconnect
+        self._reconnect_at = time.monotonic()
 
     # --- transport ---
 
@@ -99,20 +90,28 @@ class SharedPoolOffloadingManager(OffloadingManager):
             raise ConnectionError("shared KV pool server is unavailable")
         try:
             return self._client.call(op, args)
-        except (OSError, EOFError, ValueError) as exc:
-            logger.error(
-                "Lost the shared KV pool server (%s: %s); offloading is disabled "
-                "for this engine until it restarts",
-                type(exc).__name__,
-                exc,
-            )
-            self._client.close()
-            self._client = None
+        except C.UNREACHABLE as exc:
+            self.disable(f"lost the server ({type(exc).__name__}: {exc})")
             raise ConnectionError("shared KV pool server is unavailable") from exc
 
     @property
     def available(self) -> bool:
         return self._client is not None
+
+    def disable(self, reason: str) -> None:
+        """Run without the pool from now on (until a reconnect succeeds)."""
+        if self._client is None:
+            return
+        logger.error(
+            "Shared KV pool %s: %s; offloading is disabled for this engine",
+            self._pool,
+            reason,
+        )
+        self._client.close()
+        self._client = None
+        self._holds_open = False
+        self._free_fraction = None
+        self._reconnect_at = time.monotonic()
 
     def _call_soft(self, op: str, args: object = None) -> object:
         """A call whose failure must not end the engine: a rejection by the
@@ -133,16 +132,34 @@ class SharedPoolOffloadingManager(OffloadingManager):
         except ConnectionError:
             pass
 
-    # --- OffloadingManager interface ---
+    def _maybe_reconnect(self) -> None:
+        now = time.monotonic()
+        if (
+            self._client is not None
+            or self.reconnect is None
+            or now - self._reconnect_at < _RECONNECT_INTERVAL_SEC
+        ):
+            return
+        self._reconnect_at = now
+        client = self.reconnect()
+        if client is not None:
+            self._client = client
+            self._state_at = 0.0
+            logger.info("Reattached to shared KV pool %s", self._pool)
 
-    @property
-    @override
-    def lock(self) -> _Session:
-        return self._session
+    def _request_tag(self, req_context: ReqContext) -> str:
+        # Request ids are unique per engine only; conversation tags (bytes
+        # keys) are shared by every engine of a layout on purpose.
+        return f"{self._engine_tag}/{req_context.req_id}"
+
+    # --- OffloadingManager interface ---
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        return RequestOffloadingContext()
+        # Offer the chunks loaded from the pool too: the server already holds
+        # them, so nothing is copied, and offering them makes them members of
+        # this request's run, so a conversation's run always starts at its root.
+        return RequestOffloadingContext(policy=OffloadPolicy.REQUEST_LEVEL)
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -207,23 +224,26 @@ class SharedPoolOffloadingManager(OffloadingManager):
         except ConnectionError:
             pass
 
+    @override
+    def prepare_store(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> PrepareStoreOutput | None:
+        """A compute-time store, in the run of the request that makes it."""
+        return self._prepare_store(keys, self._request_tag(req_context))
+
     def prepare_store_run(
         self, keys: Collection[OffloadKey], tag: OffloadKey
     ) -> PrepareStoreOutput | None:
-        """Store one conversation ("run") as a unit (exclusive pool mode)."""
-        return self.prepare_store(keys, None, tag=tag)
+        """Store keys in the run of conversation ``tag``, all or nothing."""
+        return self._prepare_store(keys, bytes(tag))
 
-    @override
-    def prepare_store(
-        self, keys: Collection[OffloadKey], req_context: ReqContext, tag: OffloadKey | None = None
+    def _prepare_store(
+        self, keys: Collection[OffloadKey], tag: str | bytes
     ) -> PrepareStoreOutput | None:
         try:
-            if tag is None:
-                result = self._call_soft(P.OP_PREPARE_STORE, [bytes(k) for k in keys])
-            else:
-                result = self._call_soft(
-                    P.OP_PREPARE_STORE_TAGGED, [[bytes(k) for k in keys], bytes(tag)]
-                )
+            result = self._call_soft(
+                P.OP_PREPARE_STORE_TAGGED, [[bytes(k) for k in keys], tag]
+            )
         except ConnectionError:
             return None
         if result is None:
@@ -242,6 +262,16 @@ class SharedPoolOffloadingManager(OffloadingManager):
             store_spec=CPULoadStoreSpec(list(chunk_ids)),
             evicted_keys=evicted_keys,
         )
+
+    def merge_tag(self, req_context: ReqContext, tag: OffloadKey) -> None:
+        """Move everything the finished request stored into the run of
+        conversation ``tag``."""
+        try:
+            self._call_soft(
+                C.OP_MERGE_TAG, (self._request_tag(req_context), bytes(tag))
+            )
+        except ConnectionError:
+            pass
 
     @override
     def complete_store(
@@ -265,6 +295,11 @@ class SharedPoolOffloadingManager(OffloadingManager):
         return None
 
     @override
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        self._end_session()
+        self._maybe_reconnect()
+
+    @override
     def reset_cache(self) -> None:
         # The pool is shared, so a reset drops only what this engine holds:
         # its lookup holds, read references and unfinished stores. Chunks
@@ -281,19 +316,30 @@ class SharedPoolOffloadingManager(OffloadingManager):
             yield from self.events
             self.events.clear()
 
-    @override
-    def config_info(self) -> Sequence[ConfigInfoMapping]:
-        return [self._config_info]
-
-    def pool_stats(self, max_age: float = _STATS_INTERVAL_SEC) -> dict[str, Any] | None:
+    def pool_free_fraction(
+        self, max_age: float = _STATE_INTERVAL_SEC
+    ) -> float | None:
+        """This class's share of free arena rows, from STATE (at most one call
+        per ``max_age``); None when unknown."""
+        if self._client is None:
+            return None
         now = time.monotonic()
-        if self._stats is None or now - self._stats_at >= max_age:
+        if now - self._state_at >= max_age:
+            self._state_at = now
             try:
-                self._stats = self._call_soft(P.OP_STATS)  # type: ignore[assignment]
+                state: Any = self._call_soft(C.OP_STATE)
+                self._free_fraction = float(
+                    state["classes"][self._pool]["free_fraction"]
+                )
             except ConnectionError:
-                self._stats = None
-            self._stats_at = now
-        return self._stats
+                self._free_fraction = None
+            except (KeyError, TypeError, ValueError):
+                logger.warning_once(
+                    "Shared KV pool STATE names no free fraction for class %s",
+                    self._pool,
+                )
+                self._free_fraction = None
+        return self._free_fraction
 
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -301,21 +347,11 @@ class SharedPoolOffloadingManager(OffloadingManager):
         for size in self._allocation_sizes:
             stats.observe_histogram(CPUOffloadingMetrics.CPU_ALLOCATION_SIZE, size)
         self._allocation_sizes.clear()
-        pool = self.pool_stats()
-        if pool is not None and pool["num_chunks"] > 0:
-            n = pool["num_chunks"]
-            usage = (pool["held"] + pool["write_pending"]) / n
-            write_usage = pool["write_pending"] / n
-            stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_USAGE_PERC, usage)
-            stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC, write_usage)
-            stats.set_gauge(
-                CPUOffloadingMetrics.CPU_CACHE_READ_USAGE_PERC,
-                max(usage - write_usage, 0.0),
-            )
         return stats
 
     @override
     def shutdown(self) -> None:
+        self.reconnect = None
         if self._client is not None:
             self._client.close()
             self._client = None

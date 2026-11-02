@@ -889,25 +889,40 @@ class OffloadingConnectorScheduler:
         self._gpu_block_pool = gpu_block_pool
 
     def _write_through_enabled(self) -> bool:
-        """Compute-time stores run unless the band is on and the pool is full."""
+        """Compute-time stores run unless the band is on and the pool is full
+        (its class has under WRITE_THROUGH_MIN_FREE of its rows free)."""
         if not WRITE_BACK or self._gpu_block_pool is None:
             return True
-        pool_stats = getattr(self.manager, "pool_stats", None)
-        stats = pool_stats() if pool_stats is not None else None
-        if not isinstance(stats, dict) or not stats.get("num_chunks"):
-            return True
-        return stats.get("free", 0) >= WRITE_THROUGH_MIN_FREE * stats["num_chunks"]
+        free_fraction = getattr(self.manager, "pool_free_fraction", None)
+        fraction = free_fraction() if free_fraction is not None else None
+        return fraction is None or fraction >= WRITE_THROUGH_MIN_FREE
 
     def _record_run(self, req_status: "RequestOffloadState") -> None:
-        """Remember a finished request's chain so the band can write it whole."""
-        if not WRITE_BACK:
-            return
+        """Name a finished request's run after its conversation (the request's
+        last attention key): a manager that tags runs moves what the request
+        stored into it; with the band on, remember the chain so the band can
+        write it whole."""
         by_group = [gs.offload_keys for gs in req_status.group_states]
-        attn = next((keys for cfg, keys in zip(self.config.kv_group_configs, by_group)
-                     if cfg.group_idx in self._full_attention_groups and keys), None)
+        attn = next(
+            (
+                keys
+                for idx, keys in enumerate(by_group)
+                if keys
+                and idx in self._full_attention_groups
+                and not isinstance(
+                    self.config.kv_group_configs[idx].kv_cache_spec, MambaSpec
+                )
+            ),
+            None,
+        )
         if not attn:
             return
         tag = attn[-1]
+        merge_tag = getattr(self.manager, "merge_tag", None)
+        if merge_tag is not None:
+            merge_tag(req_status.req_context, tag)
+        if not WRITE_BACK:
+            return
         chain = [keys[i] for i in range(len(attn)) for keys in by_group if i < len(keys)]
         old = self._run_keys.pop(tag, None)
         if old is not None:
@@ -947,7 +962,7 @@ class OffloadingConnectorScheduler:
         triggers its run (the finished request it belongs to): every free,
         chunk-aligned block of that run is offered to the pool in one tagged,
         all-or-nothing store, held while copied, and released to the queue head.
-        Blocks of no known run are offered alone."""
+        Blocks of no known run are offered alone, each as a run of its own."""
         pool = self._gpu_block_pool
         if not WRITE_BACK or pool is None or self.config.blocks_per_chunk != 1:
             return {}
@@ -997,8 +1012,10 @@ class OffloadingConnectorScheduler:
         store_jobs: dict[int, TransferJob] = {}
         for tag, members in units:
             keys = [m[0] for m in members]
-            if tag is not None and hasattr(self.manager, "prepare_store_run"):
-                store_output = self.manager.prepare_store_run(keys, tag)
+            if hasattr(self.manager, "prepare_store_run"):
+                store_output = self.manager.prepare_store_run(
+                    keys, tag if tag is not None else keys[0]
+                )
             else:
                 store_output = self.manager.prepare_store(keys, None)
             if store_output is None:

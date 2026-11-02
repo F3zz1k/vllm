@@ -645,3 +645,13 @@ class OffloadingSpec(ABC):
 
         """
         pass
+
+    def get_worker_handshake(self) -> Any:
+        """Worker side: facts the scheduler side must agree with, sent once
+        after KV cache registration (picklable); None to send nothing."""
+        return None
+
+    def set_worker_handshakes(self, handshakes: dict[int, Any]) -> None:
+        """Scheduler side: every worker's get_worker_handshake(), by TP rank,
+        delivered before the first request is scheduled."""
+        return None

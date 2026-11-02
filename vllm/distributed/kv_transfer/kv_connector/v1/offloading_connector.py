@@ -13,7 +13,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
+    KVConnectorMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
     KVConnectorStats,
@@ -22,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
+    OffloadingHandshakeMetadata,
     OffloadingWorkerMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
@@ -87,6 +91,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         offloading_config = build_offloading_config(vllm_config, kv_cache_config)
         self._canonical_layout = offloading_config.canonical_layout
         spec = OffloadingSpecFactory.create_spec(offloading_config)
+        self._spec = spec
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
@@ -150,6 +155,25 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
         if self.connector_scheduler is not None:
             self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
+        if self.connector_worker is None:
+            return None
+        payload = self._spec.get_worker_handshake()
+        return None if payload is None else OffloadingHandshakeMetadata(payload)
+
+    def set_xfer_handshake_metadata(
+        self, metadata: dict[int, KVConnectorHandshakeMetadata]
+    ) -> None:
+        if self.connector_scheduler is None:
+            return
+        self._spec.set_worker_handshakes(
+            {
+                rank: meta.payload
+                for rank, meta in metadata.items()
+                if isinstance(meta, OffloadingHandshakeMetadata)
+            }
+        )
 
     def on_new_request(self, request: "Request") -> None:
         assert self.connector_scheduler is not None

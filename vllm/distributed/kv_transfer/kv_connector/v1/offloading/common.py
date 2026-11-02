@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
+from typing import Any
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorHandshakeMetadata,
     KVConnectorMetadata,
     KVConnectorWorkerMetadata,
 )
@@ -70,6 +72,13 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+
+
+@dataclass
+class OffloadingHandshakeMetadata(KVConnectorHandshakeMetadata):
+    """A worker's OffloadingSpec.get_worker_handshake(), for the scheduler."""
+
+    payload: Any
 
 
 @dataclass
