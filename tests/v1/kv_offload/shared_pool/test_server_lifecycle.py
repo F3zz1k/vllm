@@ -222,7 +222,9 @@ def test_spill_and_restore_round_trip_across_a_restart(tmp_path):
     a = connect(srv.sock)
     path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
     put(a, path, [key(1), key(2)], b"X", 7)
-    put(a, path, [key(3)], b"Y", 9)
+    # Engines tag a request's own run with a str ("<engine>/<request>"); one
+    # never merged into a conversation (an aborted request) still spills.
+    put(a, path, [key(3)], "e1/r9", 9)
     a.close()
     b = connect(srv.sock)
     assert call(b, P.OP_RELEASE, {"reason": "idle"})[1]["ok"]
@@ -244,9 +246,9 @@ def test_spill_and_restore_round_trip_across_a_restart(tmp_path):
         call(c, P.OP_SPAWN_OPEN, {"pool": "p", "token": "t1", "ttl_sec": 60})
         wait_state(srv2.sock, P.READY)
         call(c, P.OP_ATTACH, attach_args())
-        assert [r.tag for r in srv2.srv.arena.order] == [b"X", b"Y"]  # the old order
+        assert [r.tag for r in srv2.srv.arena.order] == [b"X", b"e1/r9"]  # the old order
         assert get(c, path, [key(3)]) == [9]
-        assert [r.tag for r in srv2.srv.arena.order] == [b"Y", b"X"]  # Y loaded: oldest
+        assert [r.tag for r in srv2.srv.arena.order] == [b"e1/r9", b"X"]  # loaded: oldest
         c.close()
     finally:
         srv2.stop()

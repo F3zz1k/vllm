@@ -90,6 +90,12 @@ MANIFEST = "manifest.json"
 _MANIFEST_VERSION = 1
 
 
+def _tag(tag: bytes | str) -> bytes:
+    """A run tag as the index keeps it. Engines send a conversation's tag as
+    its key (bytes) and a request's own run as "<engine>/<request>" (str)."""
+    return tag.encode() if isinstance(tag, str) else bytes(tag)
+
+
 def _group(key: bytes) -> int:
     """KV cache group of an offload key (block hash + 4-byte group index)."""
     return int.from_bytes(key[-4:], "big")
@@ -2104,10 +2110,10 @@ class PoolServer:
             return None
         if op == P.OP_PREPARE_STORE_TAGGED:
             whole = bool(args[2]) if len(args) > 2 else False
-            res = self.arena.prepare_store(client, args[0], args[1], whole)
+            res = self.arena.prepare_store(client, args[0], _tag(args[1]), whole)
             return None if res is None else list(res)
         if op == P.OP_MERGE_TAG:
-            return self.arena.merge_tag(client, args[0], args[1])
+            return self.arena.merge_tag(client, _tag(args[0]), _tag(args[1]))
         if op == P.OP_COMPLETE_STORE:
             keys, success = args
             self.arena.complete_store(client, keys, success)
