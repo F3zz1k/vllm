@@ -16,7 +16,7 @@ import marshal
 import socket
 import struct
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 _LEN = struct.Struct(">I")
 _MAX_MESSAGE = 256 << 20
@@ -27,7 +27,16 @@ HIT = 1
 HIT_PENDING = 2
 RETRY = 3
 
-# Operations.
+# Arena states (OP_STATE "state").
+ABSENT = "ABSENT"
+CREATING = "CREATING"
+READY = "READY"
+SPILLING = "SPILLING"
+
+# Engine operations. ATTACH and INFO take {"pool": class, "layout_key",
+# "row_stride", optional "state_groups": [group index, ...]} (ATTACH also
+# "version" and "name"); their replies wait until the arena is READY. The
+# others act on the class the connection attached to.
 OP_ATTACH = "attach"
 OP_INFO = "info"
 OP_LOOKUP = "lookup"
@@ -35,17 +44,24 @@ OP_LOOKUP_PREFIX = "lookup_prefix"  # stops after the first MISS
 OP_END_SESSION = "end_session"
 OP_PREPARE_LOAD = "prepare_load"
 OP_COMPLETE_LOAD = "complete_load"
-OP_PREPARE_STORE = "prepare_store"
-# (keys, tag): exclusive-mode store of one conversation ("run"); added 2026-10-23.
+# (keys, tag) or (keys, tag, whole): store keys into run tag. whole=True marks
+# a write-back of a whole conversation, refused if it holds no restorable
+# boundary.
 OP_PREPARE_STORE_TAGGED = "prepare_store_tagged"
+OP_MERGE_TAG = "merge_tag"  # (src_tag, dst_tag)
 OP_COMPLETE_STORE = "complete_store"
 OP_TOUCH = "touch"
 OP_RELEASE_ALL = "release_all"
 OP_STATS = "stats"
-# Operator calls (no attach): {"pool": name, ...}.
-OP_PIN = "pin"
-OP_PIN_RECENT = "pin_recent"
-OP_UNPIN = "unpin"
+# Operator calls (no attach needed).
+OP_STATE = "state"
+OP_PREPARE = "prepare"  # {"reason"}
+OP_RELEASE = "release"  # {"reason"}
+OP_SPAWN_OPEN = "spawn_open"  # {"pool", "token", "ttl_sec"}
+OP_SPAWN_CLOSE = "spawn_close"  # {"token"}
+OP_PIN = "pin"  # {"pool", "keys"}
+OP_PIN_RECENT = "pin_recent"  # {"pool", "seconds", "until_ago"}
+OP_UNPIN = "unpin"  # {"pool", "keys"}; keys None unpins everything
 
 
 class ProtocolError(Exception):
