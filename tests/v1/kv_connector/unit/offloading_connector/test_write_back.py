@@ -557,3 +557,59 @@ def test_prompt_boundary_is_a_chunk_earlier_with_a_drafter_group(band):
     tpc = configs[scheduler._chain_ref_group].tokens_per_chunk
     scheduler._maybe_set_prompt_boundary(status, 0)
     assert request.shared_prefix_boundary == (30 - 1) // tpc * tpc - tpc
+
+
+def test_keys_a_store_evicted_leave_the_band_view(band):
+    """H1: the pool's own evictions (returned by a store) are forgotten, so the
+    band rewrites those blocks when the GPU drops them instead of assuming
+    the pool still has them."""
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    _register_run(scheduler, blocks, (1, 2))
+    gone = _hkey(7, 0)
+    scheduler._note_in_pool([gone])
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: PrepareStoreOutput(
+            keys_to_store=list(keys), store_spec=CPULoadStoreSpec(list(range(len(keys)))),
+            evicted_keys=[gone]))
+    assert scheduler._build_write_back_jobs()
+    assert gone not in scheduler._pool_has
+    assert scheduler._wb_counts["pool_evicted_forgot"] == 1
+
+
+def test_a_refused_run_with_stale_pool_keys_is_retrimmed_at_once(band, monkeypatch):
+    """H1: a refusal caused by keys the band wrongly assumed in the pool is
+    retried in the same step with the re-trimmed run, not after the backoff."""
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    stale = _hkey(9, 0)
+    scheduler._run_keys[chain[-1]] = [stale] + chain
+    scheduler._key_run[stale] = chain[-1]
+    scheduler._note_in_pool([stale])
+    calls = []
+
+    def prepare(keys, t, whole):
+        calls.append(list(keys))
+        if len(calls) == 1:
+            return None
+        return _cpu_store_output(keys)
+
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=prepare)
+    real = scheduler._run_members
+    retried = []
+
+    def run_members(tag, by_group):
+        out = real(tag, by_group)
+        if stale not in scheduler._pool_has:
+            retried.append(tag)
+            scheduler._run_keys[tag] = chain     # what a re-trim would leave
+            out = real(tag, by_group)
+        return out
+
+    monkeypatch.setattr(scheduler, "_run_members", run_members)
+    jobs = scheduler._build_write_back_jobs()
+    assert len(calls) == 2 and retried
+    assert sorted(_src_blocks(jobs)) == [2, 3, 6]
+    assert scheduler._wb_counts["store_refused_retrimmed"] == 1
+    assert scheduler._wb_counts["store_refused"] == 0

@@ -1253,6 +1253,34 @@ class OffloadingConnectorScheduler:
         while len(has) > _POOL_HAS_MAX:
             has.popitem(last=False)
 
+    def _forget_in_pool(self, keys: Iterable[OffloadKey]) -> int:
+        """Keys the pool no longer holds: drop them (and, for a state key, its
+        boundary's state set) from the band's view. Returns how many it knew."""
+        n = 0
+        for key in keys:
+            if self._pool_has.pop(key, 0) is None:
+                self._state_sets.pop(bytes(key)[:-4], None)
+                n += 1
+        return n
+
+    def _prepare_store(self, keys: Any, req_context: Any) -> Any:
+        out = self.manager.prepare_store(keys, req_context)
+        self._note_evicted(out)
+        return out
+
+    def _prepare_store_run(self, keys: Any, tag: OffloadKey, whole: bool = False) -> Any:
+        out = self.manager.prepare_store_run(keys, tag, whole=whole)
+        self._note_evicted(out)
+        return out
+
+    def _note_evicted(self, store_output: Any) -> None:
+        """A store's own evictions leave the pool: without this the band kept
+        counting them as present, never rewrote them when the GPU dropped its
+        copy, and counted that loss as evict_copied (H1, 2026-11-03)."""
+        evicted = getattr(store_output, "evicted_keys", None) if store_output else None
+        if evicted and WRITE_BACK:
+            self._wb_counts["pool_evicted_forgot"] += self._forget_in_pool(evicted)
+
     def _on_gpu_evict(self, block: Any) -> None:
         """BlockPool hook: a hashed block is being reused. A member of a known
         run that the pool does not hold is lost (the band never waits for it);
@@ -1378,22 +1406,33 @@ class OffloadingConnectorScheduler:
             if hasattr(self.manager, "prepare_store_run"):
                 # A known run is a whole conversation; a block of no known
                 # run is stored alone, as a run of its own.
-                store_output = self.manager.prepare_store_run(
+                store_output = self._prepare_store_run(
                     keys, tag if tag is not None else keys[0], whole=tag is not None
                 )
             else:
-                store_output = self.manager.prepare_store(keys, None)
+                store_output = self._prepare_store(keys, None)
+            if store_output is None and tag is not None:
+                # The pool found the run unrestorable without the keys the
+                # band left out as present (another engine's store evicted
+                # them, or a load demoted their run and it went first):
+                # forget them and re-trim now, to what the GPU still holds.
+                # Waiting out the refusal backoff lost the run: the GPU
+                # reused its blocks meanwhile (H1, 2026-11-03).
+                offered = {m[0] for m in members}
+                forgot = self._forget_in_pool(
+                    k for k in self._run_keys.get(tag, ()) if k not in offered
+                )
+                if forgot and tag in self._run_keys:
+                    self._wb_counts["store_refused_retrimmed"] += 1
+                    retry = self._run_members(tag, config_idx_by_group)
+                    if retry:
+                        members = retry
+                        keys = [m[0] for m in members]
+                        store_output = self._prepare_store_run(keys, tag, whole=True)
             if store_output is None:
                 self._wb_counts["store_refused"] += 1
                 if tag is not None:
                     self._wb_refused[tag] = now
-                    # The pool found the run unrestorable without the keys
-                    # the band left out as present: forget them, so the
-                    # retry re-trims to states it can copy from the GPU.
-                    offered = {m[0] for m in members}
-                    for key in self._run_keys.get(tag, ()):
-                        if key not in offered and self._pool_has.pop(key, 0) is None:
-                            self._state_sets.pop(bytes(key)[:-4], None)
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
                 continue
             chunk_by_key = dict(
@@ -1469,7 +1508,7 @@ class OffloadingConnectorScheduler:
             by_tag.setdefault(tag, []).append((key, block_id, config_idx))
         self._wb_rescue.clear()
         for tag, items in by_tag.items():
-            store_output = self.manager.prepare_store_run(
+            store_output = self._prepare_store_run(
                 [k for k, _, _ in items], tag, whole=False
             ) if hasattr(self.manager, "prepare_store_run") else None
             if store_output is None:
@@ -2380,7 +2419,7 @@ class OffloadingConnectorScheduler:
                 key = self._make_boundary_key(
                     req, group_idx, boundary, req_status.req_context
                 )
-                store_output = self.manager.prepare_store([key], req_status.req_context)
+                store_output = self._prepare_store([key], req_status.req_context)
                 if store_output is None:
                     self._connector_stats.increase_counter(
                         _ConnectorMetricName.ALLOCATION_FAILURE
@@ -2481,7 +2520,7 @@ class OffloadingConnectorScheduler:
                 members.append((config_idx, group_config, block_id, block_idx, key))
             if not members:
                 continue
-            store_output = self.manager.prepare_store(
+            store_output = self._prepare_store(
                 [m[4] for m in members], req_status.req_context
             )
             if store_output is None:
@@ -2599,7 +2638,7 @@ class OffloadingConnectorScheduler:
             # this hand-off (its key names a sub-block hash, which the band,
             # keyed by GPU block hashes, never offers), so it is stored now or
             # never; it costs one chunk per group.
-            store_output = self.manager.prepare_store(keys, req_status.req_context)
+            store_output = self._prepare_store(keys, req_status.req_context)
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -2875,7 +2914,7 @@ class OffloadingConnectorScheduler:
                 # drop them.
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
-            store_output = self.manager.prepare_store(
+            store_output = self._prepare_store(
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
