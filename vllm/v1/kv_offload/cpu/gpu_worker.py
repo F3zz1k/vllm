@@ -81,6 +81,8 @@ class Transfer:
     # Set by the copy thread once it has recorded the transfer's events; None
     # when the transfer was submitted on the calling thread.
     submitted: threading.Event | None = None
+    # A settled store (see GPULoadStoreSpec.settled): its own copy lane
+    settled: bool = False
 
 
 # Copy thread (2026-10-23): submit each transfer's copies from a background
@@ -204,21 +206,10 @@ def _check_descriptor_bounds(
             )
 
 
-# The copy thread shares the worker's GIL with the forward thread; every GIL
-# release in a copy (a DMA wait, a CPU scatter) is followed by a retake that can
-# wait a whole switch interval (5 ms by default). Set, the process switch
-# interval becomes this many microseconds once the copy thread starts.
-COPY_THREAD_SWITCH_US = int(os.environ.get("VLLM_KV_OFFLOAD_SWITCH_INTERVAL_US", "0"))
-
-
 class _CopyThread:
     """One FIFO thread running submitted copy closures in order."""
 
     def __init__(self, name: str, device: torch.device | None) -> None:
-        if COPY_THREAD_SWITCH_US > 0:
-            import sys
-
-            sys.setswitchinterval(COPY_THREAD_SWITCH_US * 1e-6)
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._device = device
         self.error: BaseException | None = None
@@ -447,6 +438,7 @@ class SingleDirectionOffloadingHandler:
     # Started on the first transfer when COPY_THREAD is set. Declared on the
     # class so a handler built without __init__ still reads None.
     _copy_thread: "_CopyThread | None" = None
+    _band_thread: "_CopyThread | None" = None
 
     def __init__(
         self,
@@ -559,8 +551,11 @@ class SingleDirectionOffloadingHandler:
                 "store" if gpu_to_cpu else "load",
                 "on" if stageable else "off (a ref has a non-contiguous local span)",
             )
-        self._slots: list[torch.Tensor] = []
-        self._slot_events: list[torch.Event | None] = [None, None]
+        # staging slots and their last events, per lane (ordered, settled)
+        self._lane_slots: tuple[list[torch.Tensor], list[torch.Tensor], ] = ([], [])
+        self._lane_slot_events: tuple[list, list] = ([None, None], [None, None])
+        # end event of the last transfer of each lane (chaining within a lane)
+        self._lane_last: list[torch.Event | None] = [None, None]
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
@@ -800,7 +795,12 @@ class SingleDirectionOffloadingHandler:
 
         if self._staged_refs is not None:
             return self._transfer_staged(
-                job_id, src_blocks, dst_blocks, group_sizes, block_indices
+                job_id,
+                src_blocks,
+                dst_blocks,
+                group_sizes,
+                block_indices,
+                settled=bool(getattr(gpu_spec, "settled", False)),
             )
 
         num_copy_ops = self._estimate_max_copy_ops(group_sizes)
@@ -891,8 +891,11 @@ class SingleDirectionOffloadingHandler:
         # the step that allocates it for the load and cannot retract zeroing
         # shipped in an earlier step for a since-reallocated block; with async
         # scheduling nothing else orders that zeroing against this copy.
-        stream.wait_stream(current_platform.current_stream())
-        last_event = self._transfers[-1].end_event if self._transfers else None
+        settled = self.gpu_to_cpu and getattr(gpu_spec, "settled", False)
+        if not settled:
+            stream.wait_stream(current_platform.current_stream())
+        last_event = self._lane_last[settled]
+        self._lane_last[settled] = end_event
         # CPU->GPU reads from host memory, which is never written
         # by a concurrent GPU stream, so CU_MEMCPY_SRC_ACCESS_ORDER_ANY is
         # safe and lets the driver pipeline source reads. GPU->CPU reads
@@ -918,12 +921,7 @@ class SingleDirectionOffloadingHandler:
 
         submitted = None
         if COPY_THREAD:
-            if self._copy_thread is None:
-                self._copy_thread = _CopyThread(
-                    f"kv-copy-{'d2h' if self.gpu_to_cpu else 'h2d'}",
-                    getattr(stream, "device", None),
-                )
-            submitted = self._copy_thread.submit(copy)
+            submitted = self._lane_thread(settled, stream).submit(copy)
         else:
             copy()
 
@@ -939,6 +937,7 @@ class SingleDirectionOffloadingHandler:
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
                 submitted=submitted,
+                settled=settled,
             )
         )
 
@@ -980,25 +979,41 @@ class SingleDirectionOffloadingHandler:
                     segments.append((plan, g_sel, c_sel))
         return segments
 
-    def _slot(self, idx: int, nbytes: int) -> torch.Tensor:
-        while len(self._slots) <= idx:
-            self._slots.append(torch.empty(0, dtype=torch.int8))
-        if self._slots[idx].numel() < nbytes:
-            event = self._slot_events[idx]
+    def _lane_thread(self, settled: bool, stream) -> "_CopyThread":
+        """The copy thread of a lane, started on first use."""
+        name = "_band_thread" if settled else "_copy_thread"
+        thread = getattr(self, name)
+        if thread is None:
+            kind = "d2h" if self.gpu_to_cpu else "h2d"
+            thread = _CopyThread(
+                f"kv-copy-{kind}{'-band' if settled else ''}",
+                getattr(stream, "device", None),
+            )
+            setattr(self, name, thread)
+        return thread
+
+    def _slot(self, idx: int, nbytes: int, settled: bool = False) -> torch.Tensor:
+        slots = self._lane_slots[settled]
+        events = self._lane_slot_events[settled]
+        while len(slots) <= idx:
+            slots.append(torch.empty(0, dtype=torch.int8))
+        if slots[idx].numel() < nbytes:
+            event = events[idx]
             if event is not None:
                 event.synchronize()
-                self._slot_events[idx] = None
+                events[idx] = None
             nbytes = -(-nbytes // _STAGED_ALIGN) * _STAGED_ALIGN
-            self.__dict__.pop("_np_rows_cache", None)  # it keeps the old slot alive
-            self._slots[idx] = torch.empty(nbytes, dtype=torch.int8, pin_memory=True)
-        return self._slots[idx]
+            # the view cache keeps the old slot alive; rebuild it
+            self.__dict__[f"_np_rows_cache{int(settled)}"] = {}
+            slots[idx] = torch.empty(nbytes, dtype=torch.int8, pin_memory=True)
+        return slots[idx]
 
-    def _np_rows(self, tensor: torch.Tensor, size: int) -> np.ndarray:
+    def _np_rows(self, tensor: torch.Tensor, size: int, settled: bool = False) -> np.ndarray:
         """The tensor's whole storage as a numpy array of ``size``-byte rows
-        (8-byte elements when the size allows), cached per storage."""
+        (8-byte elements when the size allows), cached per storage and lane."""
         storage = tensor.untyped_storage()
         key = (storage.data_ptr(), storage.nbytes(), size)
-        cache = self.__dict__.setdefault("_np_rows_cache", {})
+        cache = self.__dict__.setdefault(f"_np_rows_cache{int(settled)}", {})
         view = cache.get(key)
         if view is None:
             elt = 8 if size % 8 == 0 else 1
@@ -1066,7 +1081,10 @@ class SingleDirectionOffloadingHandler:
         )
 
     def _staged_cpu(
-        self, batch: list[tuple[_StagedRef, np.ndarray, np.ndarray, int]], slot: torch.Tensor
+        self,
+        batch: list[tuple[_StagedRef, np.ndarray, np.ndarray, int]],
+        slot: torch.Tensor,
+        settled: bool = False,
     ) -> None:
         """Scatter (store) or gather (load) the batch's fragments between the
         slot, laid out like the local pages, and the canonical arena rows: one
@@ -1094,8 +1112,8 @@ class SingleDirectionOffloadingHandler:
                 entry[1].append(local_abs // size)
                 entry[2].append(canon_abs // size)
         for (size, _), (cpu, local_rows, canon_rows) in classes.items():
-            stage2d = self._np_rows(slot, size)
-            arena2d = self._np_rows(cpu, size)
+            stage2d = self._np_rows(slot, size, settled)
+            arena2d = self._np_rows(cpu, size, settled)
             local_idx = np.concatenate(local_rows)
             canon_idx = np.concatenate(canon_rows)
             n = len(local_idx)
@@ -1131,19 +1149,24 @@ class SingleDirectionOffloadingHandler:
                         stage.copy_(canon)
 
     def _staged_run(
-        self, segments: list[tuple[_StagedRef, np.ndarray, np.ndarray]], stream
+        self,
+        segments: list[tuple[_StagedRef, np.ndarray, np.ndarray]],
+        stream,
+        settled: bool = False,
     ) -> None:
         """Runs on the copy thread inside the transfer stream. Store: DMA batch
         k+1 while scattering batch k. Load: gather batch k+1 while batch k's
         DMA runs (a slot is refilled only once its previous DMA is done)."""
-        st = self.__dict__.setdefault("_staged_stats", [0, 0, 0.0, 0.0, 0.0, 0.0, 0])
+        st = self.__dict__.setdefault(
+            f"_staged_stats{int(settled)}", [0, 0, 0.0, 0.0, 0.0, 0.0, 0]
+        )
         t_start = time.perf_counter()
         wait = cpu = 0.0
         batches = self._staged_batches(segments)
         if self.gpu_to_cpu:
             pending: deque = deque()
             for k, batch in enumerate(batches):
-                slot = self._slot(k % 2, _batch_bytes(batch))
+                slot = self._slot(k % 2, _batch_bytes(batch), settled)
                 self._staged_dma(batch, slot)
                 event = torch.Event()
                 event.record(stream)
@@ -1153,14 +1176,14 @@ class SingleDirectionOffloadingHandler:
                     t0 = time.perf_counter()
                     done_event.synchronize()
                     t1 = time.perf_counter()
-                    self._staged_cpu(done_batch, done_slot)
+                    self._staged_cpu(done_batch, done_slot, settled)
                     wait += t1 - t0
                     cpu += time.perf_counter() - t1
         else:
             for k, batch in enumerate(batches):
                 idx = k % 2
                 slot = self._slot(idx, _batch_bytes(batch))
-                event = self._slot_events[idx]
+                event = self._lane_slot_events[False][idx]
                 t0 = time.perf_counter()
                 if event is not None:
                     event.synchronize()
@@ -1171,7 +1194,7 @@ class SingleDirectionOffloadingHandler:
                 self._staged_dma(batch, slot)
                 event = torch.Event()
                 event.record(stream)
-                self._slot_events[idx] = event
+                self._lane_slot_events[False][idx] = event
         now = time.perf_counter()
         st[0] += 1
         st[1] += len(batches)
@@ -1181,9 +1204,10 @@ class SingleDirectionOffloadingHandler:
         if now - st[5] >= 30.0:
             st[5] = now
             logger.info(
-                "KV offload staged %s: jobs=%d batches=%d wall=%.2fs "
+                "KV offload staged %s%s: jobs=%d batches=%d wall=%.2fs "
                 "slot_wait=%.2fs cpu=%.2fs (cumulative, copy thread)",
                 "store" if self.gpu_to_cpu else "load",
+                " (settled lane)" if settled else "",
                 st[0], st[1], st[2], st[3], st[4],
             )
 
@@ -1194,6 +1218,7 @@ class SingleDirectionOffloadingHandler:
         dst_blocks: np.ndarray,
         group_sizes: Sequence[int],
         block_indices: Sequence[int],
+        settled: bool = False,
     ) -> bool:
         del block_indices  # whole blocks: no partial first chunk at 1 block per chunk
         items = self._staged_items(src_blocks, dst_blocks, group_sizes)
@@ -1207,8 +1232,11 @@ class SingleDirectionOffloadingHandler:
         end_event = (
             self._event_pool.pop() if self._event_pool else torch.Event(enable_timing=True)
         )
-        stream.wait_stream(current_platform.current_stream())
-        last_event = self._transfers[-1].end_event if self._transfers else None
+        settled = self.gpu_to_cpu and settled
+        if not settled:
+            stream.wait_stream(current_platform.current_stream())
+        last_event = self._lane_last[settled]
+        self._lane_last[settled] = end_event
 
         def copy() -> None:
             if last_event is not None:
@@ -1216,15 +1244,10 @@ class SingleDirectionOffloadingHandler:
             with current_platform.stream(stream):
                 start_event.record(stream)
                 if items:
-                    self._staged_run(items, stream)
+                    self._staged_run(items, stream, settled)
                 end_event.record(stream)
 
-        if self._copy_thread is None:
-            self._copy_thread = _CopyThread(
-                f"kv-copy-{'d2h' if self.gpu_to_cpu else 'h2d'}",
-                getattr(stream, "device", None),
-            )
-        submitted = self._copy_thread.submit(copy)
+        submitted = self._lane_thread(settled, stream).submit(copy)
         self._transfer_events[job_id] = end_event
         empty = torch.empty(0, dtype=torch.int64)
         self._transfers.append(
@@ -1238,6 +1261,7 @@ class SingleDirectionOffloadingHandler:
                 batch_dst=empty,
                 batch_sizes=empty,
                 submitted=submitted,
+                settled=settled,
             )
         )
         return True
@@ -1249,18 +1273,29 @@ class SingleDirectionOffloadingHandler:
             transfer.submitted.wait()
         elif not transfer.submitted.is_set():
             return False
-        if self._copy_thread is not None and self._copy_thread.error is not None:
-            raise RuntimeError("KV offload copy failed") from self._copy_thread.error
+        for thread in (self._copy_thread, self._band_thread):
+            if thread is not None and thread.error is not None:
+                raise RuntimeError("KV offload copy failed") from thread.error
         return True
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while (
-            self._transfers
-            and self._submitted(self._transfers[0])
-            and self._transfers[0].end_event.query()
-        ):
-            transfer = self._transfers.popleft()
+        # Each lane completes in order; the settled lane may finish before
+        # earlier ordered stores, so every lane's head is checked.
+        done: list[Transfer] = []
+        for lane in (False, True):
+            for transfer in self._transfers:
+                if transfer.settled != lane:
+                    continue
+                if not (self._submitted(transfer) and transfer.end_event.query()):
+                    break
+                done.append(transfer)
+        if done:
+            finished = {id(t) for t in done}
+            self._transfers = deque(t for t in self._transfers if id(t) not in finished)
+        for transfer in done:
+            if self._lane_last[transfer.settled] is transfer.end_event:
+                self._lane_last[transfer.settled] = None  # the event is pooled again
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
@@ -1311,9 +1346,12 @@ class SingleDirectionOffloadingHandler:
                 break
             self._transfers.popleft()
 
-        if self._copy_thread is not None:
-            self._copy_thread.stop()
-            self._copy_thread = None
+        for name in ("_copy_thread", "_band_thread"):
+            thread = getattr(self, name)
+            if thread is not None:
+                thread.stop()
+                setattr(self, name, None)
+        self._lane_last = [None, None]
         self._transfer_events.clear()
         self._stream_pool.clear()
         self._event_pool.clear()

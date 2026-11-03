@@ -1306,10 +1306,13 @@ class OffloadingConnectorScheduler:
         # chunk, which a whole-block copy never has.
         job = TransferJob(
             req_id=_WRITE_BACK_REQ,
+            # Free, held blocks: no forward writes them, so the copy needs no
+            # wait for the compute stream (its own lane in the worker).
             src_spec=GPULoadStoreSpec(
                 [m[1].block_id for m in members],
                 group_sizes=group_sizes,
                 block_indices=[0] * num_groups,
+                settled=True,
             ),
             dst_spec=type(store_output.store_spec)([m[3] for m in members]),
         )

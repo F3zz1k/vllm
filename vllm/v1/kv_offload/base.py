@@ -460,12 +460,17 @@ class GPULoadStoreSpec(BlockIDsLoadStoreSpec):
         block_ids: list[int],
         group_sizes: Sequence[int],
         block_indices: Sequence[int],
+        settled: bool = False,
     ):
         super().__init__(block_ids)
         assert sum(group_sizes) == len(block_ids)
         assert len(block_indices) == len(group_sizes)
         self.group_sizes: Sequence[int] = group_sizes
         self.block_indices: Sequence[int] = block_indices
+        # Store source blocks no in-flight or later forward writes (the
+        # write-back band's held free blocks): the copy needs no wait for the
+        # compute stream and may run beside, and finish before, other stores.
+        self.settled: bool = settled
 
 
 @dataclass
