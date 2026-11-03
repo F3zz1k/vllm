@@ -101,6 +101,60 @@ CHECK_BOUNDS = os.environ.get("VLLM_KV_OFFLOAD_CHECK_BOUNDS", "0") == "1"
 # it tells a registration fault (copy engine CAT errors) from any other.
 REGISTER_REGION = os.environ.get("VLLM_KV_OFFLOAD_REGISTER", "1") == "1"
 
+# Staged canonical copies (2026-11-03). Under the canonical layout with TP > 1
+# a rank's share of a canonical page is one fragment per token and head run
+# (512 bytes per token at TP=2 on the 27B, 256 at TP=4), and the XPU batch copy
+# issues one command per fragment: measured on a B70, 512-byte fragments move
+# 0.06 GB/s device-to-registered-host (each waits, the registered arena reads
+# as pageable) and 0.16 GB/s host-to-device. Staged, each local page moves as
+# ONE contiguous command between the device and a pinned staging slot (6.6 GB/s
+# D2H, 9.8 GB/s H2D measured) and the copy thread scatters or gathers the
+# fragments between the slot and the arena with strided CPU copies (11 GB/s),
+# double buffered so the CPU side of one batch overlaps the DMA of the next.
+# Needs the copy thread (the CPU work runs there, never on the forward).
+STAGED_COPY = os.environ.get("VLLM_KV_OFFLOAD_STAGED_COPY", "1") == "1"
+STAGED_SLOT_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_SLOT_MB", "64")) << 20
+
+
+class _StagedRef(NamedTuple):
+    """One data ref's local page span and its fragment runs, for staged copies."""
+
+    tensor_idx: int
+    span_lo: int
+    span: int
+    runs: tuple
+    total_bytes: int
+    mapping: CanonicalPageMapping
+
+
+def _batch_bytes(batch) -> int:
+    """Slot bytes a staged batch needs: (plan, gpu block, cpu chunk, offset)."""
+    plan, _, _, off = batch[-1]
+    return max(STAGED_SLOT_BYTES, off + plan.span)
+
+
+def _staged_ref(ref: CanonicalKVCacheRef) -> "_StagedRef | None":
+    """The ref's staged-copy plan: the local span its runs cover, which must be
+    covered exactly (no gaps, no overlaps), else None (copy it unstaged)."""
+    mapping = ref.mapping
+    if mapping is None or not mapping.runs:
+        return None
+    intervals = []
+    for run in mapping.runs:
+        if run.local_stride < run.fragment_size and run.num_fragments > 1:
+            return None
+        for i in range(run.num_fragments):
+            start = run.local_offset + i * run.local_stride
+            intervals.append((start, start + run.fragment_size))
+    intervals.sort()
+    lo, hi = intervals[0][0], intervals[0][0]
+    for start, end in intervals:
+        if start != hi:
+            return None  # a gap or an overlap: the span would copy foreign bytes
+        hi = end
+    total = sum(r.fragment_size * r.num_fragments for r in mapping.runs)
+    return _StagedRef(ref.tensor_idx, lo, hi - lo, tuple(mapping.runs), total, mapping)
+
 
 def _check_descriptor_bounds(
     src: np.ndarray,
@@ -445,6 +499,32 @@ class SingleDirectionOffloadingHandler:
         self._scratch_bases_src = np.empty(num_scratch_blocks, dtype=np.uint64)
         self._scratch_bases_dst = np.empty(num_scratch_blocks, dtype=np.uint64)
 
+        # Staged canonical copies: per (group, ref) plans, or None when any ref
+        # cannot be staged (then every transfer takes the descriptor path)
+        self._staged_refs: list[list[_StagedRef | None]] | None = None
+        if (
+            canonical_layout
+            and STAGED_COPY
+            and COPY_THREAD
+            and blocks_per_chunk == 1
+            and current_platform.is_xpu()
+        ):
+            plans = [[_staged_ref(ref) for ref in refs] for refs in layer_refs_per_group]
+            stageable = all(
+                p is not None or ref.mapping is None or not ref.mapping.runs
+                for refs, ps in zip(layer_refs_per_group, plans)
+                for ref, p in zip(refs, ps)
+            )
+            if stageable:
+                self._staged_refs = plans
+            logger.info(
+                "KV offload %s: staged canonical copies %s",
+                "store" if gpu_to_cpu else "load",
+                "on" if stageable else "off (a ref has a non-contiguous local span)",
+            )
+        self._slots: list[torch.Tensor] = []
+        self._slot_events: list[torch.Event | None] = [None, None]
+
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
         # queue of transfers (job_id, stream, event)
@@ -681,6 +761,11 @@ class SingleDirectionOffloadingHandler:
         block_indices = gpu_spec.block_indices
         assert len(block_indices) == len(self.layer_refs_per_group)
 
+        if self._staged_refs is not None:
+            return self._transfer_staged(
+                job_id, src_blocks, dst_blocks, group_sizes, block_indices
+            )
+
         num_copy_ops = self._estimate_max_copy_ops(group_sizes)
 
         # reuse a pooled buffer set, growing it if this transfer needs more room
@@ -823,6 +908,205 @@ class SingleDirectionOffloadingHandler:
         # success
         return True
 
+    # --- staged canonical copies ---
+
+    def _staged_items(
+        self,
+        src_blocks: np.ndarray,
+        dst_blocks: np.ndarray,
+        group_sizes: Sequence[int],
+    ) -> list[tuple[_StagedRef, int, int]]:
+        """(plan, gpu block, cpu chunk) per page this rank copies, in group and
+        ref order; a store keeps only the pages this rank is elected to write."""
+        assert self._staged_refs is not None
+        gpu_ids_all, cpu_ids_all = (
+            (src_blocks, dst_blocks) if self.gpu_to_cpu else (dst_blocks, src_blocks)
+        )
+        items: list[tuple[_StagedRef, int, int]] = []
+        offset = 0
+        for g_idx, group_size in enumerate(group_sizes):
+            if group_size == 0:
+                continue
+            gpu_ids = gpu_ids_all[offset : offset + group_size]
+            cpu_ids = cpu_ids_all[offset : offset + group_size]
+            offset += group_size
+            for plan in self._staged_refs[g_idx]:
+                if plan is None:
+                    continue
+                g_sel, c_sel = gpu_ids, cpu_ids
+                mapping = plan.mapping
+                if self.gpu_to_cpu and mapping.num_writers > 1:
+                    mask = c_sel % mapping.num_writers == mapping.writer_index
+                    g_sel, c_sel = g_sel[mask], c_sel[mask]
+                items.extend(
+                    (plan, int(g), int(c)) for g, c in zip(g_sel.tolist(), c_sel.tolist())
+                )
+        return items
+
+    def _slot(self, idx: int, nbytes: int) -> torch.Tensor:
+        while len(self._slots) <= idx:
+            self._slots.append(torch.empty(0, dtype=torch.int8))
+        if self._slots[idx].numel() < nbytes:
+            event = self._slot_events[idx]
+            if event is not None:
+                event.synchronize()
+                self._slot_events[idx] = None
+            self._slots[idx] = torch.empty(nbytes, dtype=torch.int8, pin_memory=True)
+        return self._slots[idx]
+
+    def _staged_batches(
+        self, items: list[tuple[_StagedRef, int, int]]
+    ) -> list[list[tuple[_StagedRef, int, int, int]]]:
+        """Pack items into slot-sized batches: (plan, gpu block, cpu chunk,
+        offset in the slot)."""
+        batches: list[list[tuple[_StagedRef, int, int, int]]] = []
+        batch: list[tuple[_StagedRef, int, int, int]] = []
+        used = 0
+        for plan, g, c in items:
+            if batch and used + plan.span > STAGED_SLOT_BYTES:
+                batches.append(batch)
+                batch, used = [], 0
+            batch.append((plan, g, c, used))
+            used += plan.span
+        if batch:
+            batches.append(batch)
+        return batches
+
+    def _staged_dma(
+        self, batch: list[tuple[_StagedRef, int, int, int]], slot: torch.Tensor
+    ) -> None:
+        """One command per page between the device and the slot."""
+        n = len(batch)
+        slot_base = np.uint64(slot.data_ptr())
+        gpu_side = np.empty(n, dtype=np.uint64)
+        host_side = np.empty(n, dtype=np.uint64)
+        sizes = np.empty(n, dtype=np.uint64)
+        gpu_tensors = self.src_tensors if self.gpu_to_cpu else self.dst_tensors
+        for i, (plan, g, _c, off) in enumerate(batch):
+            t = gpu_tensors[plan.tensor_idx]
+            gpu_side[i] = t.data_ptr() + g * t.stride(0) + plan.span_lo
+            host_side[i] = slot_base + np.uint64(off)
+            sizes[i] = plan.span
+        src, dst = (gpu_side, host_side) if self.gpu_to_cpu else (host_side, gpu_side)
+        self._swap_blocks_batch(
+            torch.from_numpy(src),
+            torch.from_numpy(dst),
+            torch.from_numpy(sizes),
+            is_src_access_order_any=not self.gpu_to_cpu,
+        )
+
+    def _staged_cpu(
+        self, batch: list[tuple[_StagedRef, int, int, int]], slot: torch.Tensor
+    ) -> None:
+        """Scatter (store) or gather (load) the batch's fragments between the
+        slot, laid out like the local pages, and the canonical arena rows."""
+        cpu_tensors = self.dst_tensors if self.gpu_to_cpu else self.src_tensors
+        for plan, _g, c, off in batch:
+            cpu = cpu_tensors[plan.tensor_idx]
+            row = cpu.storage_offset() + c * cpu.stride(0)
+            local = slot.storage_offset() + off - plan.span_lo
+            for run in plan.runs:
+                shape = (run.num_fragments, run.fragment_size)
+                canon = cpu.as_strided(
+                    shape, (run.canonical_stride, 1), row + run.canonical_offset
+                )
+                stage = slot.as_strided(
+                    shape, (run.local_stride, 1), local + run.local_offset
+                )
+                if self.gpu_to_cpu:
+                    canon.copy_(stage)
+                else:
+                    stage.copy_(canon)
+
+    def _staged_run(self, items: list[tuple[_StagedRef, int, int]], stream) -> None:
+        """Runs on the copy thread inside the transfer stream. Store: DMA batch
+        k+1 while scattering batch k. Load: gather batch k+1 while batch k's
+        DMA runs (a slot is refilled only once its previous DMA is done)."""
+        batches = self._staged_batches(items)
+        if self.gpu_to_cpu:
+            pending: deque = deque()
+            for k, batch in enumerate(batches):
+                slot = self._slot(k % 2, _batch_bytes(batch))
+                self._staged_dma(batch, slot)
+                event = torch.Event()
+                event.record(stream)
+                pending.append((batch, slot, event))
+                if len(pending) == 2:
+                    done_batch, done_slot, done_event = pending.popleft()
+                    done_event.synchronize()
+                    self._staged_cpu(done_batch, done_slot)
+            while pending:
+                done_batch, done_slot, done_event = pending.popleft()
+                done_event.synchronize()
+                self._staged_cpu(done_batch, done_slot)
+        else:
+            for k, batch in enumerate(batches):
+                idx = k % 2
+                slot = self._slot(idx, _batch_bytes(batch))
+                event = self._slot_events[idx]
+                if event is not None:
+                    event.synchronize()
+                self._staged_cpu(batch, slot)
+                self._staged_dma(batch, slot)
+                event = torch.Event()
+                event.record(stream)
+                self._slot_events[idx] = event
+
+    def _transfer_staged(
+        self,
+        job_id: int,
+        src_blocks: np.ndarray,
+        dst_blocks: np.ndarray,
+        group_sizes: Sequence[int],
+        block_indices: Sequence[int],
+    ) -> bool:
+        del block_indices  # whole blocks: no partial first chunk at 1 block per chunk
+        items = self._staged_items(src_blocks, dst_blocks, group_sizes)
+        num_transfer_bytes = sum(plan.total_bytes for plan, _, _ in items)
+        stream = (
+            self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
+        )
+        start_event = (
+            self._event_pool.pop() if self._event_pool else torch.Event(enable_timing=True)
+        )
+        end_event = (
+            self._event_pool.pop() if self._event_pool else torch.Event(enable_timing=True)
+        )
+        stream.wait_stream(current_platform.current_stream())
+        last_event = self._transfers[-1].end_event if self._transfers else None
+
+        def copy() -> None:
+            if last_event is not None:
+                stream.wait_event(last_event)
+            with current_platform.stream(stream):
+                start_event.record(stream)
+                if items:
+                    self._staged_run(items, stream)
+                end_event.record(stream)
+
+        if self._copy_thread is None:
+            self._copy_thread = _CopyThread(
+                f"kv-copy-{'d2h' if self.gpu_to_cpu else 'h2d'}",
+                getattr(stream, "device", None),
+            )
+        submitted = self._copy_thread.submit(copy)
+        self._transfer_events[job_id] = end_event
+        empty = torch.empty(0, dtype=torch.int64)
+        self._transfers.append(
+            Transfer(
+                job_id=job_id,
+                stream=stream,
+                start_event=start_event,
+                end_event=end_event,
+                num_bytes=num_transfer_bytes,
+                batch_src=empty,
+                batch_dst=empty,
+                batch_sizes=empty,
+                submitted=submitted,
+            )
+        )
+        return True
+
     def _submitted(self, transfer: Transfer, wait: bool = False) -> bool:
         if transfer.submitted is None:
             return True
@@ -856,9 +1140,10 @@ class SingleDirectionOffloadingHandler:
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
-            self._buffer_pool.append(
-                (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
-            )
+            if transfer.batch_src.numel():
+                self._buffer_pool.append(
+                    (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
+                )
             del self._transfer_events[transfer.job_id]
         return results
 
