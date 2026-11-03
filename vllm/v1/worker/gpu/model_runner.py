@@ -418,6 +418,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
+            # B70-Q27-0007: B70_HEAD_FP8 swap after the drafter has taken the head,
+            # before any profiling (env unset or another model: a flag check).
+            from vllm.model_executor.models.qwen3_5 import (
+                b70_qwen35_head_fp8_at_load,
+            )
+
+            b70_qwen35_head_fp8_at_load(self.model)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

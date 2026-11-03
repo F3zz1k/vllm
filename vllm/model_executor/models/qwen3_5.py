@@ -160,6 +160,39 @@ def _b70_qwen35_head_fp8(lm: nn.Module) -> None:
         )
 
 
+def b70_qwen35_head_fp8_at_load(model: nn.Module) -> bool:
+    """B70-Q27-0007: run the B70_HEAD_FP8 swap once the model and its drafter are
+    loaded, before the memory profile.
+
+    The forward-time hook ran it inside profile_run, after profile_encoder_cache had
+    already set the torch peak with the BF16 shard resident, so the profile's
+    transient headroom (peak minus allocated after) carried the shard's net saving
+    (0.59 GiB per card at TP=2) and that much came out of the KV cache. The model
+    runner calls this after speculator.load_model, so a drafter that reads or shares
+    the BF16 head at load (MTP shared_head.head, the DFlash2 shortlist rows) still
+    sees it, and the shared module carries the FP8 quant_method afterwards. The
+    freed BF16 segment is returned to the device here so memory_profiling's baseline
+    does not count it. The forward-time hooks stay as a no-op flag check. Returns
+    True when the head is FP8 after the call."""
+    lm = model
+    get_lm = getattr(model, "get_language_model", None)
+    if callable(get_lm):
+        lm = get_lm()
+    elif isinstance(getattr(model, "language_model", None), nn.Module):
+        lm = model.language_model
+    if not isinstance(lm, Qwen3_5ForCausalLMBase):
+        return False
+    _b70_qwen35_head_fp8(lm)
+    from vllm.models.qwen4_exp.nvidia.b70_fp8_head import B70Fp8Head
+
+    swapped = isinstance(
+        getattr(getattr(lm, "lm_head", None), "quant_method", None), B70Fp8Head
+    )
+    if swapped:
+        torch.accelerator.empty_cache()
+    return swapped
+
+
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5Config)
