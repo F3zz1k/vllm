@@ -892,8 +892,19 @@ class SingleDirectionOffloadingHandler:
         # shipped in an earlier step for a since-reallocated block; with async
         # scheduling nothing else orders that zeroing against this copy.
         settled = self.gpu_to_cpu and getattr(gpu_spec, "settled", False)
+        # With the copy thread, the waits for compute and for the previous
+        # transfer are made on the host, never enqueued: the copy engine runs
+        # the commands of every stream in one order, so a copy queued behind a
+        # device-side wait for compute holds back every other stream's copies
+        # until that compute ends (measured: an independent D2H finished with
+        # the matmul it did not depend on).
+        compute_event = None
         if not settled:
-            stream.wait_stream(current_platform.current_stream())
+            if COPY_THREAD:
+                compute_event = torch.Event()
+                compute_event.record(current_platform.current_stream())
+            else:
+                stream.wait_stream(current_platform.current_stream())
         last_event = self._lane_last[settled]
         self._lane_last[settled] = end_event
         # CPU->GPU reads from host memory, which is never written
@@ -905,9 +916,14 @@ class SingleDirectionOffloadingHandler:
         is_src_access_order_any = not self.gpu_to_cpu
 
         def copy() -> None:
+            if compute_event is not None:
+                compute_event.synchronize()
             if last_event is not None:
                 # assure job will start only after the previous one completes
-                stream.wait_event(last_event)
+                if COPY_THREAD:
+                    last_event.synchronize()
+                else:
+                    stream.wait_event(last_event)
             with current_platform.stream(stream):
                 start_event.record(stream)
                 if op_idx > 0:
@@ -1233,14 +1249,18 @@ class SingleDirectionOffloadingHandler:
             self._event_pool.pop() if self._event_pool else torch.Event(enable_timing=True)
         )
         settled = self.gpu_to_cpu and settled
+        # Host-side waits only (see transfer_async). The lane's copy thread runs
+        # jobs in order and waits for each staged batch it reuses, so no
+        # chaining to the previous transfer is needed.
+        compute_event = None
         if not settled:
-            stream.wait_stream(current_platform.current_stream())
-        last_event = self._lane_last[settled]
+            compute_event = torch.Event()
+            compute_event.record(current_platform.current_stream())
         self._lane_last[settled] = end_event
 
         def copy() -> None:
-            if last_event is not None:
-                stream.wait_event(last_event)
+            if compute_event is not None:
+                compute_event.synchronize()
             with current_platform.stream(stream):
                 start_event.record(stream)
                 if items:
@@ -1308,8 +1328,11 @@ class SingleDirectionOffloadingHandler:
 
             results.append(result)
             self._stream_pool.append(transfer.stream)
-            self._event_pool.append(transfer.end_event)
-            self._event_pool.append(transfer.start_event)
+            if not COPY_THREAD:
+                # a queued copy closure may still wait on a finished transfer's
+                # end event, so pooled events are only safe without the thread
+                self._event_pool.append(transfer.end_event)
+                self._event_pool.append(transfer.start_event)
             if transfer.batch_src.numel():
                 self._buffer_pool.append(
                     (transfer.batch_src, transfer.batch_dst, transfer.batch_sizes)
