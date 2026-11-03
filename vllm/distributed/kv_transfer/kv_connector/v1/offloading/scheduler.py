@@ -3,7 +3,7 @@
 import os
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
 from types import SimpleNamespace
@@ -1005,7 +1005,9 @@ class OffloadingConnectorScheduler:
             merge_tag(req_status.req_context, tag)
         if not WRITE_BACK:
             return
-        chain = self._restore_chain(by_group)
+        chain = self._restore_chain(
+            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k)
+        )
         self._drop_run(tag)
         if not chain:
             # Nothing a restore could read (no boundary with every state
@@ -1060,7 +1062,12 @@ class OffloadingConnectorScheduler:
                         end = (i + 1) * tpc - 1  # usable depths end before it
                         limit = end if limit is None else min(limit, end)
                         break
-            chain = self._restore_chain(by_group, limit=limit)
+            chain = self._restore_chain(
+                by_group,
+                limit=limit,
+                have=lambda k: k in self._pool_has
+                or self._storable_free_block(k, config_idx_by_group) is not None,
+            )
             if not chain:
                 break
             self._wb_counts["run_broken_trimmed"] += 1
@@ -1086,6 +1093,7 @@ class OffloadingConnectorScheduler:
         else:
             self._state_sets.move_to_end(h)
         groups.add(get_offload_group_idx(key))
+        self._note_in_pool([key])
 
     def _note_states(self, keys: Iterable[OffloadKey]) -> None:
         for key in keys:
@@ -1093,7 +1101,10 @@ class OffloadingConnectorScheduler:
                 self._note_state_stored(key)
 
     def _restore_chain(
-        self, by_group: list[list[OffloadKey]], limit: int | None = None
+        self,
+        by_group: list[list[OffloadKey]],
+        limit: int | None = None,
+        have: Callable[[OffloadKey], bool] | None = None,
     ) -> list[OffloadKey]:
         """The keys a restore of this conversation reads, root first.
 
@@ -1102,7 +1113,9 @@ class OffloadingConnectorScheduler:
         only through the aligned hand-offs), so the chain is trimmed to the
         deepest such boundary d: full-attention keys up to d, the sliding
         window ending at d and the state keys at d. Empty when no boundary
-        has its state stored."""
+        has its state stored. ``have`` also accepts a boundary whose state keys
+        it reports present (on the GPU or in the pool): the GPU keeps the state
+        of every cached boundary, so the band can copy it from there."""
         configs = self.config.kv_group_configs
         if not self._state_group_ids:
             if limit is not None:
@@ -1122,6 +1135,9 @@ class OffloadingConnectorScheduler:
                 continue
             groups = self._state_sets.get(bytes(by_group[ref][i])[:-4])
             if groups is not None and self._state_group_ids <= groups:
+                depth = (i + 1) * ref_tpc
+                break
+            if have is not None and self._states_present(by_group, (i + 1) * ref_tpc, have):
                 depth = (i + 1) * ref_tpc
                 break
         if not depth:
@@ -1147,6 +1163,32 @@ class OffloadingConnectorScheduler:
             for first, end, idx in per_group
             if first <= i < end
         ]
+
+    def _states_present(
+        self, by_group: list[list[OffloadKey]], boundary: int, have
+    ) -> bool:
+        """Whether every state group's key at ``boundary`` passes ``have``."""
+        configs = self.config.kv_group_configs
+        found = False
+        for idx, config in enumerate(configs):
+            if not isinstance(config.kv_cache_spec, MambaSpec):
+                continue
+            tpc = config.tokens_per_chunk
+            if boundary % tpc:
+                return False
+            j = boundary // tpc - 1
+            if not 0 <= j < len(by_group[idx]) or not have(by_group[idx][j]):
+                return False
+            found = True
+        return found
+
+    def _gpu_has(self, key: OffloadKey) -> bool:
+        """The key's block is cached on the GPU (any reference count)."""
+        pool = self._gpu_block_pool
+        if pool is None:
+            return False
+        group = int.from_bytes(bytes(key)[-4:], "big")
+        return bool(pool.get_cached_block(BlockHash(bytes(key)[:-4]), [group]))
 
     def _storable_free_block(self, key: OffloadKey, config_idx_by_group: dict[int, int]):
         """(block, config_idx, num_tokens) for key if its GPU block is free (settled,
@@ -1309,6 +1351,13 @@ class OffloadingConnectorScheduler:
                 self._wb_counts["store_refused"] += 1
                 if tag is not None:
                     self._wb_refused[tag] = now
+                    # The pool found the run unrestorable without the keys
+                    # the band left out as present: forget them, so the
+                    # retry re-trims to states it can copy from the GPU.
+                    offered = {m[0] for m in members}
+                    for key in self._run_keys.get(tag, ()):
+                        if key not in offered and self._pool_has.pop(key, 0) is None:
+                            self._state_sets.pop(bytes(key)[:-4], None)
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
                 continue
             chunk_by_key = dict(
