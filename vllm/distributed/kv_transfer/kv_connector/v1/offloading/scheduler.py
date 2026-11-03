@@ -1141,16 +1141,38 @@ class OffloadingConnectorScheduler:
         if ref is None or not by_group[ref]:
             return []
         ref_tpc = configs[ref].tokens_per_chunk
+        # A lookup drops the trailing chunk of an EAGLE/MTP drafter group (its
+        # KV there is volatile), so a restore at boundary d reads that group
+        # one chunk past d and the state at d: the chain carries it too.
+        eagle = [
+            idx
+            for idx, config in enumerate(configs)
+            if config.is_eagle_group and not isinstance(config.kv_cache_spec, MambaSpec)
+        ]
+
+        def eagle_fits(boundary: int) -> bool:
+            for idx in eagle:
+                tpc = configs[idx].tokens_per_chunk
+                end = boundary + tpc
+                if boundary % tpc or len(by_group[idx]) < end // tpc:
+                    return False
+                if limit is not None and end > limit:
+                    return False
+            return True
+
         depth = 0
         for i in range(len(by_group[ref]) - 1, -1, -1):
             if limit is not None and (i + 1) * ref_tpc > limit:
                 continue
+            boundary = (i + 1) * ref_tpc
+            if not eagle_fits(boundary):
+                continue
             groups = self._state_sets.get(bytes(by_group[ref][i])[:-4])
             if groups is not None and self._state_group_ids <= groups:
-                depth = (i + 1) * ref_tpc
+                depth = boundary
                 break
-            if have is not None and self._states_present(by_group, (i + 1) * ref_tpc, have):
-                depth = (i + 1) * ref_tpc
+            if have is not None and self._states_present(by_group, boundary, have):
+                depth = boundary
                 break
         if not depth:
             return []
@@ -1160,6 +1182,8 @@ class OffloadingConnectorScheduler:
             if end <= 0 or depth % config.tokens_per_chunk:
                 per_group.append((0, 0, idx))
                 continue
+            if idx in eagle:
+                end = min(len(keys), end + 1)
             if isinstance(config.kv_cache_spec, MambaSpec):
                 first = end - 1
             elif config.sliding_window_size_in_chunks is not None:

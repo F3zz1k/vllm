@@ -522,3 +522,25 @@ def test_a_broken_run_is_retrimmed_then_dropped(band):
     assert scheduler._run_members(tag, scheduler._config_idx_by_group) == []
     assert tag not in scheduler._run_keys
     assert scheduler._wb_counts["run_broken_dropped"] == 1
+
+
+def test_restore_chain_carries_the_eagle_chunk_past_the_state(band):
+    """A lookup drops a drafter group's trailing chunk, so a restore at the
+    state boundary d reads that group to d + one chunk: the chain holds it."""
+    scheduler, _, _ = band
+    configs, attn, state = _groups(scheduler)
+    configs = list(configs)
+    configs[attn] = configs[attn]._replace(is_eagle_group=True)
+    scheduler.config = SimpleNamespace(**{
+        **{k: getattr(scheduler.config, k) for k in dir(scheduler.config)
+           if not k.startswith("_")},
+        "kv_group_configs": configs,
+    })
+    by_group = [[_hkey(i, c.group_idx) for i in range(4)] for c in configs]
+    for s in state:
+        scheduler._note_state_stored(by_group[s][1])
+        scheduler._note_state_stored(by_group[s][3])
+    chain = scheduler._restore_chain(by_group)
+    # state at chunk 3 has no eagle chunk past it; state at chunk 1 does
+    assert by_group[attn][2] in chain and by_group[attn][3] not in chain
+    assert all(by_group[s][1] in chain and by_group[s][3] not in chain for s in state)
