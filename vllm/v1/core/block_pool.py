@@ -203,6 +203,14 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        # Optional hooks for a KV offloading connector (the write-back band):
+        # ``evict_listener`` sees each hashed block get_new_blocks reuses,
+        # before its hash is dropped; ``revive_listener`` each free hashed
+        # block a prefix hit takes back. ``num_popped`` counts blocks handed
+        # out, so a listener can measure the reuse rate.
+        self.evict_listener: Callable[[KVCacheBlock], None] | None = None
+        self.revive_listener: Callable[[KVCacheBlock], None] | None = None
+        self.num_popped = 0
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -726,6 +734,11 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        self.num_popped += num_blocks
+        if self.evict_listener is not None:
+            for block in ret:
+                if block.block_hash is not None:
+                    self.evict_listener(block)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -810,6 +823,8 @@ class BlockPool:
             # candidate), so remove it.
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
+                if self.revive_listener is not None and block.block_hash is not None:
+                    self.revive_listener(block)
             block.ref_cnt += 1
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)

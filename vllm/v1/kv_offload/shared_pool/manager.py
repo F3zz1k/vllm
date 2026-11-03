@@ -322,8 +322,9 @@ class SharedPoolOffloadingManager(OffloadingManager):
     def pool_free_fraction(
         self, max_age: float = _STATE_INTERVAL_SEC
     ) -> float | None:
-        """This class's share of free arena rows, from STATE (at most one call
-        per ``max_age``); None when unknown."""
+        """This class's share of rows a store can take without evicting a live
+        run of its own (STATE admit_fraction, else free_fraction), at most one
+        call per ``max_age``; None when unknown."""
         if self._client is None:
             return None
         now = time.monotonic()
@@ -331,8 +332,13 @@ class SharedPoolOffloadingManager(OffloadingManager):
             self._state_at = now
             try:
                 state: Any = self._call_soft(P.OP_STATE)
+                cls_state = state["classes"][self._pool]
+                # admit_fraction also counts dead runs and other classes'
+                # idle runs (a joint arena full of another model's cold runs
+                # is not full for this one); older servers send only
+                # free_fraction.
                 self._free_fraction = float(
-                    state["classes"][self._pool]["free_fraction"]
+                    cls_state.get("admit_fraction", cls_state["free_fraction"])
                 )
             except ConnectionError:
                 self._free_fraction = None

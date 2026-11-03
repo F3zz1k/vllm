@@ -84,6 +84,10 @@ _IO_ALIGN = 4096
 # A run that cannot restore anything is evicted before every other run once
 # its last store is this old; a younger one is still being written.
 DEAD_RUN_GRACE_SEC = 10.0
+# admit_fraction: how long a computed value is reused, and how many runs of the
+# global order one computation walks at most.
+ADMIT_CACHE_SEC = 0.5
+ADMIT_WALK_RUNS = 20000
 # Tag prefix of the run an unpinned chunk in no conversation gets.
 _ORPHAN = b"orphan:"
 MANIFEST = "manifest.json"
@@ -570,6 +574,10 @@ class LayoutClass:
         self.n_pending = 0  # not ready: being written or read
         self.n_refd = 0     # held by a reader, a pin or a disk write
         self.n_pinned = 0
+        # Another class's run unused for this long is space this class may
+        # take for a compute-time store (it yields to an active class).
+        self.cross_class_idle_sec = float(cfg.get("cross_class_idle_sec", 120.0))
+        self._admit_cache: tuple[float, float] | None = None
 
     # --- geometry ---
 
@@ -694,6 +702,18 @@ class LayoutClass:
 
     def unrestorable_runs(self) -> int:
         return sum(1 for r in self.arena.unrestorable if r.cls is self)
+
+    def admit_fraction(self) -> float:
+        """Share of this class's rows a store could have without taking any
+        live run of its own: free rows, its dead runs and other classes' idle
+        runs (see Arena.admit_rows). Cached for ADMIT_CACHE_SEC."""
+        now = self.arena.clock()
+        cached = self._admit_cache
+        if cached is not None and now - cached[0] < ADMIT_CACHE_SEC:
+            return cached[1]
+        value = min(1.0, self.arena.admit_rows(self) / self.num_rows)
+        self._admit_cache = (now, value)
+        return value
 
     def stats(self) -> dict:
         ready = len(self.index) - self.n_pending
@@ -977,6 +997,40 @@ class Arena:
         if not run.restorable:
             cls.counters["unrestorable_runs_evicted"] += 1
         return freed
+
+    def _freeable(self, run: Run) -> int:
+        """Rows evicting run would free now (0 when any chunk is busy)."""
+        cls = run.cls
+        n = 0
+        for key in run.keys:
+            entry = cls.index[key]
+            if entry.pinned or len(entry.runs) > 1:
+                continue
+            if not cls.movable(entry):
+                return 0
+            n += 1
+        return n
+
+    def admit_rows(self, cls: LayoutClass) -> int:
+        """Rows of cls a store can have without evicting a live run of cls:
+        free and claimable rows, rows of its dead (unrestorable) runs past the
+        grace, and rows of other classes' runs idle for cls.cross_class_idle_sec
+        (converted by row size; at most ADMIT_WALK_RUNS runs are walked)."""
+        now = self.clock()
+        rows = cls.available()
+        dead_cut = now - DEAD_RUN_GRACE_SEC
+        for run in self.unrestorable:
+            if run.cls is cls and run.stored_at <= dead_cut:
+                rows += self._freeable(run)
+        idle_cut = now - cls.cross_class_idle_sec
+        other_bytes = 0
+        for walked, run in enumerate(self.order):
+            if walked >= ADMIT_WALK_RUNS:
+                break
+            if run.cls is cls or run.stored_at > idle_cut:
+                continue
+            other_bytes += self._freeable(run) * run.cls.stride
+        return rows + other_bytes // cls.stride
 
     def _candidates(self):
         """Runs that restore nothing first, then every run oldest first."""
@@ -2011,6 +2065,7 @@ class PoolServer:
                     "rows_total": cls.num_rows,
                     "rows_used": len(cls.index),
                     "free_fraction": cls.available() / cls.num_rows,
+                    "admit_fraction": cls.admit_fraction(),
                     "pinned": cls.n_pinned,
                     "runs": len(cls.runs),
                     "unrestorable_runs": cls.unrestorable_runs(),
@@ -2038,6 +2093,7 @@ class PoolServer:
             "generation": self.generation,
             "arena": True,
             "class_free_fraction": cls.available() / cls.num_rows,
+            "class_admit_fraction": cls.admit_fraction(),
         }
 
     def _attach_cold(self, cls: LayoutClass) -> None:

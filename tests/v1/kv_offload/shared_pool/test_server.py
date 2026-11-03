@@ -517,6 +517,43 @@ def test_cross_class_store_is_all_or_nothing():
     check(arena)
 
 
+def test_admit_fraction_counts_other_classes_idle_runs_only():
+    arena, big, small, b, s = two_classes(superpages=2)
+    big.cross_class_idle_sec = 60.0
+    store(arena, s, [key(1), key(2), key(3), key(4)], b"S")  # fills one superpage
+    store(arena, b, [key(1)], b"B1")                          # the other
+    assert big.available() == 0
+    # S is another class's run, but still active: nothing to admit.
+    assert big.admit_fraction() == 0.0
+    # Once S has been idle long enough it is space for the big class.
+    arena.clock.t += 61.0
+    assert big.admit_fraction() == pytest.approx(1 / big.num_rows)
+    # The small class may take the big class's idle run (one superpage), but
+    # never counts its own old run S: that is live RAM-only data.
+    small.cross_class_idle_sec = 60.0
+    assert small.admit_fraction() == pytest.approx(
+        (small.available() + SP // ROW) / small.num_rows)
+    # A held run frees nothing.
+    assert arena.lookup(b, [key(1)]) == [P.HIT]
+    small._admit_cache = None
+    assert small.admit_fraction() == pytest.approx(small.available() / small.num_rows)
+    arena.end_session(b)
+    check(arena)
+
+
+def test_admit_fraction_counts_this_class_dead_runs():
+    arena = make_arena(superpages=4)
+    cls = make_class(arena, state_groups=(1,))
+    c = client(cls, 1)
+    store(arena, c, [key(1, 0), key(2, 0)], b"dead")   # no state: unrestorable
+    store(arena, c, [key(3, 0), key(3, 1)], b"live")   # a complete boundary
+    assert cls.admit_fraction() == 0.0
+    arena.clock.t += S.DEAD_RUN_GRACE_SEC + 1
+    cls._admit_cache = None
+    assert cls.admit_fraction() == pytest.approx(2 / 4)
+    check(arena)
+
+
 def test_compaction_frees_a_superpage_and_moving_rows_answer_pending():
     arena, big, small, b, s = two_classes(superpages=3)
     for i in range(8):  # two small superpages

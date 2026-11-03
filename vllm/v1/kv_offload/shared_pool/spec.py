@@ -278,7 +278,9 @@ class SharedPoolOffloadingSpec(CPUOffloadingSpec):
                 pool=self.pool_name,
                 engine_tag=self.config.engine_id,
                 enable_events=self.kv_events_config.enable_kv_cache_events,
-                free_fraction=reply.get("class_free_fraction"),
+                free_fraction=reply.get(
+                    "class_admit_fraction", reply.get("class_free_fraction")
+                ),
                 reconnect=self._reattach,
             )
             self._scheduler_arena = reply.get("_arena")

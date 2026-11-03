@@ -50,11 +50,18 @@ class FakeGPUPool:
             node = node.next_free_block
         return None
 
+    def get_num_free_blocks(self):
+        return self.free_block_queue.num_free_blocks
+
     def touch(self, blocks):
         for block in blocks:
             if block.ref_cnt == 0:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+
+
+def _src_blocks(jobs) -> list[int]:
+    return [b for j in jobs.values() for b in j.src_spec.block_ids.tolist()]
 
 
 def _queue_ids(pool: FakeGPUPool) -> list[int]:
@@ -70,6 +77,7 @@ def band(monkeypatch):
     monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
     monkeypatch.setattr(sched_mod, "WRITE_BACK_SCAN", 8)
     monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 4)
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_FREE_SHARE", 1.0)
     scheduler = _make_partial_tail_scheduler()
     chunk = scheduler.config.kv_group_configs[0].tokens_per_chunk
     group = scheduler.config.kv_group_configs[0].group_idx
@@ -99,7 +107,7 @@ def band(monkeypatch):
 def test_band_holds_and_stores_only_what_the_pool_lacks(band):
     scheduler, pool, blocks = band
     jobs = scheduler._build_write_back_jobs()
-    stored_blocks = sorted(j.src_spec.block_ids.tolist()[0] for j in jobs.values())
+    stored_blocks = sorted(_src_blocks(jobs))
     assert stored_blocks == [2, 3, 6]          # 1 unhashed, 4 in pool, 5 partial
     for b in (blocks[1], blocks[2], blocks[5]):
         assert b.ref_cnt == 1                   # held: cannot be reallocated
@@ -167,7 +175,8 @@ def test_whole_run_is_written_root_first_under_its_tag(band):
     # holds the tip nearest eviction; only a known run is marked whole.
     lone = OffloadKey(bytes(blocks[3].block_hash))
     assert calls == [(chain, tag, True), ([lone], lone, False)]
-    assert [j.src_spec.block_ids.tolist()[0] for j in jobs.values()] == [2, 3, 6, 4]
+    # One copy job per run.
+    assert [j.src_spec.block_ids.tolist() for j in jobs.values()] == [[2, 3, 6], [4]]
 
 
 def test_a_block_of_no_known_run_is_a_run_of_its_own(band):
@@ -201,6 +210,11 @@ def test_a_finished_request_merges_into_its_conversation(band, monkeypatch, writ
         [OffloadKey(b"g%d-%d" % (g, i)) for i in range(3)] for g in range(num_groups)
     ]
     scheduler.manager.merge_tag = MagicMock()
+    # Every state group is in the pool at the last boundary.
+    for g, cfg in enumerate(scheduler.config.kv_group_configs):
+        if isinstance(cfg.kv_cache_spec, MambaSpec):
+            scheduler._note_state_stored(
+                OffloadKey(bytes(keys_by_group[attn_idx][-1])[:-4] + cfg.group_idx.to_bytes(4, "big")))
     scheduler._record_run(_finished(scheduler, keys_by_group))
     # The run is named after the conversation's last attention key, whatever
     # the band does.
@@ -281,7 +295,7 @@ def test_a_run_larger_than_the_budget_is_written_once_nothing_is_held(band, monk
     jobs = scheduler._build_write_back_jobs()
     (keys, tag), kwargs = scheduler.manager.prepare_store_run.call_args
     assert list(keys) == chain and tag == chain[-1] and kwargs["whole"]
-    assert sorted(j.src_spec.block_ids.tolist()[0] for j in jobs.values()) == [2, 3, 6]
+    assert sorted(_src_blocks(jobs)) == [2, 3, 6]
     assert scheduler._wb_counts["run_oversize"] == 1
 
 
@@ -310,3 +324,150 @@ def test_reset_cache_merges_a_finished_unsignalled_request(band):
     (ctx, tag), _ = scheduler.manager.merge_tag.call_args
     assert ctx.req_id == "req" and tag == OffloadKey(b"tip")
     assert "req" not in scheduler._req_status
+
+
+# --- 2026-11-03: the band writes what a restore reads, paced and accounted ---
+
+
+def _hkey(i: int, group: int) -> OffloadKey:
+    return OffloadKey(i.to_bytes(32, "big") + group.to_bytes(4, "big"))
+
+
+def _groups(scheduler):
+    configs = scheduler.config.kv_group_configs
+    attn = next(i for i, c in enumerate(configs) if not isinstance(c.kv_cache_spec, MambaSpec))
+    state = [i for i, c in enumerate(configs) if isinstance(c.kv_cache_spec, MambaSpec)]
+    return configs, attn, state
+
+
+def test_restore_chain_is_trimmed_to_the_deepest_stored_state(band):
+    scheduler, _, _ = band
+    configs, attn, state = _groups(scheduler)
+    assert state and len({c.tokens_per_chunk for c in configs}) == 1
+    by_group = [[_hkey(i, c.group_idx) for i in range(4)] for c in configs]
+    assert scheduler._restore_chain(by_group) == []          # no state stored
+    for s in state:                                           # state at chunk 1
+        scheduler._note_state_stored(by_group[s][1])
+    chain = scheduler._restore_chain(by_group)
+    expect = [by_group[attn][0], by_group[attn][1]] + [by_group[s][1] for s in state]
+    assert sorted(chain) == sorted(expect)
+    assert chain.index(by_group[attn][0]) < chain.index(by_group[attn][1])
+    # Interior states and attention past the boundary are never offered.
+    assert by_group[attn][2] not in chain and by_group[state[0]][0] not in chain
+
+
+def test_a_run_with_no_stored_state_is_not_remembered(band):
+    scheduler, _, _ = band
+    configs, attn, _ = _groups(scheduler)
+    by_group = [[_hkey(i, c.group_idx) for i in range(3)] for c in configs]
+    scheduler.manager.merge_tag = MagicMock()
+    scheduler._record_run(_finished(scheduler, by_group))
+    assert by_group[attn][-1] not in scheduler._run_keys
+    assert scheduler._wb_counts["run_unrestorable_dropped"] == 1
+
+
+def test_a_refused_run_is_not_offered_again_until_the_backoff(band, monkeypatch):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    scheduler.manager.prepare_store_run = MagicMock(return_value=None)
+    clock = [100.0]
+    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: clock[0])
+    assert scheduler._build_write_back_jobs() == {}
+    assert scheduler._wb_counts["store_refused"] == 1
+    scheduler._build_write_back_jobs()
+    assert scheduler.manager.prepare_store_run.call_count == 1
+    clock[0] += sched_mod.WRITE_BACK_REFUSED_BACKOFF_S + 1
+    scheduler._build_write_back_jobs()
+    assert scheduler.manager.prepare_store_run.call_count == 2
+    assert chain[-1] in scheduler._wb_refused
+    assert all(b.ref_cnt == 0 for b in blocks)
+
+
+def test_gpu_eviction_is_classified_by_copy_state(band):
+    scheduler, pool, blocks = band
+    _register_run(scheduler, blocks, (1, 2))
+    scheduler._on_gpu_evict(blocks[1])                      # run member, no copy
+    scheduler._note_in_pool([OffloadKey(bytes(blocks[2].block_hash))])
+    scheduler._on_gpu_evict(blocks[2])                      # member, in the pool
+    scheduler._on_gpu_evict(blocks[5])                      # in no run
+    c = scheduler._wb_counts
+    assert (c["evict_uncopied"], c["evict_copied"], c["evict_other"]) == (1, 1, 1)
+
+
+def test_rescue_copies_an_evicted_member_and_flushes_it(band, monkeypatch):
+    scheduler, pool, blocks = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_RESCUE", 1)
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2))
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+    scheduler._on_gpu_evict(blocks[1])
+    scheduler._on_gpu_evict(blocks[2])                      # over the per-step cap
+    assert scheduler._wb_counts["evict_rescued"] == 1
+    assert scheduler._wb_counts["evict_uncopied"] == 1
+    pool.free_block_queue.remove(blocks[1])                 # now another request's
+    blocks[1].ref_cnt = 1
+    jobs = scheduler._build_write_back_jobs()
+    rescue = [j for j, job in jobs.items() if job.src_spec.block_ids.tolist() == [2]]
+    assert rescue and rescue[0] in scheduler._current_batch_jobs_to_flush
+    first = scheduler.manager.prepare_store_run.call_args_list[0]
+    assert list(first.args[0]) == [chain[0]] and first.kwargs["whole"] is False
+    # Completing it releases nothing it does not hold.
+    meta = OffloadingWorkerMetadata()
+    for _ in range(scheduler.config.num_workers):
+        meta.mark_completed(rescue[0])
+    scheduler.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=meta))
+    assert blocks[1].ref_cnt == 1 and chain[0] in scheduler._pool_has
+
+
+def test_band_lead_follows_the_reuse_rate(band, monkeypatch):
+    scheduler, pool, _ = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_SCAN_MAX", 10000)
+    clock = [0.0]
+    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: clock[0])
+    pool.num_popped = 0
+    scheduler._wb_rate_at, scheduler._wb_popped, scheduler._wb_rate = 0.0, 0, 0.0
+    scheduler._wb_latency = 1.0
+    assert scheduler._band_lead(0.0) == sched_mod.WRITE_BACK_SCAN
+    for _ in range(20):                                   # 100 blocks/s for 20 s
+        clock[0] += 1.0
+        pool.num_popped += 100
+        lead = scheduler._band_lead(clock[0])
+    assert lead == pytest.approx(100 * 1.0 * sched_mod.WRITE_BACK_LEAD_FACTOR
+                                 + sched_mod.WRITE_BACK_SCAN, rel=0.01)
+
+
+def test_the_band_holds_at_most_its_share_of_free_blocks(band, monkeypatch):
+    scheduler, pool, blocks = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_FREE_SHARE", 0.25)   # 6 free -> 1
+    jobs = scheduler._build_write_back_jobs()
+    assert len(_src_blocks(jobs)) == 1
+
+
+def test_a_revived_copied_block_counts_as_duplicate(band):
+    scheduler, pool, blocks = band
+    jobs = scheduler._build_write_back_jobs()
+    assert scheduler._wb_counts["revived_copied"] == 0      # the hold is not a hit
+    meta = OffloadingWorkerMetadata()
+    for job_id in jobs:
+        for _ in range(scheduler.config.num_workers):
+            meta.mark_completed(job_id)
+    scheduler.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=meta))
+    scheduler._on_gpu_revive(blocks[1])
+    assert scheduler._wb_counts["revived_copied"] == 1
+
+
+def test_prompt_boundary_becomes_the_junction_when_none_is_set(band):
+    scheduler, _, _ = band
+    request = _make_partial_tail_request(scheduler)
+    request.shared_prefix_boundary = 0
+    status = scheduler._req_status["req"]
+    scheduler.config = scheduler.config._replace(retention_interval=0)  # sparse
+    tpc = scheduler.config.kv_group_configs[scheduler._chain_ref_group].tokens_per_chunk
+    scheduler._maybe_set_prompt_boundary(status, 0)
+    assert request.shared_prefix_boundary == (30 - 1) // tpc * tpc
+    # An existing junction past the resume point is kept.
+    request.shared_prefix_boundary = 4
+    scheduler._maybe_set_prompt_boundary(status, 0)
+    assert request.shared_prefix_boundary == 4
