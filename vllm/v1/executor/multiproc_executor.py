@@ -187,7 +187,60 @@ class MultiprocExecutor(Executor):
 
             # For CPU backend only, to setup OpenMP threads affinity
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
-            for local_rank in range(self.local_world_size):
+            # A spawned child reads its pickled kwargs (the whole VllmConfig)
+            # while it imports, so Process.start() blocks on the pipe write
+            # until the child has finished importing vLLM; started one after
+            # the other, the workers pay that import time in series (about
+            # 16 s per worker on the B70 rig). Start them from threads when
+            # nothing per rank goes through os.environ (no OpenMP or NUMA
+            # set-up) and no descriptors are inherited (spawn, not fork).
+            parallel_spawn = (
+                self.local_world_size > 1
+                and inherited_fds is None
+                and not current_platform.is_cpu()
+                and not self.parallel_config.numa_bind
+                and os.environ.get("B70_SERIAL_WORKER_SPAWN", "0") != "1"
+            )
+            if parallel_spawn:
+                import concurrent.futures
+
+                def _spawn(local_rank: int) -> UnreadyWorkerProcHandle:
+                    global_rank = global_start_rank + local_rank
+                    return WorkerProc.make_worker_process(
+                        vllm_config=self.vllm_config,
+                        local_rank=local_rank,
+                        rank=global_rank,
+                        distributed_init_method=distributed_init_method,
+                        input_shm_handle=scheduler_output_handle,
+                        shared_worker_lock=shared_worker_lock,
+                        is_driver_worker=self._is_driver_worker(global_rank),
+                        inherited_fds=None,
+                    )
+
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self.local_world_size
+                ) as spawn_pool:
+                    futures = [
+                        spawn_pool.submit(_spawn, r)
+                        for r in range(self.local_world_size)
+                    ]
+                    # Collect every result in rank order, so a failed start
+                    # still leaves the started workers for the cleanup below.
+                    errors = []
+                    for fut in futures:
+                        try:
+                            unready_workers.append(fut.result())
+                        except Exception as e:  # noqa: BLE001
+                            errors.append(e)
+                    if errors:
+                        raise errors[0]
+                logger.info(
+                    "Started %d workers in parallel", self.local_world_size
+                )
+            for local_rank in range(
+                self.local_world_size if parallel_spawn else 0,
+                self.local_world_size,
+            ):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(
