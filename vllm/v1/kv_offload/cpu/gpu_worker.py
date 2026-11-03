@@ -115,7 +115,13 @@ REGISTER_REGION = os.environ.get("VLLM_KV_OFFLOAD_REGISTER", "1") == "1"
 # double buffered so the CPU side of one batch overlaps the DMA of the next.
 # Needs the copy thread (the CPU work runs there, never on the forward).
 STAGED_COPY = os.environ.get("VLLM_KV_OFFLOAD_STAGED_COPY", "1") == "1"
-STAGED_SLOT_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_SLOT_MB", "128")) << 20
+STAGED_SLOT_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_SLOT_MB", "64")) << 20
+# Slots per lane form a ring of this many bytes, all enqueued at once: in the
+# engine every copy also waits behind the compute stream's own per-step copies
+# on the one copy engine, so a lane moves what it has enqueued once per forward
+# step; a double buffer moved one slot per step. Slots are pinned lazily.
+STAGED_RING_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_RING_MB", "512")) << 20
+_STAGED_RING = max(2, STAGED_RING_BYTES // max(STAGED_SLOT_BYTES, 1))
 _STAGED_ALIGN = 4096
 
 
@@ -1013,6 +1019,8 @@ class SingleDirectionOffloadingHandler:
         events = self._lane_slot_events[settled]
         while len(slots) <= idx:
             slots.append(torch.empty(0, dtype=torch.int8))
+        while len(events) <= idx:
+            events.append(None)
         if slots[idx].numel() < nbytes:
             event = events[idx]
             if event is not None:
@@ -1170,9 +1178,11 @@ class SingleDirectionOffloadingHandler:
         stream,
         settled: bool = False,
     ) -> None:
-        """Runs on the copy thread inside the transfer stream. Store: DMA batch
-        k+1 while scattering batch k. Load: gather batch k+1 while batch k's
-        DMA runs (a slot is refilled only once its previous DMA is done)."""
+        """Runs on the copy thread inside the transfer stream, over a ring of
+        _STAGED_RING slots. Store: the DMAs of up to a ring of batches are in
+        flight while the oldest is scattered. Load: batches are gathered and
+        their DMAs enqueued until the ring is full; a slot is refilled only
+        once its previous DMA is done."""
         st = self.__dict__.setdefault(
             f"_staged_stats{int(settled)}", [0, 0, 0.0, 0.0, 0.0, 0.0, 0]
         )
@@ -1181,13 +1191,14 @@ class SingleDirectionOffloadingHandler:
         batches = self._staged_batches(segments)
         if self.gpu_to_cpu:
             pending: deque = deque()
+            last = len(batches) - 1
             for k, batch in enumerate(batches):
-                slot = self._slot(k % 2, _batch_bytes(batch), settled)
+                slot = self._slot(k % _STAGED_RING, _batch_bytes(batch), settled)
                 self._staged_dma(batch, slot)
                 event = torch.Event()
                 event.record(stream)
                 pending.append((batch, slot, event))
-                while len(pending) == 2 or (pending and k == len(batches) - 1):
+                while len(pending) >= _STAGED_RING or (pending and k == last):
                     done_batch, done_slot, done_event = pending.popleft()
                     t0 = time.perf_counter()
                     done_event.synchronize()
@@ -1197,7 +1208,7 @@ class SingleDirectionOffloadingHandler:
                     cpu += time.perf_counter() - t1
         else:
             for k, batch in enumerate(batches):
-                idx = k % 2
+                idx = k % _STAGED_RING
                 slot = self._slot(idx, _batch_bytes(batch))
                 event = self._lane_slot_events[False][idx]
                 t0 = time.perf_counter()
