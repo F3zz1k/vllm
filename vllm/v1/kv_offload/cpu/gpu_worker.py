@@ -24,6 +24,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheRef,
     CanonicalKVCaches,
     CanonicalPageMapping,
+    CopyRun,
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingWorker,
@@ -123,6 +124,9 @@ STAGED_SLOT_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_SLOT_MB", "64")) 
 STAGED_RING_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_RING_MB", "512")) << 20
 _STAGED_RING = max(2, STAGED_RING_BYTES // max(STAGED_SLOT_BYTES, 1))
 _STAGED_ALIGN = 4096
+# Fragments at least this large (whole direct-layout pages) are copied one
+# slice at a time instead of as rows of an indexed copy.
+_STAGED_SLICE_BYTES = 64 << 10
 
 
 class _StagedRef(NamedTuple):
@@ -153,6 +157,16 @@ def _batch_bytes(batch) -> int:
     plan, g_ids, _, off = batch[-1]
     step = -(-plan.span // _STAGED_ALIGN) * _STAGED_ALIGN
     return max(STAGED_SLOT_BYTES, off + (len(g_ids) - 1) * step + plan.span)
+
+
+def _identity_ref(ref: CanonicalKVCacheRef) -> CanonicalKVCacheRef:
+    """A direct-layout ref as a one-run mapping: the whole page, same offset."""
+    page = ref.page_size_bytes
+    run = CopyRun(0, 0, page, 1, page, page)
+    mapping = CanonicalPageMapping(page, page, (run,), 1, 0, False)
+    return CanonicalKVCacheRef(
+        tensor_idx=ref.tensor_idx, page_size_bytes=page, mapping=mapping
+    )
 
 
 def _staged_ref(ref: CanonicalKVCacheRef) -> "_StagedRef | None":
@@ -538,13 +552,21 @@ class SingleDirectionOffloadingHandler:
         # cannot be staged (then every transfer takes the descriptor path)
         self._staged_refs: list[list[_StagedRef | None]] | None = None
         if (
-            canonical_layout
-            and STAGED_COPY
+            STAGED_COPY
             and COPY_THREAD
             and blocks_per_chunk == 1
             and current_platform.is_xpu()
         ):
-            plans = [[_staged_ref(ref) for ref in refs] for refs in layer_refs_per_group]
+            # The direct (worker-private) layout stages too, as one whole-page
+            # run per ref: unstaged, each page copy into the registered arena
+            # waits, and each wait queues behind a forward step's copies.
+            refs_for_plans = (
+                layer_refs_per_group
+                if canonical_layout
+                else [[_identity_ref(ref) for ref in refs] for refs in layer_refs_per_group]
+            )
+            plans = [[_staged_ref(ref) for ref in refs] for refs in refs_for_plans]
+            layer_refs_per_group = refs_for_plans
             stageable = all(
                 p is not None or ref.mapping is None or not ref.mapping.runs
                 for refs, ps in zip(layer_refs_per_group, plans)
@@ -553,8 +575,9 @@ class SingleDirectionOffloadingHandler:
             if stageable:
                 self._staged_refs = plans
             logger.info(
-                "KV offload %s: staged canonical copies %s",
+                "KV offload %s: staged %s copies %s",
                 "store" if gpu_to_cpu else "load",
+                "canonical" if canonical_layout else "direct",
                 "on" if stageable else "off (a ref has a non-contiguous local span)",
             )
         # staging slots and their last events, per lane (ordered, settled)
@@ -1120,6 +1143,7 @@ class SingleDirectionOffloadingHandler:
         cpu_tensors = self.dst_tensors if self.gpu_to_cpu else self.src_tensors
         classes: dict[tuple[int, int], tuple[torch.Tensor, list, list]] = {}
         slow = []
+        big = []  # large fragments (whole pages): one slice copy each
         for plan, _g, c_ids, off in batch:
             cpu = cpu_tensors[plan.tensor_idx]
             step = -(-plan.span // _STAGED_ALIGN) * _STAGED_ALIGN
@@ -1128,6 +1152,9 @@ class SingleDirectionOffloadingHandler:
             for size, local, canon in plan.frags:
                 local_abs = (offs[:, None] + local[None, :]).ravel()
                 canon_abs = (rows[:, None] + canon[None, :]).ravel()
+                if size >= _STAGED_SLICE_BYTES:
+                    big.append((cpu, size, local_abs, canon_abs))
+                    continue
                 if (local_abs % size).any() or (canon_abs % size).any():
                     slow.append((plan, cpu, rows, offs))
                     continue
@@ -1135,6 +1162,17 @@ class SingleDirectionOffloadingHandler:
                 entry = classes.setdefault(key, (cpu, [], []))
                 entry[1].append(local_abs // size)
                 entry[2].append(canon_abs // size)
+        if big:
+            stage1d = self._np_rows(slot, 1, settled).reshape(-1)
+            for cpu, size, local_abs, canon_abs in big:
+                arena1d = self._np_rows(cpu, 1, settled).reshape(-1)
+                for lo, co in zip(local_abs.tolist(), canon_abs.tolist()):
+                    arena_part = arena1d[co : co + size]
+                    stage_part = stage1d[lo : lo + size]
+                    if self.gpu_to_cpu:
+                        arena_part[...] = stage_part
+                    else:
+                        stage_part[...] = arena_part
         for (size, _), (cpu, local_rows, canon_rows) in classes.items():
             stage2d = self._np_rows(slot, size, settled)
             arena2d = self._np_rows(cpu, size, settled)

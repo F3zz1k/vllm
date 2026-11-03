@@ -126,3 +126,21 @@ def test_staged_store_keeps_writer_rotation_and_groups():
     expected = np.zeros((10, _CANON), dtype=np.int8)
     _oracle(gpu.numpy()[3:5], _shard(2, 0), expected, [8, 9])
     assert np.array_equal(canon.numpy()[8:10], expected[8:10])
+
+
+def test_direct_layout_pages_stage_as_whole_slices(monkeypatch):
+    """A direct-layout ref is one whole-page run: staged as slice copies."""
+    monkeypatch.setattr(gpu_worker, "STAGED_SLOT_BYTES", 300 << 10)
+    page = 128 << 10
+    ref = gpu_worker._identity_ref(CanonicalKVCacheRef(0, page, None))
+    gpu = torch.randint(-128, 128, (6, page), dtype=torch.int8)
+    backing = torch.zeros(5, page + 4096, dtype=torch.int8)  # row stride != page
+    cpu = backing[:, 100 : 100 + page]
+    h = _handler(gpu, cpu, [ref.mapping], True)
+    _run(h, [5, 1, 3], [0, 4, 2], (3,))
+    assert torch.equal(cpu[0], gpu[5]) and torch.equal(cpu[4], gpu[1])
+    assert torch.equal(cpu[2], gpu[3]) and not cpu[1].any()
+    back = torch.zeros(6, page, dtype=torch.int8)
+    _run(_handler(back, cpu, [ref.mapping], False), [0, 2, 4], [0, 4, 2], (3,))
+    assert torch.equal(back[0], gpu[5]) and torch.equal(back[2], gpu[1])
+    assert torch.equal(back[4], gpu[3])
