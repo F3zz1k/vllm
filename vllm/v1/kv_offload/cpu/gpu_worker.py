@@ -113,11 +113,16 @@ REGISTER_REGION = os.environ.get("VLLM_KV_OFFLOAD_REGISTER", "1") == "1"
 # double buffered so the CPU side of one batch overlaps the DMA of the next.
 # Needs the copy thread (the CPU work runs there, never on the forward).
 STAGED_COPY = os.environ.get("VLLM_KV_OFFLOAD_STAGED_COPY", "1") == "1"
-STAGED_SLOT_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_SLOT_MB", "64")) << 20
+STAGED_SLOT_BYTES = int(os.environ.get("VLLM_KV_OFFLOAD_STAGED_SLOT_MB", "128")) << 20
+_STAGED_ALIGN = 4096
 
 
 class _StagedRef(NamedTuple):
-    """One data ref's local page span and its fragment runs, for staged copies."""
+    """One data ref's local page span and its fragment runs, for staged copies.
+    ``frags`` groups the fragments by size: (size, offsets in the staged page,
+    offsets in the canonical page), so a batch moves each size class with one
+    indexed copy (one GIL-free op instead of one per run: per-run copies on
+    the copy thread queued behind the forward thread for the GIL)."""
 
     tensor_idx: int
     span_lo: int
@@ -125,12 +130,21 @@ class _StagedRef(NamedTuple):
     runs: tuple
     total_bytes: int
     mapping: CanonicalPageMapping
+    frags: tuple
+
+
+def _rows_view(storage, dtype: torch.dtype, width: int) -> torch.Tensor:
+    """The whole storage as rows of ``width`` elements of ``dtype``."""
+    elt = torch.tensor([], dtype=dtype).element_size()
+    rows = storage.nbytes() // (elt * width)
+    return torch.tensor([], dtype=dtype).set_(storage, 0, (rows, width), (width, 1))
 
 
 def _batch_bytes(batch) -> int:
-    """Slot bytes a staged batch needs: (plan, gpu block, cpu chunk, offset)."""
-    plan, _, _, off = batch[-1]
-    return max(STAGED_SLOT_BYTES, off + plan.span)
+    """Slot bytes a staged batch needs: (plan, gpu blocks, cpu chunks, offset)."""
+    plan, g_ids, _, off = batch[-1]
+    step = -(-plan.span // _STAGED_ALIGN) * _STAGED_ALIGN
+    return max(STAGED_SLOT_BYTES, off + (len(g_ids) - 1) * step + plan.span)
 
 
 def _staged_ref(ref: CanonicalKVCacheRef) -> "_StagedRef | None":
@@ -153,7 +167,19 @@ def _staged_ref(ref: CanonicalKVCacheRef) -> "_StagedRef | None":
             return None  # a gap or an overlap: the span would copy foreign bytes
         hi = end
     total = sum(r.fragment_size * r.num_fragments for r in mapping.runs)
-    return _StagedRef(ref.tensor_idx, lo, hi - lo, tuple(mapping.runs), total, mapping)
+    by_size: dict[int, tuple[list, list]] = {}
+    for run in mapping.runs:
+        i = np.arange(run.num_fragments, dtype=np.int64)
+        local, canon = by_size.setdefault(run.fragment_size, ([], []))
+        local.append(run.local_offset - lo + i * run.local_stride)
+        canon.append(run.canonical_offset + i * run.canonical_stride)
+    frags = tuple(
+        (size, np.concatenate(local), np.concatenate(canon))
+        for size, (local, canon) in sorted(by_size.items())
+    )
+    return _StagedRef(
+        ref.tensor_idx, lo, hi - lo, tuple(mapping.runs), total, mapping, frags
+    )
 
 
 def _check_descriptor_bounds(
@@ -178,10 +204,21 @@ def _check_descriptor_bounds(
             )
 
 
+# The copy thread shares the worker's GIL with the forward thread; every GIL
+# release in a copy (a DMA wait, a CPU scatter) is followed by a retake that can
+# wait a whole switch interval (5 ms by default). Set, the process switch
+# interval becomes this many microseconds once the copy thread starts.
+COPY_THREAD_SWITCH_US = int(os.environ.get("VLLM_KV_OFFLOAD_SWITCH_INTERVAL_US", "0"))
+
+
 class _CopyThread:
     """One FIFO thread running submitted copy closures in order."""
 
     def __init__(self, name: str, device: torch.device | None) -> None:
+        if COPY_THREAD_SWITCH_US > 0:
+            import sys
+
+            sys.setswitchinterval(COPY_THREAD_SWITCH_US * 1e-6)
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._device = device
         self.error: BaseException | None = None
@@ -915,20 +952,21 @@ class SingleDirectionOffloadingHandler:
         src_blocks: np.ndarray,
         dst_blocks: np.ndarray,
         group_sizes: Sequence[int],
-    ) -> list[tuple[_StagedRef, int, int]]:
-        """(plan, gpu block, cpu chunk) per page this rank copies, in group and
-        ref order; a store keeps only the pages this rank is elected to write."""
+    ) -> list[tuple[_StagedRef, np.ndarray, np.ndarray]]:
+        """Segments (plan, gpu blocks, cpu chunks): the pages this rank copies,
+        one segment per data ref in group and ref order; a store keeps only the
+        pages this rank is elected to write."""
         assert self._staged_refs is not None
         gpu_ids_all, cpu_ids_all = (
             (src_blocks, dst_blocks) if self.gpu_to_cpu else (dst_blocks, src_blocks)
         )
-        items: list[tuple[_StagedRef, int, int]] = []
+        segments: list[tuple[_StagedRef, np.ndarray, np.ndarray]] = []
         offset = 0
         for g_idx, group_size in enumerate(group_sizes):
             if group_size == 0:
                 continue
-            gpu_ids = gpu_ids_all[offset : offset + group_size]
-            cpu_ids = cpu_ids_all[offset : offset + group_size]
+            gpu_ids = np.asarray(gpu_ids_all[offset : offset + group_size], dtype=np.int64)
+            cpu_ids = np.asarray(cpu_ids_all[offset : offset + group_size], dtype=np.int64)
             offset += group_size
             for plan in self._staged_refs[g_idx]:
                 if plan is None:
@@ -938,10 +976,9 @@ class SingleDirectionOffloadingHandler:
                 if self.gpu_to_cpu and mapping.num_writers > 1:
                     mask = c_sel % mapping.num_writers == mapping.writer_index
                     g_sel, c_sel = g_sel[mask], c_sel[mask]
-                items.extend(
-                    (plan, int(g), int(c)) for g, c in zip(g_sel.tolist(), c_sel.tolist())
-                )
-        return items
+                if len(g_sel):
+                    segments.append((plan, g_sel, c_sel))
+        return segments
 
     def _slot(self, idx: int, nbytes: int) -> torch.Tensor:
         while len(self._slots) <= idx:
@@ -951,42 +988,75 @@ class SingleDirectionOffloadingHandler:
             if event is not None:
                 event.synchronize()
                 self._slot_events[idx] = None
+            nbytes = -(-nbytes // _STAGED_ALIGN) * _STAGED_ALIGN
+            self.__dict__.pop("_np_rows_cache", None)  # it keeps the old slot alive
             self._slots[idx] = torch.empty(nbytes, dtype=torch.int8, pin_memory=True)
         return self._slots[idx]
 
+    def _np_rows(self, tensor: torch.Tensor, size: int) -> np.ndarray:
+        """The tensor's whole storage as a numpy array of ``size``-byte rows
+        (8-byte elements when the size allows), cached per storage."""
+        storage = tensor.untyped_storage()
+        key = (storage.data_ptr(), storage.nbytes(), size)
+        cache = self.__dict__.setdefault("_np_rows_cache", {})
+        view = cache.get(key)
+        if view is None:
+            elt = 8 if size % 8 == 0 else 1
+            dtype = torch.int64 if elt == 8 else torch.int8
+            view = cache[key] = _rows_view(storage, dtype, size // elt).numpy()
+        return view
+
     def _staged_batches(
-        self, items: list[tuple[_StagedRef, int, int]]
-    ) -> list[list[tuple[_StagedRef, int, int, int]]]:
-        """Pack items into slot-sized batches: (plan, gpu block, cpu chunk,
-        offset in the slot)."""
-        batches: list[list[tuple[_StagedRef, int, int, int]]] = []
-        batch: list[tuple[_StagedRef, int, int, int]] = []
+        self, segments: list[tuple[_StagedRef, np.ndarray, np.ndarray]]
+    ) -> list[list[tuple[_StagedRef, np.ndarray, np.ndarray, int]]]:
+        """Pack segments into slot-sized batches of (plan, gpu blocks, cpu
+        chunks, first slot offset); page i of a piece sits at first offset +
+        i * the plan's aligned span. A page larger than a slot is a batch alone."""
+        batches: list[list[tuple[_StagedRef, np.ndarray, np.ndarray, int]]] = []
+        batch: list[tuple[_StagedRef, np.ndarray, np.ndarray, int]] = []
         used = 0
-        for plan, g, c in items:
-            if batch and used + plan.span > STAGED_SLOT_BYTES:
-                batches.append(batch)
-                batch, used = [], 0
-            batch.append((plan, g, c, used))
-            used += plan.span
+        for plan, g_ids, c_ids in segments:
+            step = -(-plan.span // _STAGED_ALIGN) * _STAGED_ALIGN
+            start = 0
+            while start < len(g_ids):
+                fit = (STAGED_SLOT_BYTES - used) // step
+                if fit <= 0:
+                    if batch:
+                        batches.append(batch)
+                        batch, used = [], 0
+                        continue
+                    fit = 1
+                end = min(len(g_ids), start + fit)
+                batch.append((plan, g_ids[start:end], c_ids[start:end], used))
+                used += (end - start) * step
+                start = end
         if batch:
             batches.append(batch)
         return batches
 
     def _staged_dma(
-        self, batch: list[tuple[_StagedRef, int, int, int]], slot: torch.Tensor
+        self, batch: list[tuple[_StagedRef, np.ndarray, np.ndarray, int]], slot: torch.Tensor
     ) -> None:
         """One command per page between the device and the slot."""
-        n = len(batch)
+        # device addresses can exceed int64: uint64 arithmetic throughout
         slot_base = np.uint64(slot.data_ptr())
-        gpu_side = np.empty(n, dtype=np.uint64)
-        host_side = np.empty(n, dtype=np.uint64)
-        sizes = np.empty(n, dtype=np.uint64)
         gpu_tensors = self.src_tensors if self.gpu_to_cpu else self.dst_tensors
-        for i, (plan, g, _c, off) in enumerate(batch):
+        gpu_parts, host_parts, size_parts = [], [], []
+        for plan, g_ids, _c, off in batch:
             t = gpu_tensors[plan.tensor_idx]
-            gpu_side[i] = t.data_ptr() + g * t.stride(0) + plan.span_lo
-            host_side[i] = slot_base + np.uint64(off)
-            sizes[i] = plan.span
+            step = np.uint64(-(-plan.span // _STAGED_ALIGN) * _STAGED_ALIGN)
+            n = len(g_ids)
+            gpu_parts.append(
+                np.uint64(t.data_ptr() + plan.span_lo)
+                + g_ids.astype(np.uint64) * np.uint64(t.stride(0))
+            )
+            host_parts.append(
+                slot_base + np.uint64(off) + np.arange(n, dtype=np.uint64) * step
+            )
+            size_parts.append(np.full(n, plan.span, dtype=np.uint64))
+        gpu_side = np.concatenate(gpu_parts)
+        host_side = np.concatenate(host_parts)
+        sizes = np.concatenate(size_parts)
         src, dst = (gpu_side, host_side) if self.gpu_to_cpu else (host_side, gpu_side)
         self._swap_blocks_batch(
             torch.from_numpy(src),
@@ -996,33 +1066,80 @@ class SingleDirectionOffloadingHandler:
         )
 
     def _staged_cpu(
-        self, batch: list[tuple[_StagedRef, int, int, int]], slot: torch.Tensor
+        self, batch: list[tuple[_StagedRef, np.ndarray, np.ndarray, int]], slot: torch.Tensor
     ) -> None:
         """Scatter (store) or gather (load) the batch's fragments between the
-        slot, laid out like the local pages, and the canonical arena rows."""
+        slot, laid out like the local pages, and the canonical arena rows: one
+        numpy fancy copy per (fragment size, arena storage), the fragments
+        being rows of a 2D view of each side. A fancy copy releases the GIL
+        once; every torch call releases and retakes it, and on the copy thread
+        each retake queues behind the forward thread. A class whose offsets are
+        not all multiples of its size is copied run by run instead."""
         cpu_tensors = self.dst_tensors if self.gpu_to_cpu else self.src_tensors
-        for plan, _g, c, off in batch:
+        classes: dict[tuple[int, int], tuple[torch.Tensor, list, list]] = {}
+        slow = []
+        for plan, _g, c_ids, off in batch:
             cpu = cpu_tensors[plan.tensor_idx]
-            row = cpu.storage_offset() + c * cpu.stride(0)
-            local = slot.storage_offset() + off - plan.span_lo
-            for run in plan.runs:
-                shape = (run.num_fragments, run.fragment_size)
-                canon = cpu.as_strided(
-                    shape, (run.canonical_stride, 1), row + run.canonical_offset
-                )
-                stage = slot.as_strided(
-                    shape, (run.local_stride, 1), local + run.local_offset
-                )
+            step = -(-plan.span // _STAGED_ALIGN) * _STAGED_ALIGN
+            offs = off + np.arange(len(c_ids), dtype=np.int64) * step
+            rows = cpu.storage_offset() + c_ids * cpu.stride(0)
+            for size, local, canon in plan.frags:
+                local_abs = (offs[:, None] + local[None, :]).ravel()
+                canon_abs = (rows[:, None] + canon[None, :]).ravel()
+                if (local_abs % size).any() or (canon_abs % size).any():
+                    slow.append((plan, cpu, rows, offs))
+                    continue
+                key = (size, cpu.untyped_storage().data_ptr())
+                entry = classes.setdefault(key, (cpu, [], []))
+                entry[1].append(local_abs // size)
+                entry[2].append(canon_abs // size)
+        for (size, _), (cpu, local_rows, canon_rows) in classes.items():
+            stage2d = self._np_rows(slot, size)
+            arena2d = self._np_rows(cpu, size)
+            local_idx = np.concatenate(local_rows)
+            canon_idx = np.concatenate(canon_rows)
+            n = len(local_idx)
+            first = int(local_idx[0])
+            if int(local_idx[-1]) - first + 1 == n and (np.diff(local_idx) == 1).all():
+                stage = stage2d[first : first + n]  # the slot holds them in order
                 if self.gpu_to_cpu:
-                    canon.copy_(stage)
+                    arena2d[canon_idx] = stage
                 else:
-                    stage.copy_(canon)
+                    np.take(arena2d, canon_idx, axis=0, out=stage)
+            elif self.gpu_to_cpu:
+                arena2d[canon_idx] = stage2d[local_idx]
+            else:
+                stage2d[local_idx] = arena2d[canon_idx]
+        done = set()
+        for plan, cpu, rows, offs in slow:
+            if id(plan) in done:
+                continue
+            done.add(id(plan))
+            for row, o in zip(rows.tolist(), offs.tolist()):
+                local = slot.storage_offset() + o - plan.span_lo
+                for run in plan.runs:
+                    shape = (run.num_fragments, run.fragment_size)
+                    canon = cpu.as_strided(
+                        shape, (run.canonical_stride, 1), row + run.canonical_offset
+                    )
+                    stage = slot.as_strided(
+                        shape, (run.local_stride, 1), local + run.local_offset
+                    )
+                    if self.gpu_to_cpu:
+                        canon.copy_(stage)
+                    else:
+                        stage.copy_(canon)
 
-    def _staged_run(self, items: list[tuple[_StagedRef, int, int]], stream) -> None:
+    def _staged_run(
+        self, segments: list[tuple[_StagedRef, np.ndarray, np.ndarray]], stream
+    ) -> None:
         """Runs on the copy thread inside the transfer stream. Store: DMA batch
         k+1 while scattering batch k. Load: gather batch k+1 while batch k's
         DMA runs (a slot is refilled only once its previous DMA is done)."""
-        batches = self._staged_batches(items)
+        st = self.__dict__.setdefault("_staged_stats", [0, 0, 0.0, 0.0, 0.0, 0.0, 0])
+        t_start = time.perf_counter()
+        wait = cpu = 0.0
+        batches = self._staged_batches(segments)
         if self.gpu_to_cpu:
             pending: deque = deque()
             for k, batch in enumerate(batches):
@@ -1031,26 +1148,44 @@ class SingleDirectionOffloadingHandler:
                 event = torch.Event()
                 event.record(stream)
                 pending.append((batch, slot, event))
-                if len(pending) == 2:
+                while len(pending) == 2 or (pending and k == len(batches) - 1):
                     done_batch, done_slot, done_event = pending.popleft()
+                    t0 = time.perf_counter()
                     done_event.synchronize()
+                    t1 = time.perf_counter()
                     self._staged_cpu(done_batch, done_slot)
-            while pending:
-                done_batch, done_slot, done_event = pending.popleft()
-                done_event.synchronize()
-                self._staged_cpu(done_batch, done_slot)
+                    wait += t1 - t0
+                    cpu += time.perf_counter() - t1
         else:
             for k, batch in enumerate(batches):
                 idx = k % 2
                 slot = self._slot(idx, _batch_bytes(batch))
                 event = self._slot_events[idx]
+                t0 = time.perf_counter()
                 if event is not None:
                     event.synchronize()
+                t1 = time.perf_counter()
                 self._staged_cpu(batch, slot)
+                wait += t1 - t0
+                cpu += time.perf_counter() - t1
                 self._staged_dma(batch, slot)
                 event = torch.Event()
                 event.record(stream)
                 self._slot_events[idx] = event
+        now = time.perf_counter()
+        st[0] += 1
+        st[1] += len(batches)
+        st[2] += now - t_start
+        st[3] += wait
+        st[4] += cpu
+        if now - st[5] >= 30.0:
+            st[5] = now
+            logger.info(
+                "KV offload staged %s: jobs=%d batches=%d wall=%.2fs "
+                "slot_wait=%.2fs cpu=%.2fs (cumulative, copy thread)",
+                "store" if self.gpu_to_cpu else "load",
+                st[0], st[1], st[2], st[3], st[4],
+            )
 
     def _transfer_staged(
         self,
@@ -1062,7 +1197,7 @@ class SingleDirectionOffloadingHandler:
     ) -> bool:
         del block_indices  # whole blocks: no partial first chunk at 1 block per chunk
         items = self._staged_items(src_blocks, dst_blocks, group_sizes)
-        num_transfer_bytes = sum(plan.total_bytes for plan, _, _ in items)
+        num_transfer_bytes = sum(plan.total_bytes * len(g) for plan, g, _ in items)
         stream = (
             self._stream_pool.pop() if self._stream_pool else current_platform.Stream()
         )

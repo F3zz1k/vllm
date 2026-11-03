@@ -83,15 +83,17 @@ def test_staged_ref_requires_exact_coverage():
     assert _staged_ref(CanonicalKVCacheRef(0, 1024, gap)) is None
 
 
-@pytest.mark.parametrize("tp", [2, 4])
-def test_staged_store_and_load_match_descriptor_oracle(tp, monkeypatch):
+@pytest.mark.parametrize("tp,misalign", [(2, 0), (4, 0), (2, 40)])
+def test_staged_store_and_load_match_descriptor_oracle(tp, misalign, monkeypatch):
     # tiny slots force several batches per transfer
     monkeypatch.setattr(gpu_worker, "STAGED_SLOT_BYTES", 1500)
     torch.manual_seed(0)
     num_blocks, num_rows = 5, 8
     local_bytes = 2 * _TOKENS * _HEADS // tp * _HEAD_BYTES
     rows = [6, 1, 3, 0, 7]  # arena chunks, deliberately unordered
-    canon = torch.zeros(num_rows, _CANON, dtype=torch.int8)
+    # misalign shifts the arena view off the fragment grid: run-by-run path
+    backing = torch.zeros(num_rows, _CANON + 64, dtype=torch.int8)
+    canon = backing[:, misalign : misalign + _CANON]
     expected = np.zeros((num_rows, _CANON), dtype=np.int8)
     gpus = []
     for rank in range(tp):
@@ -101,6 +103,7 @@ def test_staged_store_and_load_match_descriptor_oracle(tp, monkeypatch):
         _run(_handler(gpu, canon, [_shard(tp, rank)], True), ids, rows, (num_blocks,))
         _oracle(gpu.numpy()[2:], _shard(tp, rank), expected, rows)
     assert np.array_equal(canon.numpy(), expected)
+    assert not backing[:, :misalign].any() and not backing[:, misalign + _CANON :].any()
     # every rank reloads its shard bit-exact into other device blocks
     for rank in range(tp):
         back = torch.zeros(num_blocks + 3, local_bytes, dtype=torch.int8)
@@ -117,7 +120,7 @@ def test_staged_store_keeps_writer_rotation_and_groups():
     h = _handler(gpu, canon, [whole, _shard(2, 0)], True)
     items = _run(h, [0, 1, 2, 3, 4], [4, 5, 6, 8, 9], (3, 2))
     # writer 1 of 2 writes the odd canonical chunks of group 0 only
-    assert [(c) for p, _, c in items if p.mapping is whole] == [5]
+    assert [c.tolist() for p, _, c in items if p.mapping is whole] == [[5]]
     assert torch.equal(canon[5, :256], gpu[1, :256])
     assert not canon[4].any() and not canon[6].any()
     expected = np.zeros((10, _CANON), dtype=np.int8)
