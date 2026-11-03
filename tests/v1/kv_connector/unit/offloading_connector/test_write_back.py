@@ -471,3 +471,47 @@ def test_prompt_boundary_becomes_the_junction_when_none_is_set(band):
     request.shared_prefix_boundary = 4
     scheduler._maybe_set_prompt_boundary(status, 0)
     assert request.shared_prefix_boundary == 4
+
+
+def test_restore_chain_limit_picks_a_shallower_stored_state(band):
+    scheduler, _, _ = band
+    configs, attn, state = _groups(scheduler)
+    by_group = [[_hkey(i, c.group_idx) for i in range(4)] for c in configs]
+    for s in state:
+        scheduler._note_state_stored(by_group[s][1])
+        scheduler._note_state_stored(by_group[s][3])
+    tpc = configs[attn].tokens_per_chunk
+    assert by_group[attn][3] in scheduler._restore_chain(by_group)
+    shallow = scheduler._restore_chain(by_group, limit=3 * tpc - 1)
+    assert by_group[attn][1] in shallow and by_group[attn][2] not in shallow
+    assert all(by_group[s][1] in shallow and by_group[s][3] not in shallow for s in state)
+
+
+def test_a_broken_run_is_retrimmed_then_dropped(band):
+    """A chain member neither on the GPU nor in the pool breaks the run: it is
+    re-trimmed to the deepest stored boundary below the break, and dropped
+    when no boundary is left, instead of writing a chain no restore can use."""
+    scheduler, _, _ = band
+    scheduler._has_state_groups = True
+    configs, attn, state = _groups(scheduler)
+    by_group = [[_hkey(i, c.group_idx) for i in range(4)] for c in configs]
+    for s in state:
+        scheduler._note_state_stored(by_group[s][1])
+        scheduler._note_state_stored(by_group[s][3])
+    scheduler.manager.merge_tag = MagicMock()
+    scheduler._record_run(_finished(scheduler, by_group))
+    tag = by_group[attn][-1]
+    assert by_group[attn][3] in scheduler._run_keys[tag]
+    # The shallow boundary's chain is in the pool; attention chunk 2 is lost.
+    scheduler._note_in_pool([by_group[attn][0], by_group[attn][1]]
+                            + [by_group[s][1] for s in state])
+    scheduler._note_in_pool([by_group[s][3] for s in state] + [by_group[attn][3]])
+    assert scheduler._run_members(tag, scheduler._config_idx_by_group) == []
+    assert tag in scheduler._run_keys
+    assert by_group[attn][2] not in scheduler._run_keys[tag]
+    assert scheduler._wb_counts["run_broken_trimmed"] == 1
+    # Now the shallow root is gone too: nothing restorable is left.
+    scheduler._pool_has.pop(by_group[attn][0])
+    assert scheduler._run_members(tag, scheduler._config_idx_by_group) == []
+    assert tag not in scheduler._run_keys
+    assert scheduler._wb_counts["run_broken_dropped"] == 1

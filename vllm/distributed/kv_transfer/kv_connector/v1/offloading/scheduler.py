@@ -706,6 +706,9 @@ class OffloadingConnectorScheduler:
         # Finished requests' key chains: run tag (the request's last attention
         # key) -> keys root first, and key -> its newest run.
         self._run_keys: "OrderedDict[OffloadKey, list[OffloadKey]]" = OrderedDict()
+        # The request's offload keys per group, kept per run so a run whose
+        # chain broke (a member left the GPU uncopied) can be re-trimmed.
+        self._run_by_group: dict[OffloadKey, list[list[OffloadKey]]] = {}
         self._key_run: dict[OffloadKey, OffloadKey] = {}
         self._write_through = True
         # A class with recurrent state restores only from a run holding every
@@ -1003,26 +1006,73 @@ class OffloadingConnectorScheduler:
         if not WRITE_BACK:
             return
         chain = self._restore_chain(by_group)
-        old = self._run_keys.pop(tag, None)
-        if old is not None:
-            for key in old:
-                if self._key_run.get(key) == tag:
-                    del self._key_run[key]
-        self._wb_refused.pop(tag, None)
+        self._drop_run(tag)
         if not chain:
             # Nothing a restore could read (no boundary with every state
             # group stored): never offered, so never refused every step.
             self._wb_counts["run_unrestorable_dropped"] += 1
             return
         self._run_keys[tag] = chain
+        self._run_by_group[tag] = [list(keys) for keys in by_group]
         for key in chain:
             self._key_run[key] = tag
         while len(self._run_keys) > WRITE_BACK_MAX_RUNS:
-            gone_tag, gone = self._run_keys.popitem(last=False)
-            self._wb_refused.pop(gone_tag, None)
-            for key in gone:
-                if self._key_run.get(key) == gone_tag:
+            self._drop_run(next(iter(self._run_keys)))
+
+    def _drop_run(self, tag: OffloadKey) -> None:
+        old = self._run_keys.pop(tag, None)
+        self._run_by_group.pop(tag, None)
+        self._wb_refused.pop(tag, None)
+        if old is not None:
+            for key in old:
+                if self._key_run.get(key) == tag:
                     del self._key_run[key]
+
+    def _run_members(self, tag: OffloadKey, config_idx_by_group: dict[int, int]):
+        """The run's members the band can copy now: (key, block, config_idx,
+        num_tokens) for every free GPU block of its chain not yet in the pool.
+        A chain member that is neither on the GPU nor known in the pool broke
+        the chain; the run is then re-trimmed to the deepest boundary below
+        the break (what a restore can still read), or dropped when none is
+        left, so the band never writes a chain no restore can use."""
+        for _attempt in range(2):
+            members, missing = [], []
+            for run_key in self._run_keys[tag]:
+                if run_key in self._wb_inflight:
+                    continue
+                found = self._storable_free_block(run_key, config_idx_by_group)
+                if found is not None:
+                    members.append((run_key, *found))
+                elif run_key not in self._pool_has:
+                    missing.append(run_key)
+            if not missing:
+                return members
+            by_group = self._run_by_group.get(tag)
+            if by_group is None:
+                break
+            configs = self.config.kv_group_configs
+            limit = None
+            missing_set = set(missing)
+            for idx, keys in enumerate(by_group):
+                tpc = configs[idx].tokens_per_chunk
+                for i, key in enumerate(keys):
+                    if key in missing_set:
+                        end = (i + 1) * tpc - 1  # usable depths end before it
+                        limit = end if limit is None else min(limit, end)
+                        break
+            chain = self._restore_chain(by_group, limit=limit)
+            if not chain:
+                break
+            self._wb_counts["run_broken_trimmed"] += 1
+            for key in self._run_keys[tag]:
+                if self._key_run.get(key) == tag:
+                    del self._key_run[key]
+            self._run_keys[tag] = chain
+            for key in chain:
+                self._key_run[key] = tag
+        self._wb_counts["run_broken_dropped"] += 1
+        self._drop_run(tag)
+        return []
 
     def _note_state_stored(self, key: OffloadKey) -> None:
         """A recurrent-state key at a boundary is in the pool (stored or found
@@ -1042,7 +1092,9 @@ class OffloadingConnectorScheduler:
             if get_offload_group_idx(key) in self._state_group_ids:
                 self._note_state_stored(key)
 
-    def _restore_chain(self, by_group: list[list[OffloadKey]]) -> list[OffloadKey]:
+    def _restore_chain(
+        self, by_group: list[list[OffloadKey]], limit: int | None = None
+    ) -> list[OffloadKey]:
         """The keys a restore of this conversation reads, root first.
 
         Without recurrent state that is every key. With it, a restore resumes
@@ -1053,6 +1105,11 @@ class OffloadingConnectorScheduler:
         has its state stored."""
         configs = self.config.kv_group_configs
         if not self._state_group_ids:
+            if limit is not None:
+                by_group = [
+                    keys[: (limit + 1) // configs[idx].tokens_per_chunk]
+                    for idx, keys in enumerate(by_group)
+                ]
             n = max((len(k) for k in by_group), default=0)
             return [keys[i] for i in range(n) for keys in by_group if i < len(keys)]
         ref = self._chain_ref_group
@@ -1061,6 +1118,8 @@ class OffloadingConnectorScheduler:
         ref_tpc = configs[ref].tokens_per_chunk
         depth = 0
         for i in range(len(by_group[ref]) - 1, -1, -1):
+            if limit is not None and (i + 1) * ref_tpc > limit:
+                continue
             groups = self._state_sets.get(bytes(by_group[ref][i])[:-4])
             if groups is not None and self._state_group_ids <= groups:
                 depth = (i + 1) * ref_tpc
@@ -1214,13 +1273,7 @@ class OffloadingConnectorScheduler:
                 refused = self._wb_refused.get(tag)
                 if refused is not None and now - refused < WRITE_BACK_REFUSED_BACKOFF_S:
                     continue
-                members = []
-                for run_key in self._run_keys[tag]:
-                    if run_key in self._wb_inflight:
-                        continue
-                    found = self._storable_free_block(run_key, config_idx_by_group)
-                    if found is not None:
-                        members.append((run_key, *found))
+                members = self._run_members(tag, config_idx_by_group)
                 if not members:
                     continue
                 if taken + len(members) > budget:
