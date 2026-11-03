@@ -254,7 +254,16 @@ def test_spill_and_restore_round_trip_across_a_restart(tmp_path):
         srv2.stop()
 
 
-def test_a_second_spill_writes_only_new_chunks_and_drops_unused_files(tmp_path):
+def spill_files(tmp_path):
+    return {p.relative_to(tmp_path / "spill").as_posix(): p.stat().st_mtime_ns
+            for p in (tmp_path / "spill").rglob("*.bin")}
+
+
+def manifest_of(tmp_path):
+    return json.loads((tmp_path / "spill" / "manifest.json").read_text())
+
+
+def test_a_second_spill_keeps_files_still_in_the_arena_and_drops_the_rest(tmp_path):
     srv = Server(tmp_path)
     try:
         a = connect(srv.sock)
@@ -265,9 +274,9 @@ def test_a_second_spill_writes_only_new_chunks_and_drops_unused_files(tmp_path):
         b = connect(srv.sock)
         call(b, P.OP_RELEASE, {})
         wait_state(srv.sock, P.ABSENT)
-        spill = tmp_path / "spill"
-        first = {p.name: p.stat().st_mtime_ns for p in spill.rglob("*.bin")}
-        assert len(first) == 2
+        first = spill_files(tmp_path)
+        assert len(first) == 2  # one file per superpage
+        by_key = {k: rel for rel, f in manifest_of(tmp_path)["files"].items() for k in f["keys"]}
         call(b, P.OP_ATTACH, attach_args())
         cls = srv.srv.arena.classes["p"]
         srv.srv.arena.evict_run(cls.runs[b"X"])
@@ -276,18 +285,21 @@ def test_a_second_spill_writes_only_new_chunks_and_drops_unused_files(tmp_path):
         c = connect(srv.sock)
         call(c, P.OP_RELEASE, {})
         wait_state(srv.sock, P.ABSENT)
-        second = {p.name: p.stat().st_mtime_ns for p in spill.rglob("*.bin")}
-        k2 = f"{key(2).hex()}.bin"
-        assert set(second) == {k2, f"{key(3).hex()}.bin"}
-        assert second[k2] == first[k2]  # not written again
-        manifest = json.loads((spill / "manifest.json").read_text())
+        second = spill_files(tmp_path)
+        k2 = by_key[key(2).hex()]
+        assert k2 in second and second[k2] == first[k2]  # kept, not written again
+        assert by_key[key(1).hex()] not in second  # its chunk left the arena
+        assert len(second) == 2
+        manifest = manifest_of(tmp_path)
         assert [r["tag"] for r in manifest["runs"]] == [b"Y".hex(), b"Z".hex()]
+        call(c, P.OP_ATTACH, attach_args())
+        assert get(c, path, [key(2), key(3)]) == [2, 3]
         c.close()
     finally:
         srv.stop()
 
 
-def test_a_chunk_file_that_fails_to_restore_is_written_again(tmp_path):
+def test_a_spill_file_that_fails_to_restore_is_written_again(tmp_path):
     srv = Server(tmp_path)
     try:
         a = connect(srv.sock)
@@ -303,12 +315,14 @@ def test_a_chunk_file_that_fails_to_restore_is_written_again(tmp_path):
         cls = srv.srv.arena.classes["p"]
         assert key(1) not in cls.index
         assert cls.counters["spill_restore_failed"] == 1
+        assert not chunk.exists()
         put(b, path, [key(1)], b"X", 4)
         b.close()
         c = connect(srv.sock)
         call(c, P.OP_RELEASE, {})
         wait_state(srv.sock, P.ABSENT)
-        assert chunk.read_bytes() == bytes([4]) * ROW  # a fresh copy, not the bad file
+        (fresh,) = (tmp_path / "spill").rglob("*.bin")
+        assert fresh.read_bytes() == bytes([4]) * ROW  # a fresh copy, not the bad file
         c.close()
     finally:
         srv.stop()
@@ -335,39 +349,167 @@ def test_spill_cap_keeps_the_newest_whole_runs(tmp_path):
         srv.stop()
 
 
-def test_attach_during_a_spill_aborts_it_with_the_arena_intact(tmp_path, monkeypatch):
-    srv = Server(tmp_path)
+def gate_writes(monkeypatch, block_at):
+    """Make the spill's file writes wait on a gate from the block_at-th on."""
+    gate, entered = threading.Event(), threading.Event()
+    real = S._write_spill_file
+    n = [0]
+
+    def slow(*args):
+        n[0] += 1
+        if n[0] >= block_at:
+            entered.set()
+            gate.wait(10)
+        real(*args)
+
+    monkeypatch.setattr(S, "_write_spill_file", slow)
+    return gate, entered
+
+
+def arena_bytes_on_disk(path):
+    return os.stat(path).st_blocks * 512
+
+
+def test_release_frees_what_it_will_not_write_at_once(tmp_path, monkeypatch):
+    srv = Server(tmp_path, spill_max_bytes=ROW)
+    try:
+        a = connect(srv.sock)
+        path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
+        for i in range(3):
+            put(a, path, [key(i)], f"r{i}".encode(), 10 + i)
+        a.close()
+        assert arena_bytes_on_disk(path) >= 3 * ROW
+        gate, entered = gate_writes(monkeypatch, 1)
+        b = connect(srv.sock)
+        res = call(b, P.OP_RELEASE, {})[1]
+        assert res["ok"] and res["free_now_bytes"] == 7 * ROW and res["write_bytes"] == ROW
+        assert entered.wait(5)
+        st = call(b, P.OP_STATE)[1]
+        assert st["state"] == P.SPILLING
+        assert st["freed_bytes"] == 7 * ROW and st["remaining_bytes"] == ROW
+        assert st["free_soon_bytes"] == 0
+        # Only the newest run's row still holds pages; the others read as zeros.
+        assert arena_bytes_on_disk(path) == ROW
+        cls = srv.srv.arena.classes["p"]
+        with open(path, "rb") as f:
+            for i in range(3):
+                f.seek(cls.index[key(i)].row * ROW)
+                assert f.read(ROW)[0] == (12 if i == 2 else 0)
+        gate.set()
+        st = wait_state(srv.sock, P.ABSENT)
+        assert st["last_release"]["spill"]["freed_bytes"] == 8 * ROW
+        assert st["spill"]["runs"] == 1
+        b.close()
+    finally:
+        srv.stop()
+
+
+def test_each_superpage_is_freed_once_its_file_is_durable(tmp_path, monkeypatch):
+    srv = Server(tmp_path, spill_threads=1)
+    try:
+        a = connect(srv.sock)
+        path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
+        for i in range(3):
+            put(a, path, [key(i)], f"r{i}".encode(), 10 + i)
+        a.close()
+        gate, entered = gate_writes(monkeypatch, 3)
+        b = connect(srv.sock)
+        assert call(b, P.OP_RELEASE, {})[1]["ok"]
+        assert entered.wait(5)
+        st = call(b, P.OP_STATE)[1]["spill_progress"]
+        assert st["files_done"] == 2 and st["freed_bytes"] == 7 * ROW
+        assert arena_bytes_on_disk(path) == ROW
+        gate.set()
+        wait_state(srv.sock, P.ABSENT)
+        b.close()
+    finally:
+        srv.stop()
+
+
+def test_attach_during_a_spill_refills_the_freed_superpages(tmp_path, monkeypatch):
+    srv = Server(tmp_path, spill_threads=1)
+    try:
+        a = connect(srv.sock)
+        path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
+        for i in range(3):
+            put(a, path, [key(i)], f"r{i}".encode(), 5 + i)
+        a.close()
+        inode = os.stat(path).st_ino
+        gate, entered = gate_writes(monkeypatch, 2)
+        b = connect(srv.sock)
+        assert call(b, P.OP_RELEASE, {})[1]["ok"]
+        assert entered.wait(5)  # the first file is durable and its superpage freed
+        c = connect(srv.sock)
+        P.send_message(c, (P.OP_ATTACH, attach_args()))
+        time.sleep(0.05)
+        gate.set()  # the second file completes; the third is never started
+        ok, _ = P.recv_message(c)
+        assert ok and os.stat(path).st_ino == inode  # the same arena, not a new one
+        st = call(b, P.OP_STATE)[1]
+        assert st["state"] == P.READY and st["last_release"]["reason"] == "aborted"
+        assert st["last_prepare"]["ok"] and st["last_prepare"]["restored"] == 2
+        cls = srv.srv.arena.classes["p"]
+        assert cls.counters["chunks_dropped_by_spill_abort"] == 2
+        assert get(c, path, [key(0), key(1), key(2)]) == [5, 6, 7]
+        assert len(manifest_of(tmp_path)["runs"]) == 2  # the runs whole on disk
+        b.close()
+        c.close()
+    finally:
+        srv.stop()
+
+
+def test_attach_during_a_spill_without_room_to_refill_waits_for_it(tmp_path, monkeypatch):
+    srv = Server(tmp_path, populate_floor_bytes=1 << 30)
     try:
         a = connect(srv.sock)
         path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
         put(a, path, [key(1)], b"X", 5)
-        put(a, path, [key(2)], b"Y", 6)
         a.close()
-        gate, entered = threading.Event(), threading.Event()
-        real = S._write_row_file
-
-        def slow(*args):
-            entered.set()
-            gate.wait(10)
-            real(*args)
-
-        monkeypatch.setattr(S, "_write_row_file", slow)
+        gate, entered = gate_writes(monkeypatch, 1)
         b = connect(srv.sock)
         assert call(b, P.OP_RELEASE, {})[1]["ok"]
         assert entered.wait(5)
-        assert call(b, P.OP_STATE)[1]["state"] == P.SPILLING
+        srv.mem = (1 << 30) + ROW  # too little to populate the 7 freed superpages again
         c = connect(srv.sock)
         P.send_message(c, (P.OP_ATTACH, attach_args()))
         time.sleep(0.05)
+        assert not srv.srv._spill_abort.is_set()
         gate.set()
-        ok, _ = P.recv_message(c)
-        assert ok and os.path.exists(path)
+        ok, err = P.recv_message(c)  # released, then the new arena is refused
+        assert not ok and "floor" in err
         st = call(b, P.OP_STATE)[1]
-        assert st["state"] == P.READY and st["last_release"]["reason"] == "aborted"
-        assert get(c, path, [key(1), key(2)]) == [5, 6]
-        assert not list((tmp_path / "spill").rglob("*.bin"))  # the new files went again
+        assert st["state"] == P.ABSENT and st["last_release"]["ok"]
+        srv.mem = 1 << 40
+        assert call(c, P.OP_ATTACH, attach_args())[0]
+        assert get(c, path, [key(1)]) == [5]
         b.close()
         c.close()
+    finally:
+        srv.stop()
+
+
+def test_pressure_release_spills_the_newest_runs_that_fit_the_budget(tmp_path):
+    srv = Server(tmp_path, spill_rate_bytes_per_sec=ROW)
+    try:
+        a = connect(srv.sock)
+        path = call(a, P.OP_ATTACH, attach_args())[1]["path"]
+        put(a, path, [key(1), key(2)], b"old", 1)
+        put(a, path, [key(3)], b"mid", 2)
+        put(a, path, [key(4), key(5)], b"big", 3)
+        put(a, path, [key(6)], b"new", 4)
+        a.close()
+        b = connect(srv.sock)
+        res = call(b, P.OP_RELEASE, {"reason": "pressure", "detail": "ram gate: x/y",
+                                     "target_bytes": 5 * ROW, "budget_sec": 2.0})[1]
+        assert res["ok"] and res["write_bytes"] == 2 * ROW and res["free_now_bytes"] == 6 * ROW
+        st = wait_state(srv.sock, P.ABSENT)
+        spill = st["last_release"]["spill"]
+        assert spill["reason"] == "pressure: ram gate: x/y" and spill["target_met_sec"] is not None
+        assert [r["tag"] for r in manifest_of(tmp_path)["runs"]] == [b"mid".hex(), b"new".hex()]
+        call(b, P.OP_ATTACH, attach_args())
+        assert get(b, path, [key(3)]) == [2] and get(b, path, [key(6)]) == [4]
+        assert call(b, P.OP_LOOKUP, [key(4)])[1] == [P.MISS]
+        b.close()
     finally:
         srv.stop()
 
@@ -427,14 +569,16 @@ def test_server_removes_stale_regions_but_not_the_arena(tmp_path):
     assert not stale.exists() and arena.exists() and other.exists()
 
 
-def test_spill_load_removes_chunk_files_the_manifest_does_not_name(tmp_path):
+def test_spill_load_removes_files_the_manifest_does_not_name(tmp_path):
     spill = tmp_path / "spill"
     (spill / "p_L" / "abc").mkdir(parents=True)
-    (spill / "p_L" / "abc" / "dead.bin").write_bytes(b"x")
+    (spill / "p_L" / "abc" / "dead.bin").write_bytes(b"x")  # the per-chunk format
     (spill / "p_L" / "abc" / "half.bin.tmp").write_bytes(b"x")
+    (spill / "p_L" / "1-000001.bin").write_bytes(b"y")
     store = S.SpillStore(str(spill), 10**9, 0)
     store.load()
     assert not list(spill.rglob("*.bin")) and not list(spill.rglob("*.tmp"))
+    assert not (spill / "p_L").exists()
 
 
 def test_other_mappers_finds_a_process_mapping_the_file(tmp_path):

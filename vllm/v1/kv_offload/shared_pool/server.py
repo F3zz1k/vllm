@@ -45,7 +45,13 @@ file, then the spilled runs are read back) -> READY -> SPILLING (the newest
 whole runs are written to NVMe, then the file is unlinked) -> ABSENT. PREPARE,
 SPAWN_OPEN, ATTACH and INFO start a creation; ATTACH and INFO replies wait
 until READY. RELEASE starts a spill only when nothing can still use the arena.
-A clean stop with no client attached spills too.
+A clean stop with no client attached spills too. A spill gives RAM back as it
+goes: at its start every superpage holding nothing it will write is freed (a
+hole punched in the tmpfs file), then each remaining superpage is written as
+one file on one of several threads and freed once that file is durable. A
+PREPARE during the spill aborts it: the freed superpages lose their chunks,
+the ones already on disk are read back, and the arena is READY again once
+they are populated (CREATING meanwhile).
 
 Cold tier (optional, per class): pinned chunks are written to disk when
 pinned and read back into the pin zone after a restart.
@@ -80,6 +86,7 @@ logger = logging.getLogger("kvpool")
 
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
 _POPULATE_STEP = 1 << 30
+_PUNCH_STEP = 1 << 30
 _IO_ALIGN = 4096
 # A run that cannot restore anything is evicted before every other run once
 # its last store is this old; a younger one is still being written.
@@ -91,7 +98,12 @@ ADMIT_WALK_RUNS = 20000
 # Tag prefix of the run an unpinned chunk in no conversation gets.
 _ORPHAN = b"orphan:"
 MANIFEST = "manifest.json"
-_MANIFEST_VERSION = 1
+# 2: one file per superpage, the manifest naming each file's keys.
+_MANIFEST_VERSION = 2
+# A file of an earlier spill is kept, not written again, while at least this
+# share of its chunks is still in the arena (the cap counts it whole).
+SPILL_REUSE_FRACTION = 0.75
+_MAX_IOV = 1024
 
 
 def _tag(tag: bytes | str) -> bytes:
@@ -1509,24 +1521,229 @@ class Arena:
         return n
 
 
+class SpillProgress:
+    """What a running spill has done so far; written by its threads, read by
+    the event loop (STATE) under the lock."""
+
+    def __init__(self, reason: str, sp_bytes: int, free_now: int, write_bytes: int,
+                 files: int, target_bytes: int | None, budget_sec: float | None) -> None:
+        self.lock = threading.Lock()
+        self.reason = reason
+        self.sp_bytes = sp_bytes
+        self.started = time.monotonic()
+        self.free_now_bytes = free_now * sp_bytes  # freed without writing anything
+        self.write_bytes = write_bytes             # chunk bytes to write
+        self.files_total = files
+        self.target_bytes = target_bytes
+        self.budget_sec = budget_sec
+        self.free_now_done = 0
+        self.freed_bytes = 0
+        self.written_bytes = 0
+        self.files_done = 0
+        self.punched: set[int] = set()
+        self.target_met_sec: float | None = None
+        self.write_started: float | None = None
+
+    def freed(self, sps, now_phase: bool, written: int = 0) -> None:
+        with self.lock:
+            n = len(sps) * self.sp_bytes
+            self.punched.update(sps)
+            self.freed_bytes += n
+            if now_phase:
+                self.free_now_done += n
+            else:
+                self.written_bytes += written
+                self.files_done += 1
+            if (self.target_met_sec is None and self.target_bytes is not None
+                    and self.freed_bytes >= self.target_bytes):
+                self.target_met_sec = time.monotonic() - self.started
+
+    def free_soon(self) -> int:
+        """Bytes about to be freed without any write (the first phase)."""
+        with self.lock:
+            return self.free_now_bytes - self.free_now_done
+
+    def snapshot(self, arena_bytes: int) -> dict:
+        with self.lock:
+            return {
+                "reason": self.reason,
+                "elapsed_sec": round(time.monotonic() - self.started, 3),
+                "freed_bytes": self.freed_bytes,
+                "remaining_bytes": arena_bytes - self.freed_bytes,
+                "free_now_bytes": self.free_now_bytes,
+                "free_soon_bytes": self.free_now_bytes - self.free_now_done,
+                "write_bytes": self.write_bytes,
+                "written_bytes": self.written_bytes,
+                "files_total": self.files_total,
+                "files_done": self.files_done,
+                "target_bytes": self.target_bytes,
+                "target_met_sec": self.target_met_sec,
+                "budget_sec": self.budget_sec,
+            }
+
+
+@dataclass(slots=True, eq=False)
+class SpillPlan:
+    manifest: dict  # what the store holds once every job is written
+    # (superpage, file, byte ranges of the mmap in file order, bytes), cheapest first
+    jobs: list
+    free_now: list[int]  # superpages holding nothing still to write
+    write_bytes: int
+
+
+def _sp_ranges(sps, sp_bytes: int) -> list[tuple[int, int]]:
+    """Sorted superpages as coalesced byte ranges."""
+    out: list[list[int]] = []
+    for sp in sorted(sps):
+        if out and out[-1][1] == sp:
+            out[-1][1] = sp + 1
+        else:
+            out.append([sp, sp + 1])
+    return [(a * sp_bytes, (b - a) * sp_bytes) for a, b in out]
+
+
+def _iov(views: list, skip: int) -> list:
+    """The buffers after the first ``skip`` bytes (a partial pwritev)."""
+    out = []
+    for v in views:
+        if skip >= len(v):
+            skip -= len(v)
+            continue
+        out.append(v[skip:] if skip else v)
+        skip = 0
+    return out
+
+
+def _write_spill_file(path: str, mm: mmap.mmap, ranges: list[tuple[int, int]]) -> None:
+    """Write the mmap byte ranges back to back into a new file, one fdatasync."""
+    aligned = all(off % _IO_ALIGN == 0 and ln % _IO_ALIGN == 0 for off, ln in ranges)
+    fd = _open_direct(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, aligned)
+    base = memoryview(mm)
+    views = [base[off : off + ln] for off, ln in ranges]
+    try:
+        pos = 0
+        for i in range(0, len(views), _MAX_IOV):
+            batch = views[i : i + _MAX_IOV]
+            want = sum(len(v) for v in batch)
+            done = 0
+            while done < want:
+                n = os.pwritev(fd, _iov(batch, done), pos + done)
+                if n <= 0:
+                    raise OSError(f"{path}: short write at {pos + done}")
+                done += n
+            pos += want
+        os.fdatasync(fd)
+    finally:
+        for v in views:
+            v.release()
+        base.release()
+        os.close(fd)
+
+
+def _read_spill_file(path: str, mm: mmap.mmap, stride: int, size: int,
+                     reads: list[tuple[int, int]]) -> None:
+    """Read chunk ``idx`` of a spill file into the mmap at ``off`` for each
+    (idx, off) in ``reads``."""
+    aligned = stride % _IO_ALIGN == 0
+    fd = _open_direct(path, os.O_RDONLY, aligned)
+    base = memoryview(mm)
+    try:
+        have = os.fstat(fd).st_size
+        if have != size:
+            raise OSError(f"{path}: {have} bytes, expected {size}")
+        for idx, off in reads:
+            view = base[off : off + stride]
+            try:
+                pos = 0
+                while pos < stride:
+                    n = os.preadv(fd, [view[pos:]], idx * stride + pos)
+                    if n <= 0:
+                        raise OSError(f"{path}: short read of chunk {idx} at {pos}")
+                    pos += n
+            finally:
+                view.release()
+    finally:
+        base.release()
+        os.close(fd)
+
+
+def _load_fallocate():
+    """libc fallocate through ctypes, which releases the GIL for the call
+    (mmap.madvise holds it: punching 24 GiB that way stalled the event loop
+    for 5 s, measured 2026-11-03). None when unavailable."""
+    try:
+        import ctypes
+        try:
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        except OSError:
+            import ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        fn = libc.fallocate
+        fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
+        fn.restype = ctypes.c_int
+        return fn
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+_fallocate = _load_fallocate()
+_FALLOC_PUNCH_HOLE_KEEP_SIZE = 0x02 | 0x01
+
+
+def _punch(fd: int | None, mm: mmap.mmap, off: int, length: int) -> None:
+    """Give the pages of a byte range back (a hole in the tmpfs file)."""
+    if fd is not None and _fallocate is not None:
+        if _fallocate(fd, _FALLOC_PUNCH_HOLE_KEEP_SIZE, off, length) == 0:
+            return
+    mm.madvise(mmap.MADV_REMOVE, off, length)
+
+
 class SpillStore:
     """Whole runs written to NVMe when the arena is released, read back when
-    it is created again. One file per chunk, named by class, layout and key, so
-    a chunk still on disk from the last spill is not written again. The
-    manifest (classes, runs oldest first) is replaced atomically; files it no
-    longer names are deleted only once it is durable."""
+    it is created again.
 
-    def __init__(self, directory: str | None, max_bytes: int, free_floor: int) -> None:
+    One file per superpage: the chunks of that superpage that are spilled,
+    back to back in row order, so a superpage's RAM can be given back as soon
+    as its file is durable, and the store writes a few large files on several
+    threads instead of one small file per chunk. The manifest names every file
+    with the keys it holds (chunk i at i * row_stride) and the runs, oldest
+    first; it is replaced atomically, and files it no longer names are
+    deleted only once it is durable. A file of an earlier spill whose chunks
+    are still mostly in the arena (SPILL_REUSE_FRACTION) is kept instead of
+    written again; the cap counts it whole."""
+
+    def __init__(self, directory: str | None, max_bytes: int, free_floor: int,
+                 threads: int = 4, rate: float = 2e9) -> None:
         self.dir = directory
         self.max_bytes = max_bytes if directory else 0
         self.free_floor = free_floor
-        self.files: dict[str, int] = {}  # relative path -> bytes, as the manifest names
+        self.threads = max(1, threads)
+        self.rate = rate  # write bytes/s, for a pressure spill's time budget
+        # file -> (class, layout key, row stride, keys in file order)
+        self.files: dict[str, tuple[str, str, int, list[bytes]]] = {}
+        self.where: dict[tuple[str, str, bytes], tuple[str, int]] = {}
+        self.manifest: dict | None = None
         self.manifest_time: float | None = None
         self.manifest_runs = 0
+        self._lock = threading.Lock()
 
-    def key_path(self, cls_name: str, layout_key: str, key: bytes) -> str:
-        h = key.hex()
-        return os.path.join(f"{cls_name}_{layout_key}", h[:3], f"{h}.bin")
+    def file_bytes(self, rel: str) -> int:
+        _, _, stride, keys = self.files[rel]
+        return stride * len(keys)
+
+    def _adopt(self, manifest: dict | None) -> None:
+        self.files, self.where = {}, {}
+        self.manifest = manifest
+        self.manifest_time = manifest.get("time") if manifest else None
+        self.manifest_runs = len(manifest["runs"]) if manifest else 0
+        if not manifest:
+            return
+        for rel, item in manifest["files"].items():
+            info = manifest["classes"][item["cls"]]
+            keys = [bytes.fromhex(k) for k in item["keys"]]
+            self.files[rel] = (item["cls"], info["layout_key"], int(info["row_stride"]), keys)
+            for i, k in enumerate(keys):
+                self.where[(item["cls"], info["layout_key"], k)] = (rel, i)
 
     def read_manifest(self) -> dict | None:
         if not self.dir:
@@ -1544,50 +1761,57 @@ class SpillStore:
             return None
         return manifest
 
-    def _manifest_files(self, manifest: dict) -> dict[str, int]:
-        out = {}
-        for item in manifest["runs"]:
-            info = manifest["classes"][item["cls"]]
-            for k in item["keys"]:
-                out[self.key_path(item["cls"], info["layout_key"], bytes.fromhex(k))] = (
-                    int(info["row_stride"]))
-        return out
-
     def load(self) -> None:
         """At start: remember the files the manifest names and delete every
-        other chunk file (those of an aborted or interrupted spill)."""
+        other file (those of an earlier format, or of an interrupted spill)."""
         if not self.dir:
             return
         os.makedirs(self.dir, exist_ok=True)
-        manifest = self.read_manifest()
-        self.files = self._manifest_files(manifest) if manifest else {}
-        if manifest:
-            self.manifest_time = manifest.get("time")
-            self.manifest_runs = len(manifest["runs"])
+        self._adopt(self.read_manifest())
         removed = 0
-        for root, _, names in os.walk(self.dir):
+        for root, dirs, names in os.walk(self.dir, topdown=False):
             for name in names:
                 full = os.path.join(root, name)
-                if os.path.relpath(full, self.dir) in self.files:
+                rel = os.path.relpath(full, self.dir)
+                if rel in self.files or rel == MANIFEST:
                     continue
                 if name.endswith((".bin", ".tmp")):
                     os.unlink(full)
                     removed += 1
-        logger.info("spill %s: the manifest names %d chunk files (%.2f GB); removed %d others",
-                    self.dir, len(self.files), sum(self.files.values()) / 1e9, removed)
+            if root != self.dir and not os.listdir(root):
+                os.rmdir(root)
+        logger.info("spill %s: the manifest names %d files (%.2f GB); removed %d others",
+                    self.dir, len(self.files),
+                    sum(self.file_bytes(r) for r in self.files) / 1e9, removed)
 
-    def select(self, arena: Arena) -> tuple[dict, list[tuple[str, int, int]]]:
+    def _reusable(self, arena: Arena) -> set[str]:
+        out = set()
+        for rel, (name, layout, stride, keys) in self.files.items():
+            cls = arena.classes.get(name)
+            if cls is None or cls.layout_key != layout or cls.stride != stride or not keys:
+                continue
+            present = sum(1 for k in keys if (e := cls.index.get(k)) is not None and e.ready)
+            if present >= SPILL_REUSE_FRACTION * len(keys):
+                out.add(rel)
+        return out
+
+    def select(self, arena: Arena, budget_bytes: float | None = None) -> SpillPlan:
         """The newest whole restorable runs within max_bytes, writing no more
-        new bytes than NVMe has free above the floor (a chunk file already on
-        disk costs nothing)."""
+        new bytes than NVMe has free above the floor, nor than budget_bytes
+        when given (a pressure release). A chunk already in a kept file costs
+        no write; the kept file counts whole towards max_bytes."""
         free = 0
         if self.max_bytes > 0:
             st = os.statvfs(self.dir)
             free = st.f_bavail * st.f_frsize - self.free_floor
+        if budget_bytes is not None:
+            free = min(free, budget_bytes)
+        reusable = self._reusable(arena) if self.max_bytes > 0 else set()
         total = new = 0
         chosen: list[Run] = []
         picked: set[tuple[LayoutClass, bytes]] = set()
-        writes: list[tuple[str, int, int]] = []
+        kept: set[str] = set()
+        by_sp: dict[int, list[tuple[int, bytes]]] = {}
         for run in reversed(arena.order) if self.max_bytes > 0 else ():
             cls = run.cls
             if not run.restorable:
@@ -1595,18 +1819,49 @@ class SpillStore:
             entries = [(k, cls.index[k]) for k in run.keys if (cls, k) not in picked]
             if any(not e.ready or e.moving is not None or e.promoting for _, e in entries):
                 continue
-            paths = [self.key_path(cls.name, cls.layout_key, k) for k, _ in entries]
-            add_total = len(entries) * cls.stride
-            add_new = sum(cls.stride for p in paths if p not in self.files)
+            add_total = add_new = 0
+            add_kept: set[str] = set()
+            fresh = []
+            for k, e in entries:
+                loc = self.where.get((cls.name, cls.layout_key, k))
+                if loc is not None and loc[0] in reusable:
+                    if loc[0] not in kept and loc[0] not in add_kept:
+                        add_kept.add(loc[0])
+                        add_total += self.file_bytes(loc[0])
+                else:
+                    add_total += cls.stride
+                    add_new += cls.stride
+                    fresh.append((k, e))
             if total + add_total > self.max_bytes or new + add_new > free:
                 continue
             total += add_total
             new += add_new
+            kept |= add_kept
             chosen.append(run)
-            for (k, e), path in zip(entries, paths):
+            for k, _ in entries:
                 picked.add((cls, k))
-                if path not in self.files:
-                    writes.append((path, cls.offset(e.row), cls.stride))
+            for k, e in fresh:
+                by_sp.setdefault(cls.sp_of(e.row), []).append((e.row, k))
+        stamp = f"{time.time_ns():x}"
+        files: dict[str, dict] = {}
+        for rel in kept:
+            name, _, _, keys = self.files[rel]
+            files[rel] = {"cls": name, "keys": [k.hex() for k in keys]}
+        jobs = []
+        for sp, items in by_sp.items():
+            cls = arena.sp_owner[sp]
+            items.sort()
+            rel = os.path.join(f"{cls.name}_{cls.layout_key}", f"{stamp}-{sp:06d}.bin")
+            files[rel] = {"cls": cls.name, "keys": [k.hex() for _, k in items]}
+            ranges: list[list[int]] = []
+            for row, _ in items:
+                off = cls.offset(row)
+                if ranges and ranges[-1][0] + ranges[-1][1] == off:
+                    ranges[-1][1] += cls.stride
+                else:
+                    ranges.append([off, cls.stride])
+            jobs.append((sp, rel, [tuple(r) for r in ranges], len(items) * cls.stride))
+        jobs.sort(key=lambda j: (j[3], j[0]))  # cheapest superpage to free first
         classes = {r.cls for r in chosen}
         manifest = {
             "version": _MANIFEST_VERSION,
@@ -1614,82 +1869,176 @@ class SpillStore:
             "superpage_bytes": arena.sp_bytes,
             "classes": {c.name: {"layout_key": c.layout_key, "row_stride": c.stride,
                                  "state_groups": sorted(c.state_groups)} for c in classes},
+            "files": files,
             "runs": [{"cls": r.cls.name, "tag": r.tag.hex(), "keys": [k.hex() for k in r.keys]}
                      for r in reversed(chosen)],
         }
-        return manifest, writes
+        free_now = [sp for sp in range(arena.num_sp) if sp not in by_sp]
+        return SpillPlan(manifest, jobs, free_now, new)
 
-    def write(self, mm: mmap.mmap, manifest: dict, writes: list, abort: threading.Event) -> bool:
-        """Write the new chunk files, then the manifest. Returns True once
-        durable, False when aborted (the new files are removed again)."""
+    def write(self, mm: mmap.mmap, plan: SpillPlan, abort: threading.Event,
+              progress: SpillProgress, fd: int | None = None, punch: bool = True) -> dict:
+        """Thread: free the superpages with nothing to write, then write one
+        file per remaining superpage on several threads and free each
+        superpage once its file is durable; then the manifest. An abort (or a
+        write error) stops at the files in flight and writes a manifest of
+        the runs already whole on disk. Returns {"complete", "error",
+        "manifest"}; the superpages freed are in progress.punched."""
+        sp_bytes = progress.sp_bytes
+        punch = punch and sp_bytes % mmap.PAGESIZE == 0
+        if punch:
+            step = max(1, _PUNCH_STEP // sp_bytes)  # superpages per call, so STATE moves
+            for off, ln in _sp_ranges(plan.free_now, sp_bytes):
+                first, end = off // sp_bytes, (off + ln) // sp_bytes
+                for a in range(first, end, step):
+                    if abort.is_set():
+                        break  # every superpage freed now must be populated again
+                    b = min(end, a + step)
+                    _punch(fd, mm, a * sp_bytes, (b - a) * sp_bytes)
+                    progress.freed(range(a, b), True)
         if not self.dir:
-            return True
-        t0 = time.monotonic()
-        done: list[str] = []
-        dirs: set[str] = set()
-        try:
-            for rel, off, length in writes:
-                if abort.is_set():
-                    raise InterruptedError
+            return {"complete": True, "error": None, "manifest": None}
+        progress.write_started = time.monotonic()
+        jobs: queue.SimpleQueue = queue.SimpleQueue()
+        for job in plan.jobs:
+            jobs.put(job)
+        done: set[str] = set()
+        errors: list[str] = []
+        stop = threading.Event()
+        for d in {os.path.dirname(j[1]) for j in plan.jobs}:
+            os.makedirs(os.path.join(self.dir, d), exist_ok=True)
+
+        def worker() -> None:
+            while not (abort.is_set() or stop.is_set()):
+                try:
+                    sp, rel, ranges, nbytes = jobs.get_nowait()
+                except queue.Empty:
+                    return
                 full = os.path.join(self.dir, rel)
-                os.makedirs(os.path.dirname(full), exist_ok=True)
-                _write_row_file(full + ".tmp", mm, off, length)
-                os.replace(full + ".tmp", full)
-                done.append(rel)
-                dirs.add(os.path.dirname(full))
-            if abort.is_set():
-                raise InterruptedError
-            for d in dirs:
-                _fsync_dir(d)
-            path = os.path.join(self.dir, MANIFEST)
-            with open(path + ".tmp", "w") as f:
-                json.dump(manifest, f)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(path + ".tmp", path)
-            _fsync_dir(self.dir)
-        except InterruptedError:
-            for rel in done:
-                os.unlink(os.path.join(self.dir, rel))
-            return False
-        keep = self._manifest_files(manifest)
-        for rel in self.files.keys() - keep.keys():
+                try:
+                    _write_spill_file(full, mm, ranges)
+                except OSError as exc:
+                    with self._lock:
+                        errors.append(f"{rel}: {exc}")
+                    stop.set()
+                    try:
+                        os.unlink(full)
+                    except OSError:
+                        pass
+                    return
+                if punch:
+                    _punch(fd, mm, sp * sp_bytes, sp_bytes)
+                with self._lock:
+                    done.add(rel)
+                progress.freed([sp] if punch else [], False, nbytes)
+
+        threads = [threading.Thread(target=worker, name=f"kvpool-spill-{i}", daemon=True)
+                   for i in range(min(self.threads, len(plan.jobs)))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for d in {os.path.dirname(j[1]) for j in plan.jobs}:
+            _fsync_dir(os.path.join(self.dir, d))
+        complete = not errors and len(done) == len(plan.jobs)
+        manifest = plan.manifest
+        if not complete:
+            new = {j[1] for j in plan.jobs}
+            files = {rel: f for rel, f in manifest["files"].items()
+                     if rel not in new or rel in done}
+            durable = {(f["cls"], k) for f in files.values() for k in f["keys"]}
+            manifest = {**manifest,
+                        "files": files,
+                        "runs": [r for r in manifest["runs"]
+                                 if all((r["cls"], k) in durable for k in r["keys"])]}
+        path = os.path.join(self.dir, MANIFEST)
+        with open(path + ".tmp", "w") as f:
+            json.dump(manifest, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(path + ".tmp", path)
+        _fsync_dir(self.dir)
+        for rel in self.files.keys() - manifest["files"].keys():
             try:
                 os.unlink(os.path.join(self.dir, rel))
             except FileNotFoundError:
                 pass
-        self.files = keep
-        self.manifest_time = manifest["time"]
-        self.manifest_runs = len(manifest["runs"])
-        logger.info("spilled %d runs (%d chunk files, %d new, %.2f GB written) in %.1f s",
-                    len(manifest["runs"]), len(keep), len(writes),
-                    sum(w[2] for w in writes) / 1e9, time.monotonic() - t0)
-        return True
+        self._adopt(manifest)
+        elapsed = time.monotonic() - progress.started
+        wtime = time.monotonic() - progress.write_started
+        if complete and progress.written_bytes >= 1e9 and wtime > 0:
+            self.rate = progress.written_bytes / wtime
+        logger.info("spill %s: %d runs, %d files (%d new of %d), %.2f GB written in %.1f s "
+                    "(%.2f GB/s); %.2f GiB freed at once, %.2f GiB in all, in %.1f s%s",
+                    "done" if complete else ("aborted" if not errors else "FAILED"),
+                    len(manifest["runs"]), len(manifest["files"]), len(done), len(plan.jobs),
+                    progress.written_bytes / 1e9, wtime,
+                    progress.written_bytes / 1e9 / wtime if wtime > 0 else 0.0,
+                    progress.free_now_done / (1 << 30), progress.freed_bytes / (1 << 30),
+                    elapsed, f": {errors[0]}" if errors else "")
+        return {"complete": complete, "error": errors[0] if errors else None,
+                "manifest": manifest}
 
     def restore(self, mm: mmap.mmap, jobs: list[tuple]) -> list[tuple[str, bytes]]:
-        """Thread: read spilled chunks into their rows; returns the failures."""
-        failed = []
+        """Thread: read spilled chunks into their rows, a file per task on
+        several threads; returns the chunks that failed. ``jobs`` holds
+        (class, key, row, file, index)."""
         t0 = time.monotonic()
-        for cls, key, row, rel in jobs:
-            try:
-                _read_row_file(os.path.join(self.dir, rel), mm, cls.offset(row), cls.stride)
-            except OSError as exc:
-                logger.warning("spilled chunk %s not restored: %s", rel, exc)
-                failed.append((cls.name, key))
-                # Forget the file, so the next spill writes a fresh copy.
-                self.files.pop(rel, None)
+        by_file: dict[str, list[tuple]] = {}
+        for job in jobs:
+            by_file.setdefault(job[3], []).append(job)
+        tasks: queue.SimpleQueue = queue.SimpleQueue()
+        for item in by_file.items():
+            tasks.put(item)
+        failed: list[tuple[str, bytes]] = []
+        bad: list[str] = []
+
+        def worker() -> None:
+            while True:
+                try:
+                    rel, items = tasks.get_nowait()
+                except queue.Empty:
+                    return
+                cls = items[0][0]
+                try:
+                    _read_spill_file(os.path.join(self.dir, rel), mm, cls.stride,
+                                     self.file_bytes(rel),
+                                     sorted((i, cls.offset(row)) for _, _, row, _, i in items))
+                except (OSError, KeyError) as exc:
+                    logger.warning("spill file %s not restored: %s", rel, exc)
+                    with self._lock:
+                        failed.extend((c.name, k) for c, k, _, _, _ in items)
+                        bad.append(rel)
+
+        threads = [threading.Thread(target=worker, name=f"kvpool-restore-{i}", daemon=True)
+                   for i in range(min(self.threads, len(by_file)))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if bad:
+            # Forget the files, so the next spill writes fresh copies. New
+            # dicts: the event loop may be reading these for STATE.
+            gone = set(bad)
+            self.files = {r: v for r, v in self.files.items() if r not in gone}
+            self.where = {k: v for k, v in self.where.items() if v[0] not in gone}
+            for rel in gone:
                 try:
                     os.unlink(os.path.join(self.dir, rel))
                 except OSError:
                     pass
-        logger.info("restored %d spilled chunks in %.1f s (%d failed)",
-                    len(jobs) - len(failed), time.monotonic() - t0, len(failed))
+        nbytes = sum(j[0].stride for j in jobs)
+        dt = time.monotonic() - t0
+        logger.info("restored %d spilled chunks (%.2f GB, %d files) in %.1f s (%.2f GB/s, %d failed)",
+                    len(jobs) - len(failed), nbytes / 1e9, len(by_file), dt,
+                    nbytes / 1e9 / dt if dt > 0 else 0.0, len(failed))
         return failed
 
     def stats(self) -> dict:
-        return {"dir": self.dir, "files": len(self.files), "bytes": sum(self.files.values()),
+        return {"dir": self.dir, "files": len(self.files),
+                "bytes": sum(self.file_bytes(r) for r in self.files),
                 "runs": self.manifest_runs, "manifest_time": self.manifest_time,
-                "max_bytes": self.max_bytes}
+                "max_bytes": self.max_bytes, "write_rate_bytes_per_sec": round(self.rate)}
 
 
 class PoolServer:
@@ -1724,7 +2073,9 @@ class PoolServer:
         self.populate_floor = int(arena_cfg.get("populate_floor_bytes", 8 << 30))
         self.spill = SpillStore(arena_cfg.get("spill_dir"),
                                 int(float(arena_cfg.get("spill_max_bytes", 0))),
-                                int(float(arena_cfg.get("nvme_free_floor", 10e9))))
+                                int(float(arena_cfg.get("nvme_free_floor", 10e9))),
+                                threads=int(arena_cfg.get("spill_threads", 4)),
+                                rate=float(arena_cfg.get("spill_rate_bytes_per_sec", 2e9)))
         self._server_id = f"{os.getpid():x}{int(time.time()):x}"
         self._arenas = 0  # arenas created or adopted by this server
         self.state = P.ABSENT
@@ -1733,6 +2084,7 @@ class PoolServer:
         self.last_release: dict | None = None
         self.last_prepare: dict | None = None
         self._spill_abort = threading.Event()
+        self._spill_progress: SpillProgress | None = None
         self._populated = 0  # bytes populated so far while CREATING (the thread's)
         self._life_q: queue.SimpleQueue = queue.SimpleQueue()
         self._life_thread: threading.Thread | None = None
@@ -1831,6 +2183,19 @@ class PoolServer:
         if self.state in (P.READY, P.CREATING):
             return
         if self.state == P.SPILLING:
+            if self._spill_abort.is_set():
+                return
+            # Superpages the spill already gave back must be populated again
+            # before a client attaches; when that does not fit, the spill
+            # completes and the arena is created again under the usual floor.
+            prog = self._spill_progress
+            refill = prog.freed_bytes + prog.free_soon() if prog is not None else 0
+            avail = self._mem_available()
+            if refill and avail - refill < self.populate_floor:
+                logger.info("spill not aborted (%s): MemAvailable %d minus the %d bytes already "
+                            "freed is under the floor %d; the arena is created again after it",
+                            reason, avail, refill, self.populate_floor)
+                return
             self._spill_abort.set()
             logger.info("spill aborted: %s", reason)
             return
@@ -1911,6 +2276,10 @@ class PoolServer:
             cfg = self.pools_cfg.get(name)
             if cfg is None:
                 continue
+            live = arena.classes.get(name)
+            if live is not None and (live.layout_key, live.stride) != (
+                    info["layout_key"], int(info["row_stride"])):
+                continue  # never replace a live class for a spill (an abort's refill)
             try:
                 cls = arena.class_for(name, cfg, info["layout_key"], int(info["row_stride"]),
                                       info.get("state_groups", ()))
@@ -1919,6 +2288,8 @@ class PoolServer:
                 continue
             self._attach_cold(cls)
             classes[name] = cls
+        where = {(f["cls"], bytes.fromhex(k)): (rel, i)
+                 for rel, f in manifest["files"].items() for i, k in enumerate(f["keys"])}
         now = self.clock()
         jobs, chosen = [], []
         for item in reversed(manifest["runs"]):  # newest first
@@ -1941,7 +2312,8 @@ class PoolServer:
             for k, row in zip(mine, rows):
                 cls.add_entry(k, Entry(row=row, ready=False, writer=None, promoting=True,
                                        stored_at=now, last_use=now))
-                jobs.append((cls, k, row, self.spill.key_path(cls.name, cls.layout_key, k)))
+                rel, idx = where[(cls.name, k)]
+                jobs.append((cls, k, row, rel, idx))
             chosen.append((cls, bytes.fromhex(item["tag"]), keys))
         for cls, tag, keys in reversed(chosen):  # oldest first, so newest ends newest
             run = arena.get_run(cls, tag)
@@ -1990,7 +2362,14 @@ class PoolServer:
             return f"the arena is mapped by pid(s) {pids}"
         return None
 
-    def release(self, reason: str) -> dict:
+    def release(self, reason: str, target_bytes: int | None = None,
+                budget_sec: float | None = None) -> dict:
+        """Start a spill. Superpages holding nothing the spill writes are
+        freed at once; the rest one by one as their files become durable.
+        A pressure release (the router's RAM gate) may bound the write to
+        what fits in budget_sec at the measured write rate: the newest runs
+        that fit are spilled, the rest dropped. target_bytes is the RAM the
+        caller needs; STATE reports when it was reached."""
         if self.state in (P.ABSENT, P.SPILLING):
             return {"ok": True, "reason": self.state.lower(), "state": self.state_reply()}
         refusal = ("the arena is being created" if self.state == P.CREATING
@@ -1999,34 +2378,100 @@ class PoolServer:
             self.last_release = {"time": time.time(), "ok": False, "reason": refusal}
             logger.info("release (%s) refused: %s", reason, refusal)
             return {"ok": False, "reason": refusal, "state": self.state_reply()}
-        assert self.arena is not None
-        manifest, writes = self.spill.select(self.arena)
+        arena = self.arena
+        assert arena is not None
+        budget = None if budget_sec is None else max(0.0, budget_sec) * self.spill.rate
+        plan = self.spill.select(arena, budget)
+        self._spill_progress = SpillProgress(reason, arena.sp_bytes, len(plan.free_now),
+                                             plan.write_bytes, len(plan.jobs), target_bytes,
+                                             budget_sec)
         self.state = P.SPILLING
         self._spill_abort.clear()
-        logger.info("release (%s): spilling %d runs, %d new chunk files",
-                    reason, len(manifest["runs"]), len(writes))
-        self._start("spilled", self.spill.write, self.arena.mm, manifest, writes,
-                    self._spill_abort)
-        return {"ok": True, "reason": "spilling", "state": self.state_reply()}
+        logger.info("release (%s): spilling %d runs, %d new files (%.2f GB); %.2f GiB freed "
+                    "at once%s", reason, len(plan.manifest["runs"]), len(plan.jobs),
+                    plan.write_bytes / 1e9, len(plan.free_now) * arena.sp_bytes / (1 << 30),
+                    "" if budget is None else f", write budget {budget / 1e9:.2f} GB")
+        self._start("spilled", self.spill.write, arena.mm, plan, self._spill_abort,
+                    self._spill_progress, arena.fd)
+        return {"ok": True, "reason": "spilling",
+                "free_now_bytes": len(plan.free_now) * arena.sp_bytes,
+                "write_bytes": plan.write_bytes, "state": self.state_reply()}
 
     def _on_spilled(self, result) -> None:
         arena = self.arena
         assert arena is not None
-        if result is True:
+        prog = self._spill_progress
+        summary = prog.snapshot(arena.size) if prog is not None else {}
+        if isinstance(result, dict) and result["complete"]:
             arena.close(unlink=True)  # in the event loop, after the manifest is durable
             self.arena = None
             self.state = P.ABSENT
-            self.last_release = {"time": time.time(), "ok": True, "reason": "released"}
+            self._spill_progress = None
+            self.last_release = {"time": time.time(), "ok": True, "reason": "released",
+                                 "spill": summary}
             logger.info("arena released")
             waiting = any(c.backlog for c in self._conns.values()) or self._live_tokens()
             if waiting and self._running:
                 self.prepare("requests arrived during the spill")
             return
-        self.state = P.READY
-        reason = "aborted" if result is False else f"spill failed: {result}"
-        self.last_release = {"time": time.time(), "ok": False, "reason": reason}
-        logger.info("release ended with the arena intact: %s", reason)
-        self._flush_backlogs()
+        if isinstance(result, dict):
+            reason = "aborted" if result["error"] is None else f"spill failed: {result['error']}"
+            manifest = result["manifest"]
+        else:
+            reason = f"spill failed: {result}"
+            manifest = self.spill.manifest
+        self.last_release = {"time": time.time(), "ok": False, "reason": reason,
+                             "spill": summary}
+        self._spill_progress = None
+        punched = sorted(prog.punched) if prog is not None else []
+        if not punched:
+            self.state = P.READY
+            logger.info("release ended with the arena intact: %s", reason)
+            self._flush_backlogs()
+            return
+        # The freed superpages hold zeros now: forget their chunks, read back
+        # the ones that reached disk, and populate the rest before READY.
+        dropped = self._drop_superpages(arena, punched)
+        jobs = self._plan_restore(arena, manifest) if manifest else []
+        self.state = P.CREATING
+        self._populated = arena.size - len(punched) * arena.sp_bytes
+        self.last_prepare = {"time": time.time(), "ok": None, "reason": f"refill after: {reason}"}
+        logger.info("release ended early (%s): %d superpages freed, %d chunks dropped, %d read "
+                    "back from the spill", reason, len(punched), dropped, len(jobs))
+        self._start("restored", self._refill, arena.mm, punched, jobs)
+
+    def _drop_superpages(self, arena: Arena, sps: list[int]) -> int:
+        dropped = 0
+        for sp in sps:
+            cls = arena.sp_owner[sp]
+            if cls is None:
+                continue
+            for row in cls.rows_of(sp):
+                key = cls.row_key.get(row)
+                if key is not None:
+                    cls.drop_entry(key, cls.index[key], quarantine=False)
+                    cls.counters["chunks_dropped_by_spill_abort"] += 1
+                    dropped += 1
+        return dropped
+
+    def _refill(self, mm: mmap.mmap, sps: list[int], jobs: list[tuple]):
+        """Thread: populate freed superpages again, then read spilled chunks."""
+        if self.populate:
+            sp = self.superpage_bytes
+            for off, ln in _sp_ranges(sps, sp):
+                for o in range(off, off + ln, _POPULATE_STEP):
+                    n = min(_POPULATE_STEP, off + ln - o)
+                    avail = self._mem_available()
+                    if avail - n < self.populate_floor:
+                        logger.warning("refill: MemAvailable %d is under the floor %d; the rest "
+                                       "of the freed superpages fault in on use",
+                                       avail, self.populate_floor)
+                        return self.spill.restore(mm, jobs)
+                    mm.madvise(_MADV_POPULATE_WRITE, o, n)
+                    self._populated += n
+        else:
+            self._populated += len(sps) * self.superpage_bytes
+        return self.spill.restore(mm, jobs)
 
     def _live_tokens(self) -> dict:
         now = self.clock()
@@ -2058,6 +2503,13 @@ class PoolServer:
             out["free_superpages"] = len(arena.free_sp)
             out["pin_superpages"] = arena.pin_sp
             out["counters"] = dict(arena.counters)
+            prog = self._spill_progress
+            if self.state == P.SPILLING and prog is not None:
+                snap = prog.snapshot(arena.size)
+                out["spill_progress"] = snap
+                out["freed_bytes"] = snap["freed_bytes"]
+                out["remaining_bytes"] = snap["remaining_bytes"]
+                out["free_soon_bytes"] = snap["free_soon_bytes"]
             for name, cls in arena.classes.items():
                 out["classes"][name] = {
                     "layout_key": cls.layout_key,
@@ -2128,7 +2580,14 @@ class PoolServer:
             self.prepare(str((args or {}).get("reason", "operator")))
             return self.state_reply()
         if op == P.OP_RELEASE:
-            return self.release(str((args or {}).get("reason", "operator")))
+            args = args or {}
+            reason = str(args.get("reason", "operator"))
+            if args.get("detail"):
+                reason = f"{reason}: {args['detail']}"
+            target = args.get("target_bytes")
+            budget = args.get("budget_sec")
+            return self.release(reason, None if target is None else int(target),
+                                None if budget is None else float(budget))
         if op == P.OP_SPAWN_OPEN:
             self.spawn_tokens[str(args["token"])] = (
                 str(args.get("pool", "")), self.clock() + float(args.get("ttl_sec", 3600)))
@@ -2354,10 +2813,13 @@ class PoolServer:
         if self.state == P.READY and self.arena is not None:
             refusal = self._release_refusal(stopping=True)
             if refusal is None:
-                manifest, writes = self.spill.select(self.arena)
-                logger.info("stopping: spilling %d runs", len(manifest["runs"]))
-                if self.spill.write(self.arena.mm, manifest, writes, threading.Event()):
-                    self.arena.close(unlink=True)
+                arena = self.arena
+                plan = self.spill.select(arena)
+                logger.info("stopping: spilling %d runs", len(plan.manifest["runs"]))
+                prog = SpillProgress("stop", arena.sp_bytes, len(plan.free_now),
+                                     plan.write_bytes, len(plan.jobs), None, None)
+                if self.spill.write(arena.mm, plan, threading.Event(), prog, arena.fd)["complete"]:
+                    arena.close(unlink=True)
                     self.arena = None
             else:
                 logger.info("stopping with the arena kept: %s", refusal)
