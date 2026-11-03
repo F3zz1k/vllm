@@ -544,3 +544,16 @@ def test_restore_chain_carries_the_eagle_chunk_past_the_state(band):
     # state at chunk 3 has no eagle chunk past it; state at chunk 1 does
     assert by_group[attn][2] in chain and by_group[attn][3] not in chain
     assert all(by_group[s][1] in chain and by_group[s][3] not in chain for s in state)
+
+
+def test_prompt_boundary_is_a_chunk_earlier_with_a_drafter_group(band):
+    scheduler, _, _ = band
+    request = _make_partial_tail_request(scheduler)
+    request.shared_prefix_boundary = 0
+    status = scheduler._req_status["req"]
+    configs = [c._replace(is_eagle_group=True) if not isinstance(c.kv_cache_spec, MambaSpec)
+               else c for c in scheduler.config.kv_group_configs]
+    scheduler.config = scheduler.config._replace(retention_interval=0, kv_group_configs=configs)
+    tpc = configs[scheduler._chain_ref_group].tokens_per_chunk
+    scheduler._maybe_set_prompt_boundary(status, 0)
+    assert request.shared_prefix_boundary == (30 - 1) // tpc * tpc - tpc

@@ -2007,6 +2007,11 @@ class OffloadingConnectorScheduler:
         request = req_status.req
         tpc = self.config.kv_group_configs[self._chain_ref_group].tokens_per_chunk
         target = (request.num_prompt_tokens - 1) // tpc * tpc
+        if any(c.is_eagle_group for c in self.config.kv_group_configs):
+            # A restore at d also reads a drafter group's chunk after d (its
+            # trailing chunk is dropped at lookup): end a chunk one chunk
+            # earlier, so the state there has that chunk inside the prompt.
+            target -= tpc
         if target <= start or request.shared_prefix_boundary > start:
             return
         request.shared_prefix_boundary = target
