@@ -82,13 +82,13 @@ WRITE_BACK = os.environ.get("VLLM_KV_WRITE_BACK", "0") == "1"
 # The band's lead (free-queue positions scanned) is WRITE_BACK_SCAN plus the
 # blocks the GPU reuses in WRITE_BACK_LEAD_FACTOR measured copy latencies,
 # capped at WRITE_BACK_SCAN_MAX.
-WRITE_BACK_SCAN = int(os.environ.get("VLLM_KV_WRITE_BACK_SCAN", "64"))
+WRITE_BACK_SCAN = int(os.environ.get("VLLM_KV_WRITE_BACK_SCAN", "256"))
 WRITE_BACK_SCAN_MAX = int(os.environ.get("VLLM_KV_WRITE_BACK_SCAN_MAX", "4096"))
 WRITE_BACK_LEAD_FACTOR = float(os.environ.get("VLLM_KV_WRITE_BACK_LEAD_FACTOR", "2.0"))
 # Blocks held by copies in flight, also capped at WRITE_BACK_FREE_SHARE of the
 # free blocks, so the band never starves allocation.
-WRITE_BACK_MAX_HELD = int(os.environ.get("VLLM_KV_WRITE_BACK_MAX_HELD", "256"))
-WRITE_BACK_FREE_SHARE = float(os.environ.get("VLLM_KV_WRITE_BACK_FREE_SHARE", "0.25"))
+WRITE_BACK_MAX_HELD = int(os.environ.get("VLLM_KV_WRITE_BACK_MAX_HELD", "1024"))
+WRITE_BACK_FREE_SHARE = float(os.environ.get("VLLM_KV_WRITE_BACK_FREE_SHARE", "0.5"))
 # A run the pool refused is not offered again for this long.
 WRITE_BACK_REFUSED_BACKOFF_S = float(
     os.environ.get("VLLM_KV_WRITE_BACK_REFUSED_BACKOFF_S", "5.0")
@@ -109,6 +109,16 @@ _POOL_HAS_MAX = 1 << 18
 # Conversations ("runs") remembered for whole-run write-back.
 WRITE_BACK_MAX_RUNS = 4096
 WRITE_THROUGH_MIN_FREE = float(os.environ.get("VLLM_KV_WRITE_THROUGH_MIN_FREE", "0.02"))
+# With the band on, compute-time stores are off (2026-11-03, owner's decision:
+# the RAM tier extends VRAM, it does not mirror it). Only the aligned boundary
+# hand-offs stay at compute time. VLLM_KV_WRITE_BACK_MIRROR=1 restores the
+# gate: mirror while the pool has WRITE_THROUGH_MIN_FREE admissible.
+WRITE_BACK_MIRROR = os.environ.get("VLLM_KV_WRITE_BACK_MIRROR", "0") == "1"
+# Aligned boundary hand-offs (a state, plus the attention block there, stored
+# at compute time). With the band they duplicate what the GPU still holds,
+# and the band can take the state from the GPU when the boundary is cached
+# there; VLLM_KV_WRITE_BACK_HANDOFF=0 skips them (the junctions stay).
+WRITE_BACK_HANDOFF = os.environ.get("VLLM_KV_WRITE_BACK_HANDOFF", "1") == "1"
 _WRITE_BACK_REQ = "__kv_write_back__"
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
@@ -975,6 +985,8 @@ class OffloadingConnectorScheduler:
         (its class has under WRITE_THROUGH_MIN_FREE of its rows free)."""
         if not WRITE_BACK or self._gpu_block_pool is None:
             return True
+        if not WRITE_BACK_MIRROR:
+            return False
         free_fraction = getattr(self.manager, "pool_free_fraction", None)
         fraction = free_fraction() if free_fraction is not None else None
         return fraction is None or fraction >= WRITE_THROUGH_MIN_FREE
@@ -2304,6 +2316,9 @@ class OffloadingConnectorScheduler:
         self, handoffs: dict[str, list[tuple[int, int, int]]]
     ) -> dict[int, TransferJob]:
         store_jobs: dict[int, TransferJob] = {}
+        if WRITE_BACK and not WRITE_BACK_MIRROR and not WRITE_BACK_HANDOFF:
+            self._wb_counts["handoff_skipped"] += sum(len(e) for e in handoffs.values())
+            return store_jobs
         num_groups = len(self.config.kv_group_configs)
         config_idx_by_group = {
             config.group_idx: idx

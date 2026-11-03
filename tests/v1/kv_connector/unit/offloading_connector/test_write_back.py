@@ -139,7 +139,14 @@ def test_held_budget_caps_the_band(band, monkeypatch):
     assert scheduler._build_write_back_jobs() == {}
 
 
-def test_write_through_stops_only_when_pool_is_full(band):
+def test_band_alone_stores_nothing_at_compute_time(band):
+    scheduler, _, _ = band
+    scheduler.manager.pool_free_fraction.return_value = 0.5
+    assert not scheduler._write_through_enabled()
+
+
+def test_write_through_stops_only_when_pool_is_full(band, monkeypatch):
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_MIRROR", True)
     scheduler, _, _ = band
     assert not scheduler._write_through_enabled()
     scheduler.manager.pool_free_fraction.return_value = 0.5
