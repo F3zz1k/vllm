@@ -823,6 +823,28 @@ def test_pin_mmap_region_registers_row_aligned_chunks(iid, host_register):
     ]
 
 
+@pytest.mark.parametrize(
+    ("rows", "sizes"),
+    [(1, [3, 3, 3, 3, 3]), (2, [6, 6, 3]), (0, [6, 6, 3])],
+)
+def test_pin_mmap_region_external_rows_per_call(
+    iid, host_register, monkeypatch, rows, sizes
+):
+    """A shared (external) region registers REGISTER_ROWS rows per call; 0
+    falls back to the byte cap (here 7 pages, so two 3-page rows per call)."""
+    register, _ = host_register
+    monkeypatch.setattr(gpu_worker, "REGISTER_ROWS", rows)
+    with _region(iid, num_chunks=5, cpu_page_size=3 * PAGE_SIZE) as region:
+        region.external = True
+        gpu_worker.pin_mmap_region(region)
+        base = region._base.data_ptr()
+        offsets = [sum(sizes[:i]) for i in range(len(sizes))]
+        assert register.call_args_list == [
+            call(base + o * PAGE_SIZE, n * PAGE_SIZE) for o, n in zip(offsets, sizes)
+        ]
+        region.external = False
+
+
 @pytest.mark.parametrize("fail_at", [0, 1, 2])
 def test_pin_mmap_region_failure_leaves_region_pageable(iid, host_register, fail_at):
     """A failed chunk unregisters the chunks before it on the same range, so

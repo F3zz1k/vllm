@@ -104,6 +104,12 @@ CHECK_BOUNDS = os.environ.get("VLLM_KV_OFFLOAD_CHECK_BOUNDS", "0") == "1"
 # it tells a registration fault (copy engine CAT errors) from any other.
 REGISTER_REGION = os.environ.get("VLLM_KV_OFFLOAD_REGISTER", "1") == "1"
 
+# Rows per registration call for a region shared by several engines (the
+# shared KV pool). 1 (the default) registers one row per call; N > 1 registers
+# N rows per call; 0 registers the whole region (in chunks of at most
+# MAX_HOST_REGISTER_CHUNK_BYTES). An A/B knob for the per-row cost at boot.
+REGISTER_ROWS = int(os.environ.get("VLLM_KV_OFFLOAD_REGISTER_ROWS", "1"))
+
 # Staged canonical copies (2026-11-03). Under the canonical layout with TP > 1
 # a rank's share of a canonical page is one fragment per token and head run
 # (512 bytes per token at TP=2 on the 27B, 256 at TP=4), and the XPU batch copy
@@ -392,22 +398,21 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     # Chunks end on block-row boundaries, which are page aligned, so neither the
     # driver's page rounding nor any single block transfer straddles two
     # registrations.
-    # A region shared by several engines (the shared KV pool) registers one
-    # row per call. On XPU, registering a multi-GiB shared region in one call
+    # A region shared by several engines (the shared KV pool) registers
+    # REGISTER_ROWS rows per call (default one). On XPU, registering a multi-GiB shared region in one call
     # made the copy engine fault intermittently (CAT errors) once several
     # engines shared it; with the region unregistered the faults stopped
     # (2026-10-31).
-    max_chunk = (
-        min(MAX_HOST_REGISTER_CHUNK_BYTES, region._row_stride)
-        if region.external
-        else MAX_HOST_REGISTER_CHUNK_BYTES
-    )
+    max_chunk = MAX_HOST_REGISTER_CHUNK_BYTES
+    if region.external and REGISTER_ROWS > 0:
+        max_chunk = min(max_chunk, REGISTER_ROWS * region._row_stride)
     rows_per_chunk = max(max_chunk // region._row_stride, 1)
     chunk_size = rows_per_chunk * region._row_stride
 
     # Register, drain and roll back through the same helper, so a failed
     # chunk leaves neither a pending error nor a partly pinned region.
     addresses: list[int] = []
+    t_start = time.monotonic()
     for offset in range(0, total_size, chunk_size):
         address = base_ptr + offset
         size = min(chunk_size, total_size - offset)
@@ -427,11 +432,13 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
 
     region.pinned_addresses.extend(addresses)
     region.is_pinned = True
-    logger.debug(
-        "Host-registered mmap region rank=%d %.2f GB in %d chunk(s)",
+    logger.info(
+        "Host-registered mmap region rank=%d %.2f GB in %d chunk(s) of %d row(s) in %.2f s",
         rank,
         total_size / 1e9,
         len(addresses),
+        rows_per_chunk,
+        time.monotonic() - t_start,
     )
 
 
