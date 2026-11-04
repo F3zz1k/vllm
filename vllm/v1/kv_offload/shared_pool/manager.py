@@ -350,6 +350,23 @@ class SharedPoolOffloadingManager(OffloadingManager):
                 self._free_fraction = None
         return self._free_fraction
 
+    def pool_admit_rows(self) -> int | None:
+        """Rows (chunks) of this class a store can take now without evicting
+        a live run of its own, from a fresh STATE; None when unknown."""
+        if self._client is None:
+            return None
+        try:
+            state: Any = self._call_soft(P.OP_STATE)
+            cls_state = state["classes"][self._pool]
+            fraction = float(
+                cls_state.get("admit_fraction", cls_state["free_fraction"])
+            )
+            return int(fraction * int(cls_state["rows_total"]))
+        except ConnectionError:
+            return None
+        except (KeyError, TypeError, ValueError):
+            return None
+
     @override
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = OffloadingConnectorStats()

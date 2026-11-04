@@ -64,6 +64,7 @@ from vllm.v1.kv_offload.base import (
     get_offload_group_idx,
     make_offload_key,
 )
+from vllm.v1.kv_offload.flush_on_stop import flush_on_stop_sec
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
@@ -120,6 +121,10 @@ WRITE_BACK_MIRROR = os.environ.get("VLLM_KV_WRITE_BACK_MIRROR", "0") == "1"
 # there; VLLM_KV_WRITE_BACK_HANDOFF=0 skips them (the junctions stay).
 WRITE_BACK_HANDOFF = os.environ.get("VLLM_KV_WRITE_BACK_HANDOFF", "1") == "1"
 _WRITE_BACK_REQ = "__kv_write_back__"
+# Flush on stop (see vllm/v1/kv_offload/flush_on_stop.py): on a graceful stop
+# every conversation still cached on the GPU is written to the pool as a whole
+# restorable run, newest first, within this many seconds (0: off).
+FLUSH_ON_STOP_SEC = flush_on_stop_sec()
 
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
@@ -761,6 +766,14 @@ class OffloadingConnectorScheduler:
         self._wb_lead = WRITE_BACK_SCAN
         self._wb_touching = False
         self._wb_counts: Counter = Counter()
+        # Flush on stop: None -> "armed" (stop requested; this step records
+        # the runs of requests the stop finished) -> "ready" -> "running"
+        # (jobs submitted) -> "done" or "expired" (out of time: the engine
+        # exits and the pool drops the unfinished stores).
+        self._flush_state: str | None = None
+        self._flush_t0 = 0.0
+        self._flush_jobs: dict[int, tuple[int, int]] = {}  # job -> (run, blocks)
+        self._flush_counts: Counter = Counter()
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
@@ -3094,7 +3107,12 @@ class OffloadingConnectorScheduler:
         self._write_through = self._write_through_enabled()
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
-        write_back_jobs = self._build_write_back_jobs()
+        if self._flush_state == "ready":
+            write_back_jobs = self._build_flush_jobs()
+        elif self._flush_state is None or self._flush_state == "armed":
+            write_back_jobs = self._build_write_back_jobs()
+        else:
+            write_back_jobs = {}
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs | write_back_jobs,
@@ -3117,6 +3135,8 @@ class OffloadingConnectorScheduler:
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
+        if self._flush_state == "armed":
+            self._flush_state = "ready"
         return meta
 
     def has_pending_push_work(self) -> bool:
@@ -3125,7 +3145,155 @@ class OffloadingConnectorScheduler:
         While True, build_connector_meta() and update_connector_output()
         continue to be called even when no requests are scheduled.
         """
+        state = self._flush_state
+        if state is not None:
+            if state in ("armed", "ready"):
+                return True
+            if state == "running":
+                if not self._flush_jobs:
+                    self._flush_end("done")
+                elif time.monotonic() - self._flush_t0 >= FLUSH_ON_STOP_SEC:
+                    self._flush_end("expired")
+                    return False
+                else:
+                    return True
+            if self._flush_state == "expired":
+                return False
         return bool(self._jobs) or self.manager.has_pending_work()
+
+    # --- flush on stop ---
+
+    def request_flush_on_stop(self) -> None:
+        """The engine is stopping (SIGTERM): from the next step, write every
+        conversation cached on the GPU to the pool, then let the engine exit."""
+        if self._flush_state is not None:
+            return
+        if (
+            not WRITE_BACK
+            or FLUSH_ON_STOP_SEC <= 0
+            or self._gpu_block_pool is None
+            or self.config.blocks_per_chunk != 1
+            or not getattr(self.manager, "available", True)
+        ):
+            return
+        self._flush_state = "armed"
+        self._flush_t0 = time.monotonic()
+        logger.info(
+            "KV flush on stop: writing the GPU's cached conversations to the "
+            "pool (budget %.0fs, %d runs known)",
+            FLUSH_ON_STOP_SEC,
+            len(self._run_keys),
+        )
+
+    def _build_flush_jobs(self) -> dict[int, TransferJob]:
+        """Every known run with free GPU blocks the pool lacks, as one whole
+        tagged store each (what a restore of it reads, see _restore_chain).
+
+        Runs are chosen newest first while their new chunks fit the rows the
+        pool can admit without evicting a live run of this class (an
+        exclusive pool evicts its oldest run, which would be the newest one
+        flushed here). The chosen runs are stored oldest first, so the pool's
+        recency order matches the GPU's, and copied newest first, so the
+        newest are in the pool if the budget runs out."""
+        self._flush_state = "running"
+        now = time.monotonic()
+        config_idx_by_group = self._config_idx_by_group
+        admit_fn = getattr(self.manager, "pool_admit_rows", None)
+        admit = admit_fn() if admit_fn is not None else None
+        if not isinstance(admit, int):
+            admit = None
+        counts = self._flush_counts
+        chosen: list[tuple[OffloadKey, list]] = []
+        seen: set[OffloadKey] = set()
+        rows = 0
+        for tag in reversed(list(self._run_keys)):
+            if tag not in self._run_keys:
+                continue  # dropped by an earlier run's re-trim
+            members = self._run_members(tag, config_idx_by_group)
+            if not members:
+                counts["runs_nothing_to_write"] += 1
+                continue
+            new_rows = sum(1 for m in members if m[0] not in seen)
+            if admit is not None and rows + new_rows > admit:
+                counts["runs_pool_full"] += 1
+                continue
+            rows += new_rows
+            seen.update(m[0] for m in members)
+            chosen.append((tag, members))
+        jobs: list[tuple[int, TransferJob]] = []
+        pool = self._gpu_block_pool
+        for order, (tag, members) in enumerate(reversed(chosen)):
+            keys = [m[0] for m in members]
+            if hasattr(self.manager, "prepare_store_run"):
+                store_output = self._prepare_store_run(keys, tag, whole=True)
+            else:
+                store_output = self._prepare_store(keys, None)
+            if store_output is None:
+                counts["runs_refused"] += 1
+                continue
+            chunk_by_key = dict(
+                zip(store_output.keys_to_store, store_output.store_spec.block_ids.tolist())
+            )
+            new = []
+            for key, block, config_idx, _num_tokens in members:
+                chunk = chunk_by_key.get(key)
+                if chunk is None:
+                    self._note_in_pool([key])  # already there (joined the run)
+                    continue
+                new.append((key, block, config_idx, chunk))
+            if not new:
+                counts["runs_already_in_pool"] += 1
+                continue
+            self._wb_touching = True
+            try:
+                pool.touch([m[1] for m in new])
+            finally:
+                self._wb_touching = False
+            job_id, job = self._band_job(new, store_output, now)
+            self._wb_held[job_id] = [m[1] for m in new]
+            self._flush_jobs[job_id] = (order, len(new))
+            counts["runs_submitted"] += 1
+            counts["blocks_submitted"] += len(new)
+            counts["tokens_submitted"] += max(m[3] for m in members)
+            jobs.append((job_id, job))
+        # Newest first: the worker submits store jobs in this order.
+        jobs.reverse()
+        logger.info(
+            "KV flush on stop: %d runs (%d blocks) submitted in %.2fs; admit "
+            "rows %s, %d runs left out (pool full), %d refused",
+            counts["runs_submitted"],
+            counts["blocks_submitted"],
+            time.monotonic() - now,
+            admit,
+            counts["runs_pool_full"],
+            counts["runs_refused"],
+        )
+        return dict(jobs)
+
+    def _flush_job_done(self, job_id: int) -> None:
+        done = self._flush_jobs.pop(job_id, None)
+        if done is not None:
+            self._flush_counts["runs_written"] += 1
+            self._flush_counts["blocks_written"] += done[1]
+
+    def _flush_end(self, outcome: str) -> None:
+        self._flush_state = outcome
+        counts = self._flush_counts
+        logger.info(
+            "KV flush on stop %s after %.2fs: %d of %d runs written (%d of %d "
+            "blocks, ~%d tokens submitted); %d runs left out (pool full), %d "
+            "refused, %d with nothing to write",
+            outcome,
+            time.monotonic() - self._flush_t0,
+            counts["runs_written"],
+            counts["runs_submitted"],
+            counts["blocks_written"],
+            counts["blocks_submitted"],
+            counts["tokens_submitted"],
+            counts["runs_pool_full"],
+            counts["runs_refused"],
+            counts["runs_nothing_to_write"],
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """Update KVConnector state from worker-side connectors output.
@@ -3189,6 +3357,8 @@ class OffloadingConnectorScheduler:
             if job_status.req_id == _WRITE_BACK_REQ:
                 self.manager.complete_store(job_status.keys, None)
                 self._complete_write_back(job_id, job_status.keys)
+                if self._flush_jobs:
+                    self._flush_job_done(job_id)
                 del self._jobs[job_id]
                 continue
 
@@ -3329,6 +3499,7 @@ class OffloadingConnectorScheduler:
         self._wb_inflight.clear()
         self._wb_submitted.clear()
         self._wb_rescue.clear()
+        self._flush_jobs.clear()
         self._pool_has.clear()
         self._state_sets.clear()
         self._jobs.clear()

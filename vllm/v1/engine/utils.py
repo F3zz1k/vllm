@@ -33,6 +33,7 @@ from vllm.utils.system_utils import get_mp_context, set_env_var
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.executor import Executor, UniProcExecutor
 from vllm.v1.executor.ray_utils import WORKER_SPECIFIC_ENV_VARS
+from vllm.v1.kv_offload.flush_on_stop import engine_stop_grace_sec
 from vllm.v1.utils import _SubprocessWrapper, get_engine_client_zmq_addr, shutdown
 
 if TYPE_CHECKING:
@@ -253,6 +254,9 @@ class CoreEngineProcManager:
         tensor_queue: Queue | None = None,
     ):
         self._request_shutdown_timeout = vllm_config.shutdown_timeout
+        # An engine that flushes its GPU KV cache on stop needs that long
+        # before it is force-killed (see vllm/v1/kv_offload/flush_on_stop.py).
+        self._stop_grace = engine_stop_grace_sec(vllm_config)
         context = get_mp_context()
         common_kwargs = {
             "vllm_config": vllm_config,
@@ -345,6 +349,15 @@ class CoreEngineProcManager:
                     "cleanup grace after immediate request abort",
                     process_timeout,
                 )
+            if self._stop_grace and (
+                process_timeout is None or process_timeout < self._stop_grace
+            ):
+                logger.info(
+                    "[shutdown] EngineCore process manager: waiting up to %.0fs "
+                    "for the KV flush on stop",
+                    self._stop_grace,
+                )
+                process_timeout = self._stop_grace
             shutdown(self.processes, timeout=process_timeout)
 
     def monitor_engine_liveness(self) -> None:

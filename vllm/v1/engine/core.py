@@ -1660,6 +1660,16 @@ class EngineCoreProc(EngineCore):
                     )
 
             self.shutdown_state = EngineShutdownState.SHUTTING_DOWN
+            # A KV connector may write the GPU's cached conversations out
+            # before the engine exits; its pending work keeps the loop
+            # stepping (has_requests) until it is done or out of time.
+            connector = getattr(self.scheduler, "connector", None)
+            flush = getattr(connector, "request_flush_on_stop", None)
+            if flush is not None:
+                try:
+                    flush()
+                except Exception:
+                    logger.exception("[shutdown] EngineCore: KV flush on stop failed")
 
         # Exit when no work remaining
         if not self.has_work():

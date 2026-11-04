@@ -236,6 +236,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.has_pending_push_work()
 
+    def request_flush_on_stop(self) -> None:
+        """The engine is stopping: write the GPU's cached conversations to
+        the pool before it exits (see vllm/v1/kv_offload/flush_on_stop.py)."""
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.request_flush_on_stop()
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
