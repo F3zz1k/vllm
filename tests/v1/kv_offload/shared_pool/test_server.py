@@ -339,6 +339,16 @@ def test_whole_runs_are_evicted_oldest_first():
     assert cls.counters["runs_evicted"] == 1
 
 
+def test_a_touched_run_outlives_a_run_stored_after_it():
+    # The band touches a run whose GPU copy left: the pool's only copy goes last.
+    arena, _, a, _ = single(rows=5)
+    store(arena, a, [key(1), key(2)], key(2))
+    store(arena, a, [key(3), key(4)], key(4))
+    arena.touch(a, [key(1)])
+    res = arena.prepare_store(a, [key(5), key(6)], key(6))
+    assert res is not None and sorted(res[2]) == [key(3), key(4)]
+
+
 def test_offered_run_is_never_evicted_for_itself():
     arena, _, a, _ = single(rows=2)
     store(arena, a, [key(1), key(2)], key(2))

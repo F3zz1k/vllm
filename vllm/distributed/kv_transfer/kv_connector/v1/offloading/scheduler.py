@@ -755,6 +755,9 @@ class OffloadingConnectorScheduler:
         self._wb_inflight: set[OffloadKey] = set()
         self._wb_refused: dict[OffloadKey, float] = {}
         self._wb_rescue: list[tuple[OffloadKey, OffloadKey, int, int]] = []
+        # Run tag -> one of its keys, for runs whose GPU copy left this step:
+        # touched in the pool once per step, so they become newest there.
+        self._wb_left: dict[OffloadKey, OffloadKey] = {}
         # job id -> (submit time, blocks); copy latency EWMA (s) and max.
         self._wb_submitted: dict[int, tuple[float, int]] = {}
         self._wb_latency = 0.2
@@ -1298,7 +1301,10 @@ class OffloadingConnectorScheduler:
         """BlockPool hook: a hashed block is being reused. A member of a known
         run that the pool does not hold is lost (the band never waits for it);
         with WRITE_BACK_RESCUE set, up to that many per step are copied out
-        instead, and the step's forward waits for the copy (bounded wait)."""
+        instead, and the step's forward waits for the copy (bounded wait). A
+        member the pool holds makes its run the pool's only copy: it is
+        touched there (newest), so the pool evicts runs the GPU still holds
+        first."""
         key = OffloadKey(bytes(block.block_hash))
         tag = self._key_run.get(key)
         if tag is None:
@@ -1306,6 +1312,8 @@ class OffloadingConnectorScheduler:
             return
         if key in self._pool_has or key in self._wb_inflight:
             self._wb_counts["evict_copied"] += 1
+            if key in self._pool_has:
+                self._wb_left.setdefault(tag, key)
             return
         if len(self._wb_rescue) < WRITE_BACK_RESCUE:
             config_idx = self._config_idx_by_group.get(get_offload_group_idx(key))
@@ -1364,6 +1372,9 @@ class OffloadingConnectorScheduler:
         budget = min(WRITE_BACK_MAX_HELD, int((free + held) * WRITE_BACK_FREE_SHARE)) - held
         lead = self._band_lead(now)
         self._wb_lead = lead
+        if self._wb_left:
+            self.manager.touch(list(self._wb_left.values()), None)
+            self._wb_left.clear()
         if budget <= 0:
             if self._wb_held:
                 self._wb_counts["step_budget_full"] += 1
@@ -1393,9 +1404,13 @@ class OffloadingConnectorScheduler:
                 if refused is not None and now - refused < WRITE_BACK_REFUSED_BACKOFF_S:
                     continue
                 members = self._run_members(tag, config_idx_by_group)
-                if not members:
+                # Only members the pool lacks are held and copied. With none,
+                # skip: a re-offer would make a run the GPU still holds newest
+                # in the pool, ahead of runs only the pool holds.
+                need = sum(1 for m in members if m[0] not in self._pool_has)
+                if not need:
                     continue
-                if taken + len(members) > budget:
+                if taken + need > budget:
                     # A run larger than the whole budget is written alone
                     # once nothing else is held, rather than never.
                     if taken or self._wb_held:
@@ -1410,8 +1425,9 @@ class OffloadingConnectorScheduler:
                 if found is None:
                     continue
                 members = [(key, *found)]
+                need = 1
             units.append((tag, members))
-            taken += len(members)
+            taken += need
 
         store_jobs = rescue_jobs
         for tag, members in units:

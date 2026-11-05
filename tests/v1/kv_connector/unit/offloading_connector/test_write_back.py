@@ -613,3 +613,43 @@ def test_a_refused_run_with_stale_pool_keys_is_retrimmed_at_once(band, monkeypat
     assert sorted(_src_blocks(jobs)) == [2, 3, 6]
     assert scheduler._wb_counts["store_refused_retrimmed"] == 1
     assert scheduler._wb_counts["store_refused"] == 0
+
+
+# --- 2026-11-04: the pool evicts runs the GPU still holds first ---
+
+
+def test_a_run_the_pool_holds_whole_is_not_offered_again(band):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    scheduler._note_in_pool(chain)
+    scheduler.manager.prepare_store_run = MagicMock()
+    # A re-offer would only make the run newest in the pool.
+    assert scheduler._build_write_back_jobs() == {}
+    scheduler.manager.prepare_store_run.assert_not_called()
+
+
+def test_the_budget_counts_only_members_the_pool_lacks(band, monkeypatch):
+    scheduler, pool, blocks = band
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 2)
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))  # 3 members, the root in the pool
+    scheduler._note_in_pool(chain[:1])
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: _cpu_store_output([k for k in keys if k != chain[0]]))
+    jobs = scheduler._build_write_back_jobs()
+    assert sorted(_src_blocks(jobs)) == [3, 6]
+    assert scheduler._wb_counts["run_oversize"] == 0
+
+
+def test_a_member_leaving_the_gpu_makes_its_run_newest_in_the_pool(band):
+    scheduler, pool, blocks = band
+    chain = _register_run(scheduler, blocks, (1, 2))
+    scheduler._note_in_pool(chain[1:])
+    scheduler._on_gpu_evict(blocks[1])      # not in the pool: lost, nothing to touch
+    scheduler._on_gpu_evict(blocks[2])      # in the pool: now its only copy
+    scheduler.manager.touch.reset_mock()
+    scheduler._build_write_back_jobs()
+    scheduler.manager.touch.assert_called_once_with([chain[1]], None)
+    scheduler._build_write_back_jobs()
+    scheduler.manager.touch.assert_called_once()
