@@ -1198,7 +1198,9 @@ class CircularBufferManager(FullAttentionManager):
         apply_admission_cap: bool = False,
         prefill_end: int = 0,
     ) -> int:
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        if self.req_to_blocks.get(request_id):
+            return 0
+        return 1 + self._get_num_evictable_blocks(new_computed_blocks)
 
     def allocate_new_blocks(
         self, request_id: str, num_tokens: int, num_tokens_main_model: int
@@ -1246,7 +1248,17 @@ class CircularBufferManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        return
+        """Only a finish-checkpoint hit hands over a block: the finished
+        request's ring, holding the open compression group's keys. The new
+        ring is a copy of it (not zeroed); both endpoints stay retained until
+        the copy has run, as for a partial-hit copy-on-write."""
+        if not new_computed_blocks:
+            return
+        (source_block,) = new_computed_blocks
+        self.block_pool.touch([source_block])
+        (ring_block,) = self._claim_ring_block(request_id, record_for_zeroing=False)
+        self._pending_cow_copies.append((source_block, ring_block))
+        ring_block.ref_cnt += 1
 
     def remove_skipped_blocks(
         self,

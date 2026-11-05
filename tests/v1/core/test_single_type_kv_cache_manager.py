@@ -363,17 +363,20 @@ def test_circular_buffer_allocates_one_block_for_the_request_lifetime():
     )
     request_id = "request"
 
-    assert (
-        manager.get_num_blocks_to_allocate(
-            request_id,
-            num_tokens=128,
-            new_computed_blocks=[block_pool.blocks[1]],
-            total_computed_tokens=0,
-            num_local_computed_tokens=0,
-            num_tokens_main_model=128,
+    for computed, expected in (([], 1), ([block_pool.blocks[1]], 2)):
+        # A finish-checkpoint hit hands over the finished request's ring: the
+        # fresh ring plus the touched (evictable) source.
+        assert (
+            manager.get_num_blocks_to_allocate(
+                request_id,
+                num_tokens=128,
+                new_computed_blocks=computed,
+                total_computed_tokens=0,
+                num_local_computed_tokens=0,
+                num_tokens_main_model=128,
+            )
+            == expected
         )
-        == 1
-    )
     blocks = manager.allocate_new_blocks(
         request_id, num_tokens=128, num_tokens_main_model=128
     )

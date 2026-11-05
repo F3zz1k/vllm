@@ -25,9 +25,11 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
+    CircularBufferManager,
     FullAttentionManager,
     MambaManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -214,25 +216,28 @@ class KVCacheManager:
                     manager.shared_prefix_checkpoint = True
         self.mamba_finish_checkpoint = enable_mamba_finish_checkpoint
         if enable_mamba_finish_checkpoint:
-            # The KV cache groups and block sizes are only known here.
+            # The KV cache groups and block sizes are only known here. A hit
+            # ends inside a block whatever the prefix match unit: its shared
+            # tail block is privatised by the partial-hit copy-on-write, which
+            # keys on the block offset, so partial hash hits are not needed.
+            # A circular buffer (the QSA ring) is copied from the finished
+            # request's ring on a hit (CircularBufferManager).
             coordinator = self.coordinator
             if not (
                 isinstance(coordinator, HybridKVCacheCoordinator)
                 and coordinator.full_attention_group_id is not None
                 and all(
-                    type(manager) in (FullAttentionManager, MambaManager)
-                    for manager in coordinator.single_type_managers
+                    type(manager)
+                    in (FullAttentionManager, MambaManager, SlidingWindowManager)
                     if manager.kv_cache_spec.prefix_cacheable
+                    else type(manager) is CircularBufferManager
+                    for manager in coordinator.single_type_managers
                 )
             ):
                 raise ValueError(
                     "--enable-mamba-finish-checkpoint supports only models whose "
-                    "KV cache groups are full attention and Mamba."
-                )
-            if not coordinator.enable_partial_hash_hits:
-                raise ValueError(
-                    "--enable-mamba-finish-checkpoint requires a prefix match "
-                    "unit smaller than the Mamba block size."
+                    "KV cache groups are full attention, sliding window, Mamba "
+                    "and circular buffers."
                 )
         self.caching_hash_fn = caching_hash_fn
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
@@ -437,29 +442,72 @@ class KVCacheManager:
             if num_computed_tokens + 1 < tail_start + length <= request.num_tokens
         )
         for end, tail_start in reversed(tails):
-            tail_hash = self._finish_tail_hash(request, tail_start, end)
-            hit_blocks: list[list[KVCacheBlock]] = [
-                [] for _ in range(self.num_kv_cache_groups)
-            ]
-            for spec, group_ids, _, _ in coordinator.attention_groups:
-                tail_blocks = self.block_pool.get_cached_block(tail_hash, group_ids)
-                if tail_blocks is None:
-                    break
-                for group_id, tail_block in zip(group_ids, tail_blocks):
-                    num_blocks = (end - 2) // coordinator.group_block_sizes[group_id]
-                    if isinstance(spec, MambaSpec):
-                        prefix = [self.block_pool.null_block] * num_blocks
-                    else:
-                        prefix = anchor_blocks[group_id][:num_blocks]
-                    hit_blocks[group_id] = [*prefix, tail_block]
-            else:
+            hit_blocks = self._finish_tail_blocks(
+                request, self._finish_tail_hash(request, tail_start, end), end,
+                anchor_blocks,
+            )
+            if hit_blocks is not None:
                 logger.debug(
                     "Request %s hit a finished request's tail at %d tokens.",
                     request.request_id,
                     end - 1,
                 )
-                return tuple(hit_blocks), end - 1
+                return hit_blocks, end - 1
         return None
+
+    def _finish_tail_blocks(
+        self,
+        request: Request,
+        tail_hash: BlockHash,
+        end: int,
+        anchor_blocks: list[list[KVCacheBlock]],
+    ) -> tuple[list[KVCacheBlock], ...] | None:
+        """Every group's blocks for a resume at ``end - 1`` from the tail
+        ``tail_hash``, or None if any is gone: Mamba nulls then the tail, full
+        attention its anchor then the tail, a sliding window nulls, the window
+        before the tail and the tail, a circular buffer its kept ring."""
+        coordinator = self.coordinator
+        pool = self.block_pool
+        hash_block_size = pool.hash_block_size
+        hit_blocks: list[list[KVCacheBlock]] = [[] for _ in range(self.num_kv_cache_groups)]
+        for spec, group_ids, _, _ in coordinator.attention_groups:
+            tail_blocks = pool.get_cached_block(tail_hash, group_ids)
+            if tail_blocks is None:
+                return None
+            for group_id, tail_block in zip(group_ids, tail_blocks):
+                manager = coordinator.single_type_managers[group_id]
+                num_blocks = (end - 2) // manager.block_size
+                if isinstance(spec, MambaSpec):
+                    prefix = [pool.null_block] * num_blocks
+                elif isinstance(manager, SlidingWindowManager):
+                    first = self._finish_window_start(manager, end - 1)
+                    prefix = [pool.null_block] * first
+                    for j in range(first, num_blocks):
+                        found = pool.get_cached_block(
+                            request.block_hashes[(j + 1) * manager.block_size // hash_block_size - 1],
+                            [group_id],
+                        )
+                        if found is None:
+                            return None
+                        prefix.append(found[0])
+                else:
+                    prefix = anchor_blocks[group_id][:num_blocks]
+                hit_blocks[group_id] = [*prefix, tail_block]
+        for group_id, manager in enumerate(coordinator.single_type_managers):
+            if isinstance(manager, CircularBufferManager):
+                ring = pool.get_cached_block(tail_hash, [group_id])
+                if ring is None:
+                    return None
+                hit_blocks[group_id] = list(ring)
+        return tuple(hit_blocks)
+
+    @staticmethod
+    def _finish_window_start(manager: SingleTypeKVCacheManager, num_computed: int) -> int:
+        """First block a resume at ``num_computed`` tokens reads besides the
+        tail block: the window start for a sliding window, else the tail."""
+        if isinstance(manager, SlidingWindowManager):
+            return manager.get_num_skipped_tokens(num_computed) // manager.block_size
+        return (num_computed - 1) // manager.block_size
 
     def cache_finished_request(self, request: Request) -> None:
         """Register the final state of a request that finished on its EOS, a
@@ -470,7 +518,10 @@ class KVCacheManager:
         the attention block holding the same position get a tail key covering
         the tokens after the last full prefix match unit, the last token
         included, and full attention also registers that unit as a lookup-only
-        entry. Must run before the request's blocks are freed.
+        entry. A sliding-window group also registers the in-window blocks
+        before the tail under their own keys, and a circular buffer (the ring
+        of the open compression group) is kept under the tail key whole. Must
+        run before the request's blocks are freed.
         """
         params = request.sampling_params
         if params is None or finish_stop_token_ids(params) is None:
@@ -481,17 +532,44 @@ class KVCacheManager:
         start = round_down(num_tokens - 1, hash_block_size)
         tail_blocks: list[tuple[SingleTypeKVCacheManager, list[KVCacheBlock]]] = []
         for manager in self.coordinator.single_type_managers:
+            blocks = manager.req_to_blocks.get(request.request_id, [])
+            if isinstance(manager, CircularBufferManager):
+                if len(blocks) != 1:
+                    return
+                tail_blocks.append((manager, blocks))
+                continue
             if not manager.kv_cache_spec.prefix_cacheable:
                 continue
-            blocks = manager.req_to_blocks.get(request.request_id, [])
             block_idx = (num_tokens - 2) // manager.block_size
-            if block_idx >= len(blocks) or blocks[block_idx].is_null:
+            first = self._finish_window_start(manager, num_tokens - 1)
+            if block_idx >= len(blocks) or any(
+                block.is_null for block in blocks[first : block_idx + 1]
+            ):
                 return
             tail_blocks.append((manager, blocks))
 
         tail_hash = self._finish_tail_hash(request, start, num_tokens)
         tail = (self._finish_tail_parent(request, start), num_tokens - start)
         for manager, blocks in tail_blocks:
+            if isinstance(manager, CircularBufferManager):
+                self.block_pool.cache_finish_tail(
+                    make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id),
+                    blocks[0],
+                    tail,
+                )
+                continue
+            if isinstance(manager, SlidingWindowManager):
+                block_idx = (num_tokens - 2) // manager.block_size
+                for j in range(self._finish_window_start(manager, num_tokens - 1), block_idx):
+                    self.block_pool.cache_finish_tail(
+                        make_block_hash_with_group_id(
+                            request.block_hashes[
+                                (j + 1) * manager.block_size // hash_block_size - 1
+                            ],
+                            manager.kv_cache_group_id,
+                        ),
+                        blocks[j],
+                    )
             if isinstance(manager, FullAttentionManager) and start:
                 self.block_pool.cache_finish_tail(
                     make_block_hash_with_group_id(
