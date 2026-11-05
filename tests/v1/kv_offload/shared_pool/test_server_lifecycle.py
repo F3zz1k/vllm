@@ -556,19 +556,6 @@ def test_start_adopts_a_mapped_arena_and_removes_an_unmapped_one(tmp_path):
         srv.stop()
 
 
-def test_server_removes_stale_regions_but_not_the_arena(tmp_path):
-    stale = tmp_path / "vllm_kvpool_qwen3.8-27b.mmap"
-    stale.write_bytes(b"x" * ROW)
-    other = tmp_path / "vllm_offload_engine.mmap"
-    other.write_bytes(b"y")
-    srv = S.PoolServer(str(tmp_path / "s.sock"), {"p": {}}, arena_cfg(tmp_path),
-                       shm_dir=str(tmp_path))
-    arena = tmp_path / "vllm_kvpool_joint.mmap"
-    arena.write_bytes(b"z")
-    assert srv.remove_stale_regions() == 1
-    assert not stale.exists() and arena.exists() and other.exists()
-
-
 def test_spill_load_removes_files_the_manifest_does_not_name(tmp_path):
     spill = tmp_path / "spill"
     (spill / "p_L" / "abc").mkdir(parents=True)

@@ -2746,23 +2746,7 @@ class PoolServer:
         self._drain()
         self._process(conn, requests)
 
-    def remove_stale_regions(self) -> int:
-        """Delete the region files of the per-model pools the arena replaces
-        (and of the first deployment's per-generation names). An engine still
-        mapping one keeps its pages until it exits."""
-        keep = os.path.basename(self.arena_path)
-        removed = 0
-        for name in os.listdir(self.shm_dir):
-            if name.startswith("vllm_kvpool_") and name.endswith(".mmap") and name != keep:
-                path = os.path.join(self.shm_dir, name)
-                size = os.path.getsize(path)
-                os.unlink(path)
-                removed += 1
-                logger.info("removed stale region %s (%.2f GiB)", path, size / (1 << 30))
-        return removed
-
     def serve_forever(self, log_interval: float = 60.0) -> None:
-        self.remove_stale_regions()
         self.spill.load()
         self.adopt_or_clear()
         try:
