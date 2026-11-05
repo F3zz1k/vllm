@@ -38,16 +38,15 @@ class FakeGPUPool:
     """The two BlockPool members the band uses, with BlockPool.touch semantics."""
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        self.blocks = blocks
         self.free_block_queue = FreeKVCacheBlockQueue(blocks)
 
     def get_cached_block(self, block_hash, group_ids):
-        node = self.free_block_queue.fake_free_list_head.next_free_block
-        while node is not self.free_block_queue.fake_free_list_tail:
-            if node.block_hash is not None and bytes(node.block_hash) == bytes(
-                make_block_hash_with_group_id(block_hash, group_ids[0])
-            ):
-                return [node]
-            node = node.next_free_block
+        # Like BlockPool: any hashed block, in use or free.
+        want = bytes(make_block_hash_with_group_id(block_hash, group_ids[0]))
+        for block in self.blocks:
+            if block.block_hash is not None and bytes(block.block_hash) == want:
+                return [block]
         return None
 
     def get_num_free_blocks(self):
@@ -653,3 +652,61 @@ def test_a_member_leaving_the_gpu_makes_its_run_newest_in_the_pool(band):
     scheduler.manager.touch.assert_called_once_with([chain[1]], None)
     scheduler._build_write_back_jobs()
     scheduler.manager.touch.assert_called_once()
+
+
+# --- 2026-11-04: a finished run is pinned until the band copies it ---
+
+
+def _pin_chain(scheduler, monkeypatch, chain):
+    monkeypatch.setattr(scheduler, "_run_tag", lambda by_group: chain[-1])
+    monkeypatch.setattr(scheduler, "_restore_chain", lambda by_group, **kw: chain)
+    scheduler._pin_finished(SimpleNamespace(group_states=[]))
+
+
+def test_a_finished_run_is_pinned_until_the_band_copies_it(band, monkeypatch):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    run = [blocks[i] for i in (1, 2, 5)]
+    pool.touch(run)                              # the finishing request holds them
+    chain = [OffloadKey(bytes(b.block_hash)) for b in run]
+    _pin_chain(scheduler, monkeypatch, chain)
+    for b in run:                                # the scheduler frees them
+        b.ref_cnt -= 1
+    # Pinned: out of the free queue, so this step's allocations cannot reuse them.
+    assert all(b.ref_cnt == 1 for b in run) and not {2, 3, 6} & set(_queue_ids(pool))
+    _register_run(scheduler, blocks, (1, 2, 5))  # recorded at the end of the next step
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+    jobs = scheduler._build_write_back_jobs()
+    assert sorted(_src_blocks(jobs)) == [2, 3, 6]
+    # The copy job holds them now; the pins are gone.
+    assert not scheduler._wb_pinned and all(b.ref_cnt == 1 for b in run)
+
+
+def test_a_pinned_run_never_recorded_is_released(band, monkeypatch):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True               # no lone-block stores
+    run = [blocks[1], blocks[2]]
+    pool.touch(run)
+    _pin_chain(scheduler, monkeypatch, [OffloadKey(bytes(b.block_hash)) for b in run])
+    for b in run:
+        b.ref_cnt -= 1
+    clock = [100.0]
+    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: clock[0])
+    scheduler._wb_pinned = {t: (clock[0], bs) for t, (_, bs) in scheduler._wb_pinned.items()}
+    scheduler._build_write_back_jobs()
+    assert scheduler._wb_pinned                  # waits for the run to be recorded
+    clock[0] += sched_mod.WRITE_BACK_PIN_S + 1
+    scheduler._build_write_back_jobs()
+    assert not scheduler._wb_pinned and all(b.ref_cnt == 0 for b in run)
+    assert _queue_ids(pool)[-2:] == [2, 3]       # back at the tail: the pool lacks them
+
+
+def test_a_run_member_in_use_on_the_gpu_is_not_missing(band):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    pool.touch([blocks[2]])                      # a running request reads it
+    members = scheduler._run_members(chain[-1], scheduler._config_idx_by_group)
+    assert sorted(m[1].block_id for m in members) == [2, 6]
+    assert chain[-1] in scheduler._run_keys and not scheduler._wb_counts["run_broken_trimmed"]

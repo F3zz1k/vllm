@@ -104,6 +104,8 @@ WRITE_BACK_RESCUE = int(os.environ.get("VLLM_KV_WRITE_BACK_RESCUE", "0"))
 WRITE_BACK_PROMPT_BOUNDARY = (
     os.environ.get("VLLM_KV_WRITE_BACK_PROMPT_BOUNDARY", "1") == "1"
 )
+# A finished run's pins are dropped if it is not recorded within this long.
+WRITE_BACK_PIN_S = 5.0
 # Bounds of the band's bookkeeping maps.
 _STATE_SETS_MAX = 1 << 16
 _POOL_HAS_MAX = 1 << 18
@@ -758,6 +760,11 @@ class OffloadingConnectorScheduler:
         # Run tag -> one of its keys, for runs whose GPU copy left this step:
         # touched in the pool once per step, so they become newest there.
         self._wb_left: dict[OffloadKey, OffloadKey] = {}
+        # Finished runs pinned until the band copies them (see _pin_finished):
+        # tag -> (pin time, blocks).
+        self._wb_pinned: dict[OffloadKey, tuple[float, list[Any]]] = {}
+        self._wb_pinned_ids: set[int] = set()
+        self._wb_pinned_n = 0
         # job id -> (submit time, blocks); copy latency EWMA (s) and max.
         self._wb_submitted: dict[int, tuple[float, int]] = {}
         self._wb_latency = 0.2
@@ -1007,12 +1014,8 @@ class OffloadingConnectorScheduler:
         fraction = free_fraction() if free_fraction is not None else None
         return fraction is None or fraction >= WRITE_THROUGH_MIN_FREE
 
-    def _record_run(self, req_status: "RequestOffloadState") -> None:
-        """Name a finished request's run after its conversation (the request's
-        last attention key): a manager that tags runs moves what the request
-        stored into it; with the band on, remember what a restore of it reads
-        (see _restore_chain) so the band can write exactly that, whole."""
-        by_group = [gs.offload_keys for gs in req_status.group_states]
+    def _run_tag(self, by_group: list[list[OffloadKey]]) -> OffloadKey | None:
+        """A run's tag: the request's last attention key (its conversation)."""
         attn = next(
             (
                 keys
@@ -1025,9 +1028,69 @@ class OffloadingConnectorScheduler:
             ),
             None,
         )
-        if not attn:
+        return attn[-1] if attn else None
+
+    def _pin_finished(self, req_status: "RequestOffloadState") -> None:
+        """Pin (one extra reference) the GPU blocks of a finishing request's
+        run that the pool lacks, before the scheduler frees them. The run is
+        recorded only at the end of the next schedule step, after that step's
+        allocations, which under pressure reuse the freed blocks first: the
+        run then broke and its conversation was lost (2026-11-04). The band
+        copies a pinned run in its next step, whatever its budget."""
+        by_group = [gs.offload_keys for gs in req_status.group_states]
+        tag = self._run_tag(by_group)
+        if tag is None or tag in self._wb_pinned:
             return
-        tag = attn[-1]
+        pool = self._gpu_block_pool
+        chain = self._restore_chain(
+            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k)
+        )
+        blocks = []
+        for key in chain:
+            if key in self._pool_has or key in self._wb_inflight:
+                continue
+            found = pool.get_cached_block(
+                BlockHash(bytes(key)[:-4]), [get_offload_group_idx(key)]
+            )
+            if found:
+                blocks.append(found[0])
+        if not blocks:
+            return
+        if self._wb_pinned_n + len(blocks) > WRITE_BACK_MAX_HELD:
+            self._wb_counts["pin_over_cap"] += 1
+            return
+        pool.touch(blocks)
+        self._wb_pinned[tag] = (time.monotonic(), blocks)
+        self._wb_pinned_n += len(blocks)
+        self._wb_pinned_ids.update(b.block_id for b in blocks)
+        self._wb_counts["runs_pinned"] += 1
+
+    def _unpin(self, tag: OffloadKey) -> None:
+        """Drop a run's pins. A block left unreferenced returns to the free
+        queue: at the head if the pool holds it, else at the tail."""
+        entry = self._wb_pinned.pop(tag, None)
+        if entry is None:
+            return
+        queue = self._gpu_block_pool.free_block_queue
+        self._wb_pinned_n -= len(entry[1])
+        for block in entry[1]:
+            self._wb_pinned_ids.discard(block.block_id)
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                if OffloadKey(bytes(block.block_hash)) in self._pool_has:
+                    queue.prepend_n([block])
+                else:
+                    queue.append_n([block])
+
+    def _record_run(self, req_status: "RequestOffloadState") -> None:
+        """Name a finished request's run after its conversation (the request's
+        last attention key): a manager that tags runs moves what the request
+        stored into it; with the band on, remember what a restore of it reads
+        (see _restore_chain) so the band can write exactly that, whole."""
+        by_group = [gs.offload_keys for gs in req_status.group_states]
+        tag = self._run_tag(by_group)
+        if tag is None:
+            return
         merge_tag = getattr(self.manager, "merge_tag", None)
         if merge_tag is not None:
             merge_tag(req_status.req_context, tag)
@@ -1073,8 +1136,8 @@ class OffloadingConnectorScheduler:
                 found = self._storable_free_block(run_key, config_idx_by_group)
                 if found is not None:
                     members.append((run_key, *found))
-                elif run_key not in self._pool_has:
-                    missing.append(run_key)
+                elif run_key not in self._pool_has and not self._gpu_has(run_key):
+                    missing.append(run_key)  # in use on the GPU is not missing
             if not missing:
                 return members
             by_group = self._run_by_group.get(tag)
@@ -1244,7 +1307,8 @@ class OffloadingConnectorScheduler:
 
     def _storable_free_block(self, key: OffloadKey, config_idx_by_group: dict[int, int]):
         """(block, config_idx, num_tokens) for key if its GPU block is free (settled,
-        the next eviction candidates) and chunk-aligned; else None."""
+        the next eviction candidates, or held only by a pin) and chunk-aligned;
+        else None."""
         group = int.from_bytes(bytes(key)[-4:], "big")
         config_idx = config_idx_by_group.get(group)
         if config_idx is None:
@@ -1254,7 +1318,10 @@ class OffloadingConnectorScheduler:
             return None
         block = found[0]
         num_tokens = block.block_hash_num_tokens
-        if (block.ref_cnt != 0 or not num_tokens
+        free = block.ref_cnt == 0 or (
+            block.ref_cnt == 1 and block.block_id in self._wb_pinned_ids
+        )
+        if (not free or not num_tokens
                 or num_tokens % self.config.kv_group_configs[config_idx].tokens_per_chunk):
             return None
         return block, config_idx, num_tokens
@@ -1375,15 +1442,26 @@ class OffloadingConnectorScheduler:
         if self._wb_left:
             self.manager.touch(list(self._wb_left.values()), None)
             self._wb_left.clear()
-        if budget <= 0:
-            if self._wb_held:
-                self._wb_counts["step_budget_full"] += 1
-            return rescue_jobs
         config_idx_by_group = self._config_idx_by_group
-        queue = pool.free_block_queue
-        node = queue.fake_free_list_head.next_free_block
         units: list[tuple[OffloadKey | None, list]] = []
         seen_runs: set[OffloadKey] = set()
+        # Pinned finished runs first, outside the budget: their blocks are out
+        # of the free queue already. Pins end after this step's copy jobs.
+        pinned = []
+        for tag, (pinned_at, _) in list(self._wb_pinned.items()):
+            if tag not in self._run_keys:
+                if now - pinned_at > WRITE_BACK_PIN_S:
+                    self._unpin(tag)  # never recorded, or dropped
+                continue
+            pinned.append(tag)
+            seen_runs.add(tag)
+            members = self._run_members(tag, config_idx_by_group)
+            if any(m[0] not in self._pool_has for m in members):
+                units.append((tag, members))
+        if budget <= 0 and self._wb_held:
+            self._wb_counts["step_budget_full"] += 1
+        queue = pool.free_block_queue
+        node = queue.fake_free_list_head.next_free_block
         taken = 0
         for _ in range(lead):
             if node is None or node is queue.fake_free_list_tail or taken >= budget:
@@ -1485,6 +1563,8 @@ class OffloadingConnectorScheduler:
             job_id, job = self._band_job(new, store_output, now)
             self._wb_held[job_id] = [m[1] for m in new]
             store_jobs[job_id] = job
+        for tag in pinned:
+            self._unpin(tag)  # its copy jobs hold what they copy
         return store_jobs
 
     def _band_job(
@@ -3454,6 +3534,8 @@ class OffloadingConnectorScheduler:
         # Update offload keys with final block hash so _build_store_jobs can
         # create store jobs for the last block(s) on the next schedule step.
         req_status.update_offload_keys()
+        if WRITE_BACK and self._gpu_block_pool is not None:
+            self._pin_finished(req_status)
 
         # Keep req_status alive: _build_store_jobs will process finished_req_ids
         # on the next step and handle cleanup after creating store jobs.
@@ -3511,6 +3593,8 @@ class OffloadingConnectorScheduler:
         self._stale_job_threshold = self._job_counter
         for job_id in list(self._wb_held):
             self._release_write_back(job_id)
+        for tag in list(self._wb_pinned):
+            self._unpin(tag)
         self._wb_written.clear()
         self._wb_inflight.clear()
         self._wb_submitted.clear()
