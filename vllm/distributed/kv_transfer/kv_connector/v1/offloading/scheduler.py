@@ -1509,7 +1509,7 @@ class OffloadingConnectorScheduler:
 
         store_jobs = rescue_jobs
         for tag, members in units:
-            keys = [m[0] for m in members]
+            keys = self._offer_keys(tag, members)
             if hasattr(self.manager, "prepare_store_run"):
                 # A known run is a whole conversation; a block of no known
                 # run is stored alone, as a run of its own.
@@ -1534,7 +1534,7 @@ class OffloadingConnectorScheduler:
                     retry = self._run_members(tag, config_idx_by_group)
                     if retry:
                         members = retry
-                        keys = [m[0] for m in members]
+                        keys = self._offer_keys(tag, members)
                         store_output = self._prepare_store_run(keys, tag, whole=True)
             if store_output is None:
                 self._wb_counts["store_refused"] += 1
@@ -1566,6 +1566,17 @@ class OffloadingConnectorScheduler:
         for tag in pinned:
             self._unpin(tag)  # its copy jobs hold what they copy
         return store_jobs
+
+    def _offer_keys(self, tag: OffloadKey | None, members: list) -> list[OffloadKey]:
+        """The keys a band store offers: the members it copies and, for a run,
+        the chain keys the pool already holds, so they join the run. Left out,
+        they stayed only in the conversation's older runs and left the pool
+        with the oldest of them (2026-11-04)."""
+        keys = [m[0] for m in members]
+        if tag is None:
+            return keys
+        copying = set(keys)
+        return [k for k in self._run_keys.get(tag, ()) if k in copying or k in self._pool_has]
 
     def _band_job(
         self, members: list[tuple[OffloadKey, Any, int, int]], store_output: Any, now: float

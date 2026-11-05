@@ -736,3 +736,22 @@ def test_a_boundary_hand_off_stores_the_whole_sliding_window(monkeypatch):
     jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 98, boundary)]})
     srcs = sorted(j.src_spec.block_ids.tolist()[0] for j in jobs.values())
     assert srcs == sorted([98] + [41 + e // tpb - 1 for e in (boundary, tpc)])
+
+
+def test_a_run_store_joins_the_chain_keys_the_pool_already_holds(band):
+    # A chain key the GPU no longer holds but the pool does is offered too,
+    # so it joins the run instead of living only in an older run (2026-11-04).
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    only_in_pool = _hkey(7, scheduler.config.kv_group_configs[0].group_idx)
+    chain = [only_in_pool] + [OffloadKey(bytes(blocks[i].block_hash)) for i in (2, 5)]
+    scheduler._run_keys[chain[-1]] = chain
+    for k in chain:
+        scheduler._key_run[k] = chain[-1]
+    scheduler._note_in_pool([only_in_pool])
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: _cpu_store_output([k for k in keys if k != only_in_pool]))
+    jobs = scheduler._build_write_back_jobs()
+    (keys, tag), kwargs = scheduler.manager.prepare_store_run.call_args
+    assert list(keys) == chain and tag == chain[-1] and kwargs["whole"]
+    assert sorted(_src_blocks(jobs)) == [3, 6]       # only what the pool lacks is copied
