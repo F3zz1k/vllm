@@ -1542,6 +1542,7 @@ class OffloadingConnectorScheduler:
                     self._wb_refused[tag] = now
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
                 continue
+            self._drop_unwritten(store_output, members)
             chunk_by_key = dict(
                 zip(store_output.keys_to_store, store_output.store_spec.block_ids.tolist())
             )
@@ -1577,6 +1578,19 @@ class OffloadingConnectorScheduler:
             return keys
         copying = set(keys)
         return [k for k in self._run_keys.get(tag, ()) if k in copying or k in self._pool_has]
+
+    def _drop_unwritten(self, store_output: Any, members: list) -> None:
+        """Release the rows a store allocated for keys no member writes: chain
+        keys offered as present that the pool had evicted meanwhile (another
+        engine's store, or the other model's in a joint arena). Left allocated
+        they stayed pending until this engine left the pool, and a restore of
+        the conversation could not read past them."""
+        written = {m[0] for m in members}
+        stale = [k for k in store_output.keys_to_store if k not in written]
+        if stale:
+            self._forget_in_pool(stale)
+            self.manager.complete_store(stale, None, success=False)
+            self._wb_counts["offered_evicted"] += len(stale)
 
     def _band_job(
         self, members: list[tuple[OffloadKey, Any, int, int]], store_output: Any, now: float
@@ -3303,48 +3317,64 @@ class OffloadingConnectorScheduler:
         """Every known run with free GPU blocks the pool lacks, as one whole
         tagged store each (what a restore of it reads, see _restore_chain).
 
-        Runs are chosen newest first while their new chunks fit the rows the
-        pool can admit without evicting a live run of this class (an
-        exclusive pool evicts its oldest run, which would be the newest one
-        flushed here). The chosen runs are stored oldest first, so the pool's
-        recency order matches the GPU's, and copied newest first, so the
-        newest are in the pool if the budget runs out."""
+        These are the newest conversations, so they displace the pool's older
+        runs like any band store. Runs still on the GPU are chosen newest
+        first while their chains (chunks to write and chunks the pool holds)
+        fit the rows the class can hold, including runs with nothing to write.
+        Before anything is allocated, the chosen runs' chunks in the pool are
+        touched: a load demotes the run it restores to the eviction head while
+        the GPU holds it (the server promotes it again only when this engine
+        leaves, after the flush), so without the touch the flush's own stores
+        evicted conversations the GPU is about to drop, or one chosen run's
+        store another's. The runs with chunks to write are stored oldest
+        first, each offering its whole chain so the held chunks join it,
+        which keeps the pool's recency order the GPU's, and copied newest
+        first, so the newest are in the pool if the budget runs out (a store
+        allocated but not copied by then is dropped with the engine)."""
         self._flush_state = "running"
         now = time.monotonic()
         config_idx_by_group = self._config_idx_by_group
-        admit_fn = getattr(self.manager, "pool_admit_rows", None)
-        admit = admit_fn() if admit_fn is not None else None
-        if not isinstance(admit, int):
-            admit = None
+        rows_fn = getattr(self.manager, "pool_flush_rows", None)
+        capacity = rows_fn() if rows_fn is not None else None
+        if not isinstance(capacity, int):
+            capacity = None
         counts = self._flush_counts
-        chosen: list[tuple[OffloadKey, list]] = []
+        chosen: list[tuple[OffloadKey, list, list[OffloadKey]]] = []
         seen: set[OffloadKey] = set()
         rows = 0
         for tag in reversed(list(self._run_keys)):
             if tag not in self._run_keys:
                 continue  # dropped by an earlier run's re-trim
             members = self._run_members(tag, config_idx_by_group)
-            if not members:
+            offer = self._offer_keys(tag, members)
+            if not members and not any(self._gpu_has(k) for k in offer):
                 counts["runs_nothing_to_write"] += 1
-                continue
-            new_rows = sum(1 for m in members if m[0] not in seen)
-            if admit is not None and rows + new_rows > admit:
+                continue  # off the GPU: its pool copy keeps its place
+            new_rows = sum(1 for k in offer if k not in seen)
+            if capacity is not None and rows + new_rows > capacity:
                 counts["runs_pool_full"] += 1
                 continue
             rows += new_rows
-            seen.update(m[0] for m in members)
-            chosen.append((tag, members))
+            seen.update(offer)
+            chosen.append((tag, members, offer))
+        copying = {m[0] for _, members, _ in chosen for m in members}
+        held = [k for _, _, offer in chosen for k in offer if k not in copying]
+        if held:
+            self.manager.touch(held, None)  # newest run's first: it ends newest
         jobs: list[tuple[int, TransferJob]] = []
         pool = self._gpu_block_pool
-        for order, (tag, members) in enumerate(reversed(chosen)):
-            keys = [m[0] for m in members]
+        for order, (tag, members, offer) in enumerate(reversed(chosen)):
+            if not members:
+                counts["runs_already_in_pool"] += 1
+                continue  # touched above, nothing to write
             if hasattr(self.manager, "prepare_store_run"):
-                store_output = self._prepare_store_run(keys, tag, whole=True)
+                store_output = self._prepare_store_run(offer, tag, whole=True)
             else:
-                store_output = self._prepare_store(keys, None)
+                store_output = self._prepare_store([m[0] for m in members], None)
             if store_output is None:
                 counts["runs_refused"] += 1
                 continue
+            self._drop_unwritten(store_output, members)
             chunk_by_key = dict(
                 zip(store_output.keys_to_store, store_output.store_spec.block_ids.tolist())
             )
@@ -3373,12 +3403,14 @@ class OffloadingConnectorScheduler:
         # Newest first: the worker submits store jobs in this order.
         jobs.reverse()
         logger.info(
-            "KV flush on stop: %d runs (%d blocks) submitted in %.2fs; admit "
-            "rows %s, %d runs left out (pool full), %d refused",
+            "KV flush on stop: %d runs (%d blocks) submitted in %.2fs; %d "
+            "held chunks touched, class capacity %s rows, %d runs left out "
+            "(over capacity), %d refused",
             counts["runs_submitted"],
             counts["blocks_submitted"],
             time.monotonic() - now,
-            admit,
+            len(held),
+            capacity,
             counts["runs_pool_full"],
             counts["runs_refused"],
         )
