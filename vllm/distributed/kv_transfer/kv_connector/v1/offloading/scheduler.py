@@ -761,8 +761,8 @@ class OffloadingConnectorScheduler:
         # touched in the pool once per step, so they become newest there.
         self._wb_left: dict[OffloadKey, OffloadKey] = {}
         # Finished runs pinned until the band copies them (see _pin_finished):
-        # tag -> (pin time, blocks).
-        self._wb_pinned: dict[OffloadKey, tuple[float, list[Any]]] = {}
+        # tag -> (pin time, [(key, block)]).
+        self._wb_pinned: dict[OffloadKey, tuple[float, list[tuple[OffloadKey, Any]]]] = {}
         self._wb_pinned_ids: set[int] = set()
         self._wb_pinned_n = 0
         # job id -> (submit time, blocks); copy latency EWMA (s) and max.
@@ -1045,7 +1045,7 @@ class OffloadingConnectorScheduler:
         chain = self._restore_chain(
             by_group, have=lambda k: k in self._pool_has or self._gpu_has(k)
         )
-        blocks = []
+        pins = []  # (key, block): a lookup-only alias block may carry no hash
         for key in chain:
             if key in self._pool_has or key in self._wb_inflight:
                 continue
@@ -1053,16 +1053,16 @@ class OffloadingConnectorScheduler:
                 BlockHash(bytes(key)[:-4]), [get_offload_group_idx(key)]
             )
             if found:
-                blocks.append(found[0])
-        if not blocks:
+                pins.append((key, found[0]))
+        if not pins:
             return
-        if self._wb_pinned_n + len(blocks) > WRITE_BACK_MAX_HELD:
+        if self._wb_pinned_n + len(pins) > WRITE_BACK_MAX_HELD:
             self._wb_counts["pin_over_cap"] += 1
             return
-        pool.touch(blocks)
-        self._wb_pinned[tag] = (time.monotonic(), blocks)
-        self._wb_pinned_n += len(blocks)
-        self._wb_pinned_ids.update(b.block_id for b in blocks)
+        pool.touch([block for _, block in pins])
+        self._wb_pinned[tag] = (time.monotonic(), pins)
+        self._wb_pinned_n += len(pins)
+        self._wb_pinned_ids.update(block.block_id for _, block in pins)
         self._wb_counts["runs_pinned"] += 1
 
     def _unpin(self, tag: OffloadKey) -> None:
@@ -1073,11 +1073,11 @@ class OffloadingConnectorScheduler:
             return
         queue = self._gpu_block_pool.free_block_queue
         self._wb_pinned_n -= len(entry[1])
-        for block in entry[1]:
+        for key, block in entry[1]:
             self._wb_pinned_ids.discard(block.block_id)
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                if OffloadKey(bytes(block.block_hash)) in self._pool_has:
+                if key in self._pool_has:
                     queue.prepend_n([block])
                 else:
                     queue.append_n([block])

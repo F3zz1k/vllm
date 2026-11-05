@@ -755,3 +755,19 @@ def test_a_run_store_joins_the_chain_keys_the_pool_already_holds(band):
     (keys, tag), kwargs = scheduler.manager.prepare_store_run.call_args
     assert list(keys) == chain and tag == chain[-1] and kwargs["whole"]
     assert sorted(_src_blocks(jobs)) == [3, 6]       # only what the pool lacks is copied
+
+
+def test_a_pinned_alias_block_without_its_own_hash_is_released(band, monkeypatch):
+    # The pool's map also holds lookup-only aliases (a finish-checkpoint anchor or
+    # tail): such a block can carry no hash of its own (2026-11-05 crash).
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    alias = KVCacheBlock(9)
+    key = OffloadKey(bytes(blocks[1].block_hash))
+    monkeypatch.setattr(pool, "get_cached_block", lambda h, g: [alias])
+    alias.ref_cnt = 1                            # the finishing request holds it
+    _pin_chain(scheduler, monkeypatch, [key])
+    alias.ref_cnt -= 1                           # the scheduler frees it
+    assert alias.block_hash is None and alias.ref_cnt == 1
+    scheduler._unpin(key)
+    assert alias.ref_cnt == 0 and not scheduler._wb_pinned
