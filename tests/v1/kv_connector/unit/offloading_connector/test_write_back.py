@@ -710,3 +710,29 @@ def test_a_run_member_in_use_on_the_gpu_is_not_missing(band):
     members = scheduler._run_members(chain[-1], scheduler._config_idx_by_group)
     assert sorted(m[1].block_id for m in members) == [2, 6]
     assert chain[-1] in scheduler._run_keys and not scheduler._wb_counts["run_broken_trimmed"]
+
+
+def test_a_boundary_hand_off_stores_the_whole_sliding_window(monkeypatch):
+    # A restore at the boundary reads the window ending there; its earlier
+    # chunks leave the GPU as the decode passes them, so the hand-off stores
+    # all of them, not only the chunk at the boundary (2026-11-04).
+    monkeypatch.setattr(sched_mod.GroupOffloadConfig, "load_window_size_in_chunks",
+                        lambda self, num_tokens: 2)
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    status = scheduler._req_status["req"]
+    attn_idx, attn_cfg = next(
+        (idx, cfg) for idx, cfg in enumerate(scheduler.config.kv_group_configs)
+        if not isinstance(cfg.kv_cache_spec, MambaSpec)
+    )
+    tpb, tpc = attn_cfg.tokens_per_block, attn_cfg.tokens_per_chunk
+    boundary = 2 * tpc
+    request.num_tokens = request.num_prompt_tokens = boundary + 2
+    request.all_token_ids = list(range(boundary + 2))
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(boundary)]
+    status.group_states[attn_idx].block_ids[:] = list(range(41, 41 + boundary // tpb))
+    scheduler.manager.prepare_store.side_effect = _cpu_store_output
+    scheduler._write_through = False
+    jobs = scheduler._build_aligned_boundary_store_jobs({"req": [(1, 98, boundary)]})
+    srcs = sorted(j.src_spec.block_ids.tolist()[0] for j in jobs.values())
+    assert srcs == sorted([98] + [41 + e // tpb - 1 for e in (boundary, tpc)])

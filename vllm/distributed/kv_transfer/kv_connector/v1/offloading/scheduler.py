@@ -2615,18 +2615,24 @@ class OffloadingConnectorScheduler:
             ):
                 if isinstance(group_config.kv_cache_spec, MambaSpec):
                     continue
-                if boundary % group_config.tokens_per_chunk != 0:
+                tpc = group_config.tokens_per_chunk
+                if boundary % tpc != 0:
                     continue
-                block_idx = boundary // group_config.tokens_per_block - 1
-                if not 0 <= block_idx < len(group_state.block_ids):
-                    continue
-                block_id = group_state.block_ids[block_idx]
-                if block_id == 0:
-                    continue
-                key = self._make_boundary_key(
-                    req, group_config.group_idx, boundary, req_status.req_context
-                )
-                members.append((config_idx, group_config, block_id, block_idx, key))
+                # A sliding-window group stores the whole window a restore at
+                # the boundary reads: its earlier chunks leave the GPU once the
+                # decode passes them, before the band can copy the run.
+                window = group_config.load_window_size_in_chunks(boundary) or 1
+                for end in range(boundary, max(0, boundary - window * tpc), -tpc):
+                    block_idx = end // group_config.tokens_per_block - 1
+                    if not 0 <= block_idx < len(group_state.block_ids):
+                        continue
+                    block_id = group_state.block_ids[block_idx]
+                    if block_id == 0:
+                        continue
+                    key = self._make_boundary_key(
+                        req, group_config.group_idx, end, req_status.req_context
+                    )
+                    members.append((config_idx, group_config, block_id, block_idx, key))
             if not members:
                 continue
             store_output = self._prepare_store(
@@ -2673,7 +2679,8 @@ class OffloadingConnectorScheduler:
                 self._events_tracker.record_store(
                     req,
                     group_config,
-                    boundary // group_config.tokens_per_chunk - 1,
+                    (block_idx + 1) * group_config.tokens_per_block
+                    // group_config.tokens_per_chunk - 1,
                     key,
                 )
         return store_jobs
