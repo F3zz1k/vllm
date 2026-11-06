@@ -793,14 +793,6 @@ class WorkerProc:
             # Have the worker close parent end of this worker's pipes too
             "inherited_fds": inherited_fds if inherited_fds is not None else [],
         }
-        if os.environ.get("VLLM_KV_OFFLOAD_COPY_HELPER") == "1":
-            # With defer backing, xe fills a shared buffer's unused system page
-            # table at export, so exporting the KV cache to the copy helper cost
-            # host RAM of its size. The workers start without it; this process
-            # read the setting when its driver loaded, so it and the API server
-            # keep it and their contexts on every card take no VRAM
-            # (kv_offload/cpu/copy_helper.py).
-            os.environ["EnableDeferBacking"] = "0"
         # Run EngineCore busy loop in background process.
         proc = context.Process(
             target=WorkerProc.worker_main,
@@ -921,6 +913,13 @@ class WorkerProc:
     def worker_main(*args, **kwargs):
         """Worker initialization and execution loops.
         This runs a background process"""
+        if os.environ.get("VLLM_KV_OFFLOAD_COPY_HELPER") == "1":
+            # Before the device opens: with defer backing, xe fills a shared
+            # buffer's unused system page table at export, so exporting the
+            # KV cache to the copy helper cost host RAM of its size. Workers
+            # only: other processes keep defer backing, so their contexts on
+            # every card take no VRAM (kv_offload/cpu/copy_helper.py).
+            os.environ["EnableDeferBacking"] = "0"
         if logging_config := getattr(kwargs["vllm_config"], "logging_config", None):
             configure_logging(logging_config)
 
