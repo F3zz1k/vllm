@@ -80,6 +80,12 @@ logger = init_logger(__name__)
 # pool only through the band, so the pool converges on holding what the GPU
 # does not.
 WRITE_BACK = os.environ.get("VLLM_KV_WRITE_BACK", "0") == "1"
+# A restore leaves out the last chunk of an EAGLE/MTP drafter group (its KV may
+# have been written under a rejected speculation). The store side already never
+# writes that chunk while a request decodes, and a stale drafter chunk only
+# lowers acceptance (the target verifies every draft), so =0 restores it: one
+# chunk less recomputed per restore (1,600 tokens on Qwen3.8-27B).
+KV_OFFLOAD_EAGLE_POP = os.environ.get("VLLM_KV_OFFLOAD_EAGLE_POP", "1") == "1"
 # The band's lead (free-queue positions scanned) is WRITE_BACK_SCAN plus the
 # blocks the GPU reuses in WRITE_BACK_LEAD_FACTOR measured copy latencies,
 # capped at WRITE_BACK_SCAN_MAX.
@@ -1975,7 +1981,9 @@ class OffloadingConnectorScheduler:
                 )
 
                 is_eagle_unverified = (
-                    group_config.is_eagle_group and group_idx not in eagle_verified
+                    KV_OFFLOAD_EAGLE_POP
+                    and group_config.is_eagle_group
+                    and group_idx not in eagle_verified
                 )
 
                 # Constrain to a chunk-aligned boundary for this group.

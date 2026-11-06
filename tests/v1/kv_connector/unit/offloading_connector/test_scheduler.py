@@ -3482,6 +3482,47 @@ class TestEagle:
         # 3 hits, pop to 2 → 2 * block_size = 8 tokens loadable
         assert sched._lookup(req_status) == 8
 
+    def test_full_attn_lookup_keeps_the_last_block_without_the_pop(
+        self, request_runner, monkeypatch
+    ):
+        """VLLM_KV_OFFLOAD_EAGLE_POP=0: all 3 hit blocks are loadable."""
+        import vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler as sm
+
+        block_size = 4
+        groups = [
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+                is_eagle_group=True,
+            ),
+        ]
+        runner = request_runner(
+            block_size=block_size,
+            num_gpu_blocks=100,
+            async_scheduling=False,
+            kv_cache_groups=groups,
+        )
+        runner.manager.lookup.side_effect = lambda key, req_context: (
+            LookupResult.HIT
+            if int(get_offload_block_hash(key).decode()) in {1, 2, 3}
+            else LookupResult.MISS
+        )
+        sched = runner.connector_scheduler
+        req_status = self._make_req_status(
+            sched, num_tokens=13, offload_keys_per_group=[[1, 2, 3]]
+        )
+        assert sched._lookup(req_status) == 8  # the pop: 3 hits, 2 used
+        monkeypatch.setattr(sm, "KV_OFFLOAD_EAGLE_POP", False)
+        req_status = self._make_req_status(
+            sched, num_tokens=13, offload_keys_per_group=[[1, 2, 3]]
+        )
+        assert sched._lookup(req_status) == 12
+
     def test_full_attn_lookup_single_block_returns_zero(self, request_runner):
         """Full-attn eagle group with 1 block hit → pop to 0 → returns 0."""
         block_size = 4
