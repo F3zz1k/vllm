@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The copy helper's lane (copy_helper._Lane), CPU only: Level Zero is a fake
-whose copies are memmoves, the device side is a CPU tensor. A helper store and
-load must move exactly what the staged in-process path moves (the oracle of
+"""A copy-list lane (copy_list._Lane), CPU only: Level Zero is a fake whose
+copies are memmoves, the device side is a CPU tensor. A lane's store and load
+must move exactly what the staged torch path moves (the oracle of
 test_staged_copy), through its own slot ring and events."""
 
 import ctypes
@@ -14,7 +14,7 @@ import torch
 
 from tests.v1.kv_offload.cpu.test_staged_copy import _oracle, _shard
 from vllm.v1.kv_offload.base import CanonicalKVCacheRef
-from vllm.v1.kv_offload.cpu import copy_helper, gpu_worker
+from vllm.v1.kv_offload.cpu import copy_list, gpu_worker
 from vllm.v1.kv_offload.cpu.gpu_worker import _staged_ref
 
 _HEADS, _HEAD_BYTES, _TOKENS = 4, 64, 4
@@ -45,12 +45,11 @@ class _FakeL0:
 
 def _lane(gpu_to_cpu: bool, device: torch.Tensor, cpu: torch.Tensor, mapping, l0, ring=2):
     refs = [[_staged_ref(CanonicalKVCacheRef(0, mapping.local_page_size_bytes, mapping))]]
-    dev = copy_helper._Device(device.data_ptr(), device.stride(0))
-    return copy_helper._Lane(gpu_to_cpu, refs, [dev], [cpu], l0, threading.Lock(), 10, ring, 1500)
+    return copy_list._Lane(gpu_to_cpu, refs, [device], [cpu], l0, threading.Lock(), 10, ring, 1500)
 
 
 @pytest.mark.parametrize("tp,ring", [(2, 2), (4, 3), (2, 1)])
-def test_helper_store_and_load_match_the_staged_oracle(tp, ring, monkeypatch):
+def test_lane_store_and_load_match_the_staged_oracle(tp, ring, monkeypatch):
     monkeypatch.setattr(gpu_worker, "STAGED_SLOT_BYTES", 1500)  # several batches per job
     torch.manual_seed(0)
     num_blocks, num_rows = 5, 8
@@ -79,31 +78,3 @@ def test_helper_store_and_load_match_the_staged_oracle(tp, ring, monkeypatch):
         assert torch.equal(back[3:8], devices[rank][2:7])
         assert not back[:3].any()
         assert sorted(l0.signalled) == sorted(l0.waited)  # the job ends with nothing in flight
-
-
-def test_plain_kv_allocation_is_a_no_op_when_off(monkeypatch):
-    monkeypatch.setattr(copy_helper, "ENABLED", False)
-    with copy_helper.plain_kv_allocation():
-        t = torch.zeros(4)
-    assert t.numel() == 4
-
-
-def test_framing_round_trips_objects_and_descriptors():
-    import os
-    import socket
-
-    a, b = socket.socketpair()
-    r, w = os.pipe()
-    try:
-        copy_helper._send(a, {"x": np.arange(3)}, [r])
-        obj, fds = copy_helper._recv(b, max_fds=4)
-        assert np.array_equal(obj["x"], np.arange(3)) and len(fds) == 1
-        copy_helper._send(a, ("ok", 1))
-        assert copy_helper._recv(b)[0] == ("ok", 1)
-        for fd in fds:
-            os.close(fd)
-    finally:
-        os.close(r)
-        os.close(w)
-        a.close()
-        b.close()

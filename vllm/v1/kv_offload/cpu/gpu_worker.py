@@ -589,8 +589,8 @@ class SingleDirectionOffloadingHandler:
             )
         # staging slots and their last events, per lane (ordered, settled)
         self._lane_slots: tuple[list[torch.Tensor], list[torch.Tensor], ] = ([], [])
-        # The worker's copy helper (copy_helper.py), set by CPUOffloadingWorker.
-        self._helper = None
+        # The worker's own copy list (copy_list.py), set by CPUOffloadingWorker.
+        self._copy_list = None
         self._lane_slot_events: tuple[list, list] = ([None, None], [None, None])
         # end event of the last transfer of each lane (chaining within a lane)
         self._lane_last: list[torch.Event | None] = [None, None]
@@ -1322,14 +1322,14 @@ class SingleDirectionOffloadingHandler:
             with current_platform.stream(stream):
                 start_event.record(stream)
                 if items:
-                    helper = self._helper
-                    if helper is not None and not helper.failed:
+                    copies = self._copy_list
+                    if copies is not None and not copies.failed:
                         try:
-                            helper.run(self.gpu_to_cpu, settled, src_blocks, dst_blocks, group_sizes)
+                            copies.run(self.gpu_to_cpu, settled, src_blocks, dst_blocks, group_sizes)
                         except Exception:
-                            # In process from now on: slower, never wrong.
-                            logger.exception("KV offload copy helper failed; copying in process")
-                            helper.failed = True
+                            # Through torch from now on: slower, never wrong.
+                            logger.exception("KV offload copy list failed; copying through torch")
+                            copies.failed = True
                             self._staged_run(items, stream, settled)
                     else:
                         self._staged_run(items, stream, settled)
@@ -1442,7 +1442,7 @@ class SingleDirectionOffloadingHandler:
             if thread is not None:
                 thread.stop()
                 setattr(self, name, None)
-        self._helper = None
+        self._copy_list = None
         self._lane_last = [None, None]
         self._transfer_events.clear()
         self._stream_pool.clear()
@@ -1544,33 +1544,25 @@ class CPUOffloadingWorker(OffloadingWorker):
             host_memory_is_pinned=host_memory_is_pinned,
         )
 
-        self._copy_helper = None
-        from vllm.v1.kv_offload.cpu import copy_helper
+        self._copy_list = None
+        from vllm.v1.kv_offload.cpu import copy_list
 
         if (
-            copy_helper.ENABLED
-            and mmap_region is not None
+            copy_list.ENABLED
             and self._store_handler._staged_refs is not None
             and self._load_handler._staged_refs is not None
         ):
             try:
-                self._copy_helper = copy_helper.CopyHelper(
-                    device_index=torch.xpu.current_device(),
-                    gpu_tensors=gpu_tensors,
-                    cpu_tensors=cpu_tensors,
-                    region_path=mmap_region.mmap_path,
-                    region_ptr=mmap_region._base.data_ptr(),
-                    region_size=mmap_region.total_size_bytes,
-                    staged_refs={
-                        True: self._store_handler._staged_refs,
-                        False: self._load_handler._staged_refs,
-                    },
+                self._copy_list = copy_list.CopyList(
+                    gpu_tensors,
+                    cpu_tensors,
+                    {True: self._store_handler._staged_refs, False: self._load_handler._staged_refs},
                 )
             except Exception:
-                logger.exception("KV offload copy helper did not start; copying in process")
+                logger.exception("KV offload copy list did not open; copying through torch")
             else:
-                self._store_handler._helper = self._copy_helper
-                self._load_handler._helper = self._copy_helper
+                self._store_handler._copy_list = self._copy_list
+                self._load_handler._copy_list = self._copy_list
 
     def submit_store(
         self, job_id: int, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec
@@ -1604,10 +1596,6 @@ class CPUOffloadingWorker(OffloadingWorker):
         except Exception:
             logger.exception("Failed to shut down load offloading handler")
             handler_failed = True
-
-        if self._copy_helper is not None:
-            self._copy_helper.close()  # both directions are drained: it is idle
-            self._copy_helper = None
 
         if self._mmap_region is not None:
             if handler_failed:

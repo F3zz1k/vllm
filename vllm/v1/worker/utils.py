@@ -593,10 +593,7 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    from vllm.v1.kv_offload.cpu.copy_helper import plain_kv_allocation
-
-    with plain_kv_allocation():  # the KV offload copy helper exports this allocation
-        buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
