@@ -991,10 +991,10 @@ class OffloadingConnectorScheduler:
             gidx, start, n_keys, n_hit, counts, max_before = ctx["groups"][-1]
             zeroed = f"g{gidx}({self._b70_kind(gidx)})@{max_before}"
         head = None
-        for gs in req_status.group_states:
-            if gs.offload_keys:
-                head = gs.offload_keys[0]
-                break
+        ref = self._chain_ref_group
+        states = req_status.group_states
+        if ref is not None and ref < len(states) and states[ref].offload_keys:
+            head = states[ref].offload_keys[0]
         head_tag = self._key_run.get(head) if head is not None else None
         if head is not None:
             self._b70_heads.add(head)
@@ -1235,6 +1235,15 @@ class OffloadingConnectorScheduler:
             self._b70_log_drop("broken", tag, missing)
         self._drop_run(tag)
         return []
+
+    def _band_store_held(self) -> bool:
+        """Whether a band store tells the pool the GPU still holds the run (its
+        copy is a duplicate the pool may evict first). Not for a class with
+        recurrent state: the GPU frees a boundary's state blocks two steps after
+        writing them, so the pool's copy is the only one a restore can use, and
+        evicting it first dropped whole live sessions (27B TP=4 24x100k, 19% of
+        turns recomputed, 2026-11-06)."""
+        return not self._has_state_groups
 
     def _b70_log_drop(self, reason: str, tag: OffloadKey, missing: list) -> None:
         """Trace: a run the band stops tracking (its blocks are then never copied)."""
@@ -1612,7 +1621,8 @@ class OffloadingConnectorScheduler:
                 # A known run is a whole conversation; a block of no known
                 # run is stored alone, as a run of its own.
                 store_output = self._prepare_store_run(
-                    keys, tag if tag is not None else keys[0], whole=tag is not None, held=True
+                    keys, tag if tag is not None else keys[0], whole=tag is not None,
+                    held=self._band_store_held(),
                 )
             else:
                 store_output = self._prepare_store(keys, None)
@@ -1632,7 +1642,9 @@ class OffloadingConnectorScheduler:
                     if retry:
                         members = retry
                         keys = self._offer_keys(tag, members)
-                        store_output = self._prepare_store_run(keys, tag, whole=True, held=True)
+                        store_output = self._prepare_store_run(
+                            keys, tag, whole=True, held=self._band_store_held()
+                        )
             if store_output is None:
                 self._wb_counts["store_refused"] += 1
                 if tag is not None:

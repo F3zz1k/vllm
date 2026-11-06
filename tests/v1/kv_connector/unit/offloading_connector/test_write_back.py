@@ -149,14 +149,18 @@ def test_a_block_whose_predecessor_was_reused_returns_at_the_head(band):
     assert _queue_ids(pool) == [2, 3, 4, 5, 6]    # 3 still after 2, 6 after 5
 
 
-def test_band_stores_are_held_and_the_flush_is_not(band):
+@pytest.mark.parametrize("has_state", [True, False])
+def test_band_stores_are_held_only_without_recurrent_state(band, has_state):
+    # With recurrent state the GPU frees a boundary's state right after writing
+    # it, so the pool's copy is not a duplicate and must not be evicted first.
     scheduler, pool, blocks = band
     scheduler._has_state_groups = True
     _register_run(scheduler, blocks, (1, 2, 5))
+    scheduler._has_state_groups = has_state
     scheduler.manager.prepare_store_run = MagicMock(
         side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
     scheduler._build_write_back_jobs()
-    assert scheduler.manager.prepare_store_run.call_args.kwargs.get("held") is True
+    assert scheduler.manager.prepare_store_run.call_args.kwargs.get("held", False) is (not has_state)
 
 
 def test_pool_evictions_reported_by_the_server_are_forgotten(band):
