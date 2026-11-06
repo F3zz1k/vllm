@@ -806,6 +806,7 @@ class OffloadingConnectorScheduler:
         self._b70_t0 = time.monotonic()
         self._b70_heads: set = set()
         self._b70_evicted_heads: dict = {}
+        self._b70_pool_evicted: OrderedDict = OrderedDict()
         self._b70_junction = _b70.junction_enabled()
         self._b70_guard = _b70.guard_enabled()
         self._b70_guard_logged: dict[ReqId, tuple[int, ...]] = {}
@@ -1029,6 +1030,9 @@ class OffloadingConnectorScheduler:
                 by_tag[tag] += 1
             if key in self._b70_heads:
                 self._b70_evicted_heads[key] = (round(now - self._b70_t0, 1), src)
+            self._b70_pool_evicted[key] = src
+            if len(self._b70_pool_evicted) > _POOL_HAS_MAX:
+                self._b70_pool_evicted.popitem(last=False)
         runs = []
         for tag, n in by_tag.most_common(12):
             run = self._run_keys.get(tag, ())
@@ -1155,6 +1159,14 @@ class OffloadingConnectorScheduler:
             # Nothing a restore could read (no boundary with every state
             # group stored): never offered, so never refused every step.
             self._wb_counts["run_unrestorable_dropped"] += 1
+            if self._b70_trace:
+                _b70.log(
+                    "run-unrestorable tag=%s head=%s groups=%s",
+                    _b70_tag(tag), _b70_tag(by_group[0][0] if by_group and by_group[0] else None),
+                    [(self._b70_kind(get_offload_group_idx(ks[0])) if ks else "-", len(ks),
+                      sum(1 for k in ks if k in self._pool_has), sum(1 for k in ks if self._gpu_has(k)))
+                     for ks in by_group],
+                )
             return
         self._run_keys[tag] = chain
         self._run_by_group[tag] = [list(keys) for keys in by_group]
@@ -1219,8 +1231,24 @@ class OffloadingConnectorScheduler:
             for key in chain:
                 self._key_run[key] = tag
         self._wb_counts["run_broken_dropped"] += 1
+        if self._b70_trace:
+            self._b70_log_drop("broken", tag, missing)
         self._drop_run(tag)
         return []
+
+    def _b70_log_drop(self, reason: str, tag: OffloadKey, missing: list) -> None:
+        """Trace: a run the band stops tracking (its blocks are then never copied)."""
+        run = self._run_keys.get(tag, [])
+        pos = {k: i for i, k in enumerate(run)}
+        info = []
+        for key in missing[:8]:
+            gidx = get_offload_group_idx(key)
+            info.append((pos.get(key), self._b70_kind(gidx), self._b70_pool_evicted.get(key, "never-seen-evicted")))
+        _b70.log(
+            "run-dropped reason=%s tag=%s head=%s run_len=%d missing=%d first=%s on_gpu=%d in_pool_view=%d",
+            reason, _b70_tag(tag), _b70_tag(run[0] if run else None), len(run), len(missing), info,
+            sum(1 for k in run if self._gpu_has(k)), sum(1 for k in run if k in self._pool_has),
+        )
 
     def _note_state_stored(self, key: OffloadKey) -> None:
         """A recurrent-state key at a boundary is in the pool (stored or found
@@ -1447,6 +1475,13 @@ class OffloadingConnectorScheduler:
                 self._wb_counts["evict_rescued"] += 1
                 return
         self._wb_counts["evict_uncopied"] += 1
+        if self._b70_trace:
+            run = self._run_keys.get(tag, [])
+            _b70.log(
+                "evict-uncopied tag=%s pos=%s run_len=%d kind=%s",
+                _b70_tag(tag), run.index(key) if key in run else None, len(run),
+                self._b70_kind(get_offload_group_idx(key)),
+            )
 
     def _on_gpu_revive(self, block: Any) -> None:
         """BlockPool hook: a free hashed block is hit again on the GPU. If the
