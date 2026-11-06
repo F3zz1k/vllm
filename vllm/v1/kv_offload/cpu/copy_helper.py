@@ -41,6 +41,9 @@ logger = init_logger(__name__)
 ENABLED = os.environ.get("VLLM_KV_OFFLOAD_COPY_HELPER", "0") == "1"
 # store, load, and the settled (band) store lane: the worker's three copy lanes.
 LANES = ("store", "load", "band")
+# Slots per lane in the helper: its copies are not paced by the forward, so a
+# short ring keeps the copy engine busy (each slot is pinned host memory).
+HELPER_RING = int(os.environ.get("VLLM_KV_OFFLOAD_HELPER_RING", "3"))
 _HDR = struct.Struct("<Q")
 
 
@@ -130,6 +133,12 @@ class CopyHelper:
             self._socks[lane] = a
             children.append(b)
         env = {k: v for k, v in os.environ.items() if k != "L0IPC_ENGINE"}
+        # Only this worker's card: a context on every card the worker sees
+        # costs host memory (GTT) for nothing.
+        mask = [m for m in os.environ.get("ZE_AFFINITY_MASK", "").split(",") if m]
+        if mask:
+            env["ZE_AFFINITY_MASK"] = mask[device_index]
+            device_index = 0
         self._proc = subprocess.Popen(
             [sys.executable, "-m", "vllm.v1.kv_offload.cpu.copy_helper",
              *[str(b.fileno()) for b in children]],
@@ -154,8 +163,8 @@ class CopyHelper:
         if reply != "ready":
             raise RuntimeError(f"copy helper failed to start: {reply}")
         self.failed = False
-        logger.info("KV offload copy helper %d started for device %d (%d KV allocation(s))",
-                    self._proc.pid, device_index, len(ptrs))
+        logger.info("KV offload copy helper %d started (ZE_AFFINITY_MASK=%s, %d KV allocation(s))",
+                    self._proc.pid, env.get("ZE_AFFINITY_MASK", "unset"), len(ptrs))
 
     def run(self, gpu_to_cpu: bool, settled: bool, src_blocks: np.ndarray,
             dst_blocks: np.ndarray, group_sizes) -> None:
@@ -285,12 +294,12 @@ def _serve(lane: _Lane, sock: socket.socket) -> None:
 
 def main(fds: list[int]) -> None:
     from vllm.v1.kv_offload.cpu import l0ipc
-    from vllm.v1.kv_offload.cpu.gpu_worker import _STAGED_RING, STAGED_SLOT_BYTES
+    from vllm.v1.kv_offload.cpu.gpu_worker import STAGED_SLOT_BYTES
 
     socks = [socket.socket(fileno=fd) for fd in fds]
     init, alloc_fds = _recv(socks[0], max_fds=16)
     try:
-        l0 = l0ipc.Helper(init["device"], len(LANES) * _STAGED_RING)
+        l0 = l0ipc.Helper(init["device"], len(LANES) * HELPER_RING)
         bases = [l0.open(fd, raw, 0) for fd, (raw, _size) in zip(alloc_fds, init["allocs"])]
         gpu = [_Device(bases[i] + off, stride) for i, off, stride in init["gpu"]]
         path, size = init["region"]
@@ -304,7 +313,7 @@ def main(fds: list[int]) -> None:
         lock = threading.Lock()
         lanes = {
             name: _Lane(name != "load", init["staged_refs"][name != "load"], gpu, cpu, l0, lock,
-                        i * _STAGED_RING, _STAGED_RING, STAGED_SLOT_BYTES)
+                        i * HELPER_RING, HELPER_RING, STAGED_SLOT_BYTES)
             for i, name in enumerate(LANES)
         }
     except Exception as e:  # noqa: BLE001
