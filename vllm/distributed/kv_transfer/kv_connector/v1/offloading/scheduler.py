@@ -71,6 +71,11 @@ from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
 
+
+def _b70_tag(key) -> str | None:
+    """Trace: a short printable id of an offload key or run tag."""
+    return None if key is None else bytes(key).hex()[:10]
+
 # Exclusive RAM tier (2026-10-23). Write-back band: each step, the hashed GPU
 # blocks near the head of the free queue (the next to be evicted) that the pool
 # does not hold yet are held, copied to the pool and released back to the queue
@@ -797,6 +802,10 @@ class OffloadingConnectorScheduler:
 
         # B70 0014 (env-gated; every flag off = upstream behaviour).
         self._b70_trace = _b70.trace_enabled()
+        # Trace only: session head keys seen by lookups, and when the pool evicted one.
+        self._b70_t0 = time.monotonic()
+        self._b70_heads: set = set()
+        self._b70_evicted_heads: dict = {}
         self._b70_junction = _b70.junction_enabled()
         self._b70_guard = _b70.guard_enabled()
         self._b70_guard_logged: dict[ReqId, tuple[int, ...]] = {}
@@ -980,9 +989,18 @@ class OffloadingConnectorScheduler:
         if result == 0 and ctx["groups"] and ctx["groups"][-1][3] == 0:
             gidx, start, n_keys, n_hit, counts, max_before = ctx["groups"][-1]
             zeroed = f"g{gidx}({self._b70_kind(gidx)})@{max_before}"
+        head = None
+        for gs in req_status.group_states:
+            if gs.offload_keys:
+                head = gs.offload_keys[0]
+                break
+        head_tag = self._key_run.get(head) if head is not None else None
+        if head is not None:
+            self._b70_heads.add(head)
         _b70.log(
             "lookup req=%s prompt=%d local=%d hit=%s %s zeroed_by=%s "
-            "shared_prefix_boundary=%s junction_set=%s",
+            "shared_prefix_boundary=%s junction_set=%s head=%s head_run=%s "
+            "head_in_pool_view=%s head_evicted=%s",
             req.request_id,
             req.num_prompt_tokens,
             req_status.num_locally_computed_tokens,
@@ -991,6 +1009,33 @@ class OffloadingConnectorScheduler:
             zeroed,
             getattr(req, "shared_prefix_boundary", None),
             ctx.get("junction"),
+            _b70_tag(head),
+            _b70_tag(head_tag),
+            head in self._pool_has if head is not None else None,
+            self._b70_evicted_heads.get(head),
+        )
+
+    def _b70_log_pool_evicted(self, keys, src: str) -> None:
+        """Trace: what the pool evicted, by run: keys evicted, run length, and
+        how many of the run's keys the GPU still holds (0 = the only copy went)."""
+        by_tag: Counter = Counter()
+        untagged = 0
+        now = time.monotonic()
+        for key in keys:
+            tag = self._key_run.get(key)
+            if tag is None:
+                untagged += 1
+            else:
+                by_tag[tag] += 1
+            if key in self._b70_heads:
+                self._b70_evicted_heads[key] = (round(now - self._b70_t0, 1), src)
+        runs = []
+        for tag, n in by_tag.most_common(12):
+            run = self._run_keys.get(tag, ())
+            runs.append((_b70_tag(tag), n, len(run), sum(1 for k in run if self._gpu_has(k))))
+        _b70.log(
+            "pool-evicted t=%.1f src=%s keys=%d untagged=%d runs=%s",
+            now - self._b70_t0, src, len(keys), untagged, runs,
         )
 
     def _maybe_observe_lookup_async_delay(
@@ -1370,6 +1415,8 @@ class OffloadingConnectorScheduler:
         copy, and counted that loss as evict_copied (H1, 2026-11-03)."""
         evicted = getattr(store_output, "evicted_keys", None) if store_output else None
         if evicted and WRITE_BACK:
+            if self._b70_trace:
+                self._b70_log_pool_evicted(evicted, "own")
             self._wb_counts["pool_evicted_forgot"] += self._forget_in_pool(evicted)
 
     def _on_gpu_evict(self, block: Any) -> None:
@@ -1556,7 +1603,15 @@ class OffloadingConnectorScheduler:
                 if tag is not None:
                     refused.add(tag)
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
+                if self._b70_trace:
+                    _b70.log("band-store tag=%s offered=%d REFUSED", _b70_tag(tag), len(keys))
                 continue
+            if self._b70_trace:
+                _b70.log(
+                    "band-store tag=%s offered=%d new=%d run_len=%d",
+                    _b70_tag(tag), len(keys), len(store_output.keys_to_store),
+                    len(self._run_keys.get(tag, ())) if tag is not None else 0,
+                )
             self._drop_unwritten(store_output, members)
             chunk_by_key = dict(
                 zip(store_output.keys_to_store, store_output.store_spec.block_ids.tolist())
@@ -1704,6 +1759,8 @@ class OffloadingConnectorScheduler:
             self._pool_has.clear()
             self._state_sets.clear()
         elif keys:
+            if self._b70_trace:
+                self._b70_log_pool_evicted(keys, "feed")
             self._wb_counts["pool_evicted_seen"] += self._forget_in_pool(keys)
 
     def _take_for_copy(self, blocks: list) -> None:
