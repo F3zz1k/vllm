@@ -564,25 +564,60 @@ def test_admit_fraction_counts_this_class_dead_runs():
     check(arena)
 
 
-def test_compaction_frees_a_superpage_and_moving_rows_answer_pending():
+def test_a_store_evicts_the_oldest_run_instead_of_waiting_on_compaction():
+    # Fragmented small superpages: compacting them would free one, so the store
+    # used to start that compaction and be refused meanwhile, and the GPU reused
+    # the blocks it was copying (2026-11-05). Now it evicts the oldest run, here
+    # the big class's own, and gets its row at once; nothing moves.
     arena, big, small, b, s = two_classes(superpages=3)
-    for i in range(8):  # two small superpages
-        store(arena, s, [key(i)], f"S{i}".encode())
     store(arena, b, [key(100)], b"B0")
-    for i in (1, 3, 5, 7):  # each half empty now
+    for i in range(8):  # S0 S2 S3 S4 and S1 S5 S6 S7
+        store(arena, s, [key(i)], f"S{i}".encode())
+    for i in (2, 3, 5, 6):  # two half-empty small superpages
         arena.evict_run(small.runs[f"S{i}".encode()])
-    assert len(small.sp_free) == 2 and small.free_rows == 4
-    # A big store needs a superpage: compacting the small class makes one.
+    res = arena.prepare_store(b, [key(101)], b"B1")
+    assert res is not None and res[0] == [key(101)]
+    assert b"B0" not in big.runs and len(small.runs) == 4
+    assert small.counters["rows_moving"] == 0 and not small.draining
+    arena.complete_store(b, res[0], True)
+    check(arena)
+
+
+def test_a_big_store_frees_a_superpage_by_evicting_small_runs():
+    arena, big, small, b, s = two_classes(superpages=3)
+    store(arena, s, [key(i) for i in range(4)], b"A")
+    store(arena, s, [key(i) for i in range(4, 8)], b"B")
+    store(arena, b, [key(100)], b"B0")
+    res = arena.prepare_store(b, [key(101)], b"B1")
+    assert res is not None and b"A" not in small.runs and b"B" in small.runs
+    arena.complete_store(b, res[0], True)
+    check(arena)
+
+
+def test_interleaved_runs_get_their_own_superpages():
+    arena, big, small, b, s = two_classes(superpages=4)
+    for i in range(4):  # two conversations stored a chunk at a time, alternately
+        store(arena, s, [key(i)], b"A")
+        store(arena, s, [key(10 + i)], b"B")
+    sps = lambda tag: {small.sp_of(small.index[k].row) for k in small.runs[tag].keys}
+    assert len(sps(b"A")) == 1 and len(sps(b"B")) == 1 and sps(b"A") != sps(b"B")
+    freed = len(arena.free_sp)
+    arena.evict_run(small.runs[b"A"])
+    assert len(arena.free_sp) == freed + 1  # its superpage, whole
+    check(arena)
+
+
+def test_a_refused_store_evicts_nothing():
+    arena, big, small, b, s = two_classes(superpages=2)
+    store(arena, s, [key(i) for i in range(4)], b"A")
+    store(arena, b, [key(100)], b"B0")
+    arena.lookup(s, [key(0)])  # held: neither run can be evicted
+    arena.lookup(b, [key(100)])
     assert arena.prepare_store(b, [key(101)], b"B1") is None
-    assert big.counters["store_waits_compaction"] == 1
-    assert small.counters["rows_moving"] == 2
-    moving = [k for k, e in small.index.items() if e.moving is not None]
-    assert arena.lookup(s, moving) == [P.HIT_PENDING] * 2
-    arena.mover.run_pending()
-    assert len(small.sp_free) == 1 and len(arena.free_sp) == 1
-    assert arena.lookup(s, moving) == [P.HIT] * 2
+    assert b"A" in small.runs and b"B0" in big.runs
+    assert big.counters["store_rejected"] == 1
     arena.end_session(s)
-    assert store(arena, b, [key(101)], b"B1")[0] == [key(101)]
+    arena.end_session(b)
     check(arena)
 
 
@@ -620,38 +655,36 @@ def test_compaction_keeps_every_byte(tmp_path):
 
 def test_a_failed_move_gives_up_draining_its_superpage():
     arena, big, small, b, s = two_classes(superpages=3)
-    for i in range(8):  # two small superpages
-        store(arena, s, [key(i)], f"S{i}".encode())
     store(arena, b, [key(100)], b"B0")
-    for i in (1, 3, 5, 7):
+    for i in range(8):  # two small superpages: S0 S2 S3 S4 and S1 S5 S6 S7
+        store(arena, s, [key(i)], f"S{i}".encode())
+    for i in (1, 3, 5, 7):  # left: S0 S2 S4 and S6
         arena.evict_run(small.runs[f"S{i}".encode()])
-    assert arena.prepare_store(b, [key(101)], b"B1") is None  # starts compaction
+    assert arena.compact(1, exclude=big) == 1
     assert len(small.draining) == 1
 
     def fail(job):
         raise OSError("injected")
     arena.mover._execute = fail
     arena.mover.run_pending()
-    assert small.counters["move_failed"] == 2
+    assert small.counters["move_failed"] == 1
     assert not small.draining  # back to allocatable, no longer counted as supply
     check(arena)
-    # Compaction is planned again instead of waiting on a superpage that
-    # never empties.
     arena.mover._execute = arena._move_execute
-    assert arena.prepare_store(b, [key(101)], b"B1") is None
-    assert len(small.draining) == 1
+    assert arena.compact(1, exclude=big) == 1
     arena.mover.run_pending()
-    assert store(arena, b, [key(101)], b"B1")[0] == [key(101)]
+    assert len(arena.free_sp) == 1
     check(arena)
 
 
 def test_held_rows_are_not_moved():
     arena, big, small, b, s = two_classes(superpages=3)
-    for i in range(8):
+    store(arena, b, [key(100)], b"B0")
+    for i in range(8):  # S0 S2 S3 S4 and S1 S5 S6 S7
         store(arena, s, [key(i)], f"S{i}".encode())
-    for i in (1, 2, 3, 5, 6, 7):
+    for i in range(2, 8):  # one row left in each small superpage
         arena.evict_run(small.runs[f"S{i}".encode()])
-    arena.lookup(s, [key(0), key(4)])  # one held row in each small superpage
+    arena.lookup(s, [key(0), key(1)])
     assert arena.compact(1, exclude=big) == 0
     arena.end_session(s)
     assert arena.compact(1, exclude=big) == 1

@@ -372,21 +372,17 @@ def test_a_run_with_no_stored_state_is_not_remembered(band):
     assert scheduler._wb_counts["run_unrestorable_dropped"] == 1
 
 
-def test_a_refused_run_is_not_offered_again_until_the_backoff(band, monkeypatch):
+def test_a_refused_run_is_offered_again_the_next_step(band):
+    # No backoff: the GPU reuses a refused run's blocks while it waits, so a
+    # wait lost the run (2026-11-05). The next step offers it again.
     scheduler, pool, blocks = band
     scheduler._has_state_groups = True
-    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    _register_run(scheduler, blocks, (1, 2, 5))
     scheduler.manager.prepare_store_run = MagicMock(return_value=None)
-    clock = [100.0]
-    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: clock[0])
     assert scheduler._build_write_back_jobs() == {}
     assert scheduler._wb_counts["store_refused"] == 1
     scheduler._build_write_back_jobs()
-    assert scheduler.manager.prepare_store_run.call_count == 1
-    clock[0] += sched_mod.WRITE_BACK_REFUSED_BACKOFF_S + 1
-    scheduler._build_write_back_jobs()
     assert scheduler.manager.prepare_store_run.call_count == 2
-    assert chain[-1] in scheduler._wb_refused
     assert all(b.ref_cnt == 0 for b in blocks)
 
 
@@ -681,6 +677,68 @@ def test_a_finished_run_is_pinned_until_the_band_copies_it(band, monkeypatch):
     assert sorted(_src_blocks(jobs)) == [2, 3, 6]
     # The copy job holds them now; the pins are gone.
     assert not scheduler._wb_pinned and all(b.ref_cnt == 1 for b in run)
+
+
+def test_a_refused_pinned_run_stays_pinned_until_stored(band, monkeypatch):
+    # Unpinned after one refusal, the GPU reused the run's blocks (tail first)
+    # and lost them. Now the pins stay, the run is offered again each step, and
+    # the pins go once its copy jobs hold the blocks, or after PIN_HOLD_S.
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    run = [blocks[i] for i in (1, 2, 5)]
+    pool.touch(run)
+    chain = [OffloadKey(bytes(b.block_hash)) for b in run]
+    _pin_chain(scheduler, monkeypatch, chain)
+    for b in run:
+        b.ref_cnt -= 1
+    _register_run(scheduler, blocks, (1, 2, 5))
+    clock = [100.0]
+    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: clock[0])
+    scheduler._wb_pinned = {t: (clock[0], bs) for t, (_, bs) in scheduler._wb_pinned.items()}
+    scheduler.manager.prepare_store_run = MagicMock(return_value=None)
+    assert scheduler._build_write_back_jobs() == {}
+    assert chain[-1] in scheduler._wb_pinned and all(b.ref_cnt == 1 for b in run)
+    assert scheduler._wb_counts["pin_kept_refused"] == 1
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+    clock[0] += 1.0
+    jobs = scheduler._build_write_back_jobs()
+    assert sorted(_src_blocks(jobs)) == [2, 3, 6]
+    assert not scheduler._wb_pinned and all(b.ref_cnt == 1 for b in run)
+
+
+def test_a_refused_pin_expires_after_the_hold(band, monkeypatch):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    run = [blocks[1], blocks[2]]
+    pool.touch(run)
+    chain = [OffloadKey(bytes(b.block_hash)) for b in run]
+    _pin_chain(scheduler, monkeypatch, chain)
+    for b in run:
+        b.ref_cnt -= 1
+    _register_run(scheduler, blocks, (1, 2))
+    clock = [100.0]
+    monkeypatch.setattr(sched_mod.time, "monotonic", lambda: clock[0])
+    scheduler._wb_pinned = {t: (clock[0], bs) for t, (_, bs) in scheduler._wb_pinned.items()}
+    scheduler.manager.prepare_store_run = MagicMock(return_value=None)
+    scheduler._build_write_back_jobs()
+    assert scheduler._wb_pinned
+    clock[0] += sched_mod.WRITE_BACK_PIN_HOLD_S + 1
+    scheduler._build_write_back_jobs()
+    assert not scheduler._wb_pinned and all(b.ref_cnt == 0 for b in run)
+    assert scheduler._wb_counts["pin_expired"] == 1
+
+
+def test_band_counters_reach_the_stats_once(band):
+    scheduler, _, _ = band
+    scheduler.manager.get_stats = MagicMock(return_value=None)
+    scheduler._wb_counts["run_offered"] += 3
+    stats = scheduler.get_stats()
+    name = sched_mod._ConnectorMetricName.WRITE_BACK_EVENTS
+    assert stats.data["data"][name] == {("run_offered",): 3}
+    scheduler._wb_counts["run_offered"] += 1
+    stats = scheduler.get_stats()
+    assert stats.data["data"][name] == {("run_offered",): 1}
 
 
 def test_a_pinned_run_never_recorded_is_released(band, monkeypatch):

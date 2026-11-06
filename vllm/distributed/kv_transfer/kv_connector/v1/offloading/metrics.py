@@ -36,6 +36,7 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    WRITE_BACK_EVENTS = "vllm:kv_offload_write_back_events"
 
 
 class _TransferType:
@@ -125,6 +126,14 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
             ),
+        ),
+        _ConnectorMetricName.WRITE_BACK_EVENTS: OffloadingCounterMetadata(
+            documentation=(
+                "Write-back band events (VLLM_KV_WRITE_BACK=1) by kind: runs "
+                "pinned, offered, refused, blocks copied, blocks the GPU reused "
+                "before they were copied (evict_uncopied), and so on."
+            ),
+            labelnames=("event",),
         ),
     }
 

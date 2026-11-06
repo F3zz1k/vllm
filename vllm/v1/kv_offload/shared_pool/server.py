@@ -13,10 +13,11 @@ layout class (a model's KV layout, named in the config) at a time, and a row
 of stride s is valid for its class only when [r*s, (r+1)*s) lies inside a
 superpage that class owns, so the server never hands out a row that overlaps
 another class's bytes. Pinned rows live in a pin zone of superpages capped by
-``pin_max_bytes``. A class with several rows per superpage is compacted when
-another class needs whole superpages: ready, unreferenced rows are copied into
-fuller superpages of their own class, and a lookup of a row being moved
-answers HIT_PENDING.
+``pin_max_bytes``. A store puts a run's rows in the run's own superpages
+(its tail one, else a fresh one), so evicting a run frees whole superpages and
+another class that needs them gets them by evicting, never by waiting. Arena
+.compact (rows copied into fuller superpages of their class; a row being moved
+answers HIT_PENDING) is not on the store path.
 
 Runs. Every store names a run (a request id for compute-time stores, a
 conversation for write-back; MERGE_TAG moves a request's keys into its
@@ -221,7 +222,7 @@ class Entry:
 class Run:
     """One run's chunks, evicted as a unit."""
 
-    __slots__ = ("cls", "tag", "keys", "_groups", "complete", "stored_at", "demoted_by")
+    __slots__ = ("cls", "tag", "keys", "_groups", "complete", "stored_at", "demoted_by", "tail_sp")
 
     def __init__(self, cls: "LayoutClass", tag: bytes, now: float) -> None:
         self.cls = cls
@@ -232,6 +233,10 @@ class Run:
         self.complete = 0  # boundaries with every state group present
         self.stored_at = now
         self.demoted_by: set = set()  # clients whose completed load demoted it
+        # The superpage its last stored row went to: the run's next rows go
+        # there first, so a run's rows share superpages and evicting it frees
+        # them (rows of many runs interleaved, and an eviction freed none).
+        self.tail_sp: int | None = None
 
     @property
     def restorable(self) -> bool:
@@ -612,11 +617,26 @@ class LayoutClass:
 
     # --- rows ---
 
-    def alloc(self, pin: bool = False, claim: bool = True) -> int | None:
+    def alloc(self, pin: bool = False, claim: bool = True, run: Run | None = None) -> int | None:
+        """A free row. For a store's ``run``: the run's tail superpage first,
+        then a fresh one, and only then another run's partly used superpage."""
         part = self.pin_partial if pin else self.partial
+        if run is not None and not pin:
+            if run.tail_sp in part:
+                sp = run.tail_sp
+            elif claim and self.arena.claim_sp(self, pin):
+                sp = next(reversed(part))
+            elif part:
+                sp = next(iter(part))
+            else:
+                return None
+            run.tail_sp = sp
+            return self._take(sp, part, pin)
         if not part and not (claim and self.arena.claim_sp(self, pin)):
             return None
-        sp = next(iter(part))
+        return self._take(next(iter(part)), part, pin)
+
+    def _take(self, sp: int, part: dict[int, None], pin: bool) -> int:
         rows = self.sp_free[sp]
         row = rows.pop()
         self.arena.sp_used[sp] += 1
@@ -1051,29 +1071,18 @@ class Arena:
         return itertools.chain(dead, self.order)
 
     def plan(self, cls: LayoutClass, need: int, keep: set[bytes],
-             protect: Run | None) -> tuple[list[Run], int] | None:
+             protect: Run | None) -> list[Run] | None:
         """Simulate the eviction walk over every class until ``need`` rows of
-        ``cls`` can be had. Returns (victims, superpages to compact), or None
-        when even evicting every candidate cannot free enough. Freed rows of
-        another class count only as whole superpages, emptied directly or by
-        compacting a class with several rows per superpage, which is preferred
-        to evicting more. ``keep`` (the offered keys) are never freed."""
+        ``cls`` can be had now. Returns the runs to evict, or None when even
+        evicting every candidate cannot free enough. Freed rows of another
+        class count only as whole superpages that empty. A store never waits
+        for a compaction: it was refused while rows moved, and the GPU reused
+        the blocks it was copying (2026-11-05); evicting an old run frees the
+        room at once. ``keep`` (the offered keys) are never freed."""
         adopting = self.clock() < self.adopt_until
         direct = cls.available()
-        others = [c for c in self.owners() if c is not cls and c.max_rows > 1]
-        slack = {c: c.free_rows for c in others}
-        draining = sum(len(c.draining) for c in others)  # compactions in flight
-
-        def shortfall() -> int | None:
-            """Superpages compaction must free, or None if not enough yet."""
-            if direct >= need:
-                return 0
-            missing = -(-(need - direct) // cls.min_rows)
-            have = 0 if adopting else draining + sum(s // c.max_rows for c, s in slack.items())
-            return missing if have >= missing else None
-
-        if (sps := shortfall()) is not None:
-            return [], sps
+        if direct >= need:
+            return []
         gone: set[Run] = set()
         victims: list[Run] = []
         freed_in_sp: collections.Counter = collections.Counter()
@@ -1101,15 +1110,10 @@ class Arena:
                         direct += 1
                         continue
                     freed_in_sp[sp] += 1
-                    if c in slack and normal:
-                        slack[c] += 1
-                    if self.sp_used[sp] == freed_in_sp[sp]:  # the superpage empties
-                        if not adopting:
-                            direct += cls.min_rows
-                        if c in slack and normal:
-                            slack[c] -= len(c.sp_free[sp]) + freed_in_sp[sp]
-                if (sps := shortfall()) is not None:
-                    return victims, sps
+                    if self.sp_used[sp] == freed_in_sp[sp] and not adopting:
+                        direct += cls.min_rows  # the superpage empties
+                if direct >= need:
+                    return victims
         return None
 
     # --- compaction ---
@@ -1304,10 +1308,10 @@ class Arena:
                       whole: bool = False) -> tuple[list[bytes], list[int], list[bytes]] | None:
         """Allocate rows for the keys the class does not hold yet; every
         offered key joins run tag, which becomes newest. Space comes from
-        evicting whole older runs of any class, or from compacting. All or
-        nothing: returns None and changes nothing when the walk cannot free
-        enough. A store that needs a compaction returns None once it has
-        started it (with the evictions it needed); the next store succeeds."""
+        evicting whole older runs of any class, never from waiting on a
+        compaction. All or nothing: returns None and changes nothing when the
+        walk cannot free enough. The run's rows share superpages (see
+        LayoutClass.alloc)."""
         cls = client.cls
         assert cls is not None
         self.maintain()
@@ -1319,13 +1323,11 @@ class Arena:
             cls.counters["store_rejected_unrestorable"] += 1
             return None
         victims: list[Run] = []
-        compact = 0
         if new_keys:
-            plan = self.plan(cls, len(new_keys), set(offered), run)
-            if plan is None:
+            victims = self.plan(cls, len(new_keys), set(offered), run)
+            if victims is None:
                 cls.counters["store_rejected"] += 1
                 return None
-            victims, compact = plan
         if run is None:
             run = self.get_run(cls, tag)
         else:
@@ -1341,12 +1343,10 @@ class Arena:
                 evicted += freed
             else:
                 self.counters["cross_class_runs_evicted"] += 1
-        if compact:
-            self.compact(compact, exclude=cls)
         rows: list[int] = []
         for key in new_keys:
             row = cls.alloc(pin=True) if key in cls.pins else None
-            row = row if row is not None else cls.alloc()
+            row = row if row is not None else cls.alloc(run=run)
             if row is None:
                 break
             rows.append(row)
@@ -1355,7 +1355,7 @@ class Arena:
                 cls.give_back(row)
             if not run.keys:
                 self.remove_run(run)
-            cls.counters["store_waits_compaction" if compact else "store_rejected"] += 1
+            cls.counters["store_alloc_short"] += 1  # the plan promised these rows
             return None
         now = self.clock()
         for key, row in zip(new_keys, rows):

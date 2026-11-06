@@ -90,10 +90,6 @@ WRITE_BACK_LEAD_FACTOR = float(os.environ.get("VLLM_KV_WRITE_BACK_LEAD_FACTOR", 
 # free blocks, so the band never starves allocation.
 WRITE_BACK_MAX_HELD = int(os.environ.get("VLLM_KV_WRITE_BACK_MAX_HELD", "1024"))
 WRITE_BACK_FREE_SHARE = float(os.environ.get("VLLM_KV_WRITE_BACK_FREE_SHARE", "0.5"))
-# A run the pool refused is not offered again for this long.
-WRITE_BACK_REFUSED_BACKOFF_S = float(
-    os.environ.get("VLLM_KV_WRITE_BACK_REFUSED_BACKOFF_S", "5.0")
-)
 # Bounded-wait variant (off by default): up to this many run members the GPU
 # reuses in a step before the band copied them are copied out, and the step's
 # forward waits for that copy instead of losing them.
@@ -106,6 +102,9 @@ WRITE_BACK_PROMPT_BOUNDARY = (
 )
 # A finished run's pins are dropped if it is not recorded within this long.
 WRITE_BACK_PIN_S = 5.0
+# A pinned run stays pinned until its store succeeds (a refusal is retried the
+# next step), at most this long: the pins are GPU blocks taken from the queue.
+WRITE_BACK_PIN_HOLD_S = float(os.environ.get("VLLM_KV_WRITE_BACK_PIN_HOLD_S", "30"))
 # Bounds of the band's bookkeeping maps.
 _STATE_SETS_MAX = 1 << 16
 _POOL_HAS_MAX = 1 << 18
@@ -755,7 +754,6 @@ class OffloadingConnectorScheduler:
         # Keys known to have reached the pool (bounded; for accounting).
         self._pool_has: "OrderedDict[OffloadKey, None]" = OrderedDict()
         self._wb_inflight: set[OffloadKey] = set()
-        self._wb_refused: dict[OffloadKey, float] = {}
         self._wb_rescue: list[tuple[OffloadKey, OffloadKey, int, int]] = []
         # Run tag -> one of its keys, for runs whose GPU copy left this step:
         # touched in the pool once per step, so they become newest there.
@@ -776,6 +774,7 @@ class OffloadingConnectorScheduler:
         self._wb_lead = WRITE_BACK_SCAN
         self._wb_touching = False
         self._wb_counts: Counter = Counter()
+        self._wb_counts_emitted: Counter = Counter()  # already on /metrics
         # Flush on stop: None -> "armed" (stop requested; this step records
         # the runs of requests the stop finished) -> "ready" -> "running"
         # (jobs submitted) -> "done" or "expired" (out of time: the engine
@@ -1115,7 +1114,6 @@ class OffloadingConnectorScheduler:
     def _drop_run(self, tag: OffloadKey) -> None:
         old = self._run_keys.pop(tag, None)
         self._run_by_group.pop(tag, None)
-        self._wb_refused.pop(tag, None)
         if old is not None:
             for key in old:
                 if self._key_run.get(key) == tag:
@@ -1446,12 +1444,19 @@ class OffloadingConnectorScheduler:
         units: list[tuple[OffloadKey | None, list]] = []
         seen_runs: set[OffloadKey] = set()
         # Pinned finished runs first, outside the budget: their blocks are out
-        # of the free queue already. Pins end after this step's copy jobs.
+        # of the free queue already. Pins end once the run's copy jobs hold
+        # what they copy; a refused run stays pinned and is offered again the
+        # next step, up to WRITE_BACK_PIN_HOLD_S. Unpinned after one refusal,
+        # the GPU reused the run's newest blocks first and its tail was lost.
         pinned = []
         for tag, (pinned_at, _) in list(self._wb_pinned.items()):
             if tag not in self._run_keys:
                 if now - pinned_at > WRITE_BACK_PIN_S:
                     self._unpin(tag)  # never recorded, or dropped
+                continue
+            if now - pinned_at > WRITE_BACK_PIN_HOLD_S:
+                self._wb_counts["pin_expired"] += 1
+                self._unpin(tag)
                 continue
             pinned.append(tag)
             seen_runs.add(tag)
@@ -1478,9 +1483,6 @@ class OffloadingConnectorScheduler:
                 if tag in seen_runs:
                     continue
                 seen_runs.add(tag)
-                refused = self._wb_refused.get(tag)
-                if refused is not None and now - refused < WRITE_BACK_REFUSED_BACKOFF_S:
-                    continue
                 members = self._run_members(tag, config_idx_by_group)
                 # Only members the pool lacks are held and copied. With none,
                 # skip: a re-offer would make a run the GPU still holds newest
@@ -1508,6 +1510,7 @@ class OffloadingConnectorScheduler:
             taken += need
 
         store_jobs = rescue_jobs
+        refused: set[OffloadKey] = set()
         for tag, members in units:
             keys = self._offer_keys(tag, members)
             if hasattr(self.manager, "prepare_store_run"):
@@ -1522,9 +1525,8 @@ class OffloadingConnectorScheduler:
                 # The pool found the run unrestorable without the keys the
                 # band left out as present (another engine's store evicted
                 # them, or a load demoted their run and it went first):
-                # forget them and re-trim now, to what the GPU still holds.
-                # Waiting out the refusal backoff lost the run: the GPU
-                # reused its blocks meanwhile (H1, 2026-11-03).
+                # forget them and re-trim now, to what the GPU still holds
+                # (waiting would lose the run: the GPU reuses its blocks).
                 offered = {m[0] for m in members}
                 forgot = self._forget_in_pool(
                     k for k in self._run_keys.get(tag, ()) if k not in offered
@@ -1539,7 +1541,7 @@ class OffloadingConnectorScheduler:
             if store_output is None:
                 self._wb_counts["store_refused"] += 1
                 if tag is not None:
-                    self._wb_refused[tag] = now
+                    refused.add(tag)
                 self._connector_stats.increase_counter(_ConnectorMetricName.ALLOCATION_FAILURE)
                 continue
             self._drop_unwritten(store_output, members)
@@ -1565,7 +1567,10 @@ class OffloadingConnectorScheduler:
             self._wb_held[job_id] = [m[1] for m in new]
             store_jobs[job_id] = job
         for tag in pinned:
-            self._unpin(tag)  # its copy jobs hold what they copy
+            if tag in refused:
+                self._wb_counts["pin_kept_refused"] += 1
+            else:
+                self._unpin(tag)  # its copy jobs hold what they copy
         return store_jobs
 
     def _offer_keys(self, tag: OffloadKey | None, members: list) -> list[OffloadKey]:
@@ -3542,6 +3547,13 @@ class OffloadingConnectorScheduler:
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
+        if WRITE_BACK:
+            for event, n in self._wb_counts.items():
+                if delta := n - self._wb_counts_emitted[event]:
+                    self._connector_stats.increase_counter(
+                        _ConnectorMetricName.WRITE_BACK_EVENTS, delta, (event,)
+                    )
+            self._wb_counts_emitted = Counter(self._wb_counts)
         if not self._connector_stats.is_empty():
             stats = self._connector_stats
             self._connector_stats = OffloadingConnectorStats()
