@@ -19,6 +19,7 @@ every fence and the lane order: a lane's copy closure runs its job here."""
 import ctypes
 import os
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -83,6 +84,8 @@ class _Lane:
         self.slots: list[torch.Tensor | None] = [None] * ring
         self.armed = [False] * ring
         self._event = -1
+        # jobs, batches, copies, bytes, wall, slot wait, cpu, dma issue (cumulative), last log
+        self.stats = [0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     def _slot(self, idx: int, nbytes: int) -> torch.Tensor:
         slot = self.slots[idx]
@@ -96,22 +99,34 @@ class _Lane:
         return slot
 
     def _swap(self, src, dst, sizes, **_) -> None:
+        self.stats[2] += len(sizes)
+        self.stats[3] += int(sizes.sum())
         with self.lock:
             self.l0.copy_async(dst.tolist(), src.tolist(), sizes.tolist(), self._event)
 
     def _dma(self, batch, idx: int, slot: torch.Tensor) -> None:
+        t = time.perf_counter()
         self._event = self.events[idx]
         self.h._staged_dma(batch, slot)
         self.armed[idx] = True
+        self.stats[7] += time.perf_counter() - t
 
     def _wait(self, idx: int) -> None:
+        t = time.perf_counter()
         self.l0.wait(self.events[idx])
         self.armed[idx] = False
+        self.stats[5] += time.perf_counter() - t
+
+    def _cpu(self, batch, slot: torch.Tensor) -> None:
+        t = time.perf_counter()
+        self.h._staged_cpu(batch, slot)
+        self.stats[6] += time.perf_counter() - t
 
     def run(self, src_blocks, dst_blocks, group_sizes) -> None:
         from vllm.v1.kv_offload.cpu.gpu_worker import _batch_bytes
 
         h = self.h
+        t_start = time.perf_counter()
         batches = h._staged_batches(h._staged_items(src_blocks, dst_blocks, group_sizes))
         ring = len(self.events)
         if h.gpu_to_cpu:
@@ -125,15 +140,28 @@ class _Lane:
                 while len(pending) >= ring or (pending and k == last):
                     done_batch, done_idx, done_slot = pending.popleft()
                     self._wait(done_idx)
-                    h._staged_cpu(done_batch, done_slot)
+                    self._cpu(done_batch, done_slot)
         else:
             for k, batch in enumerate(batches):
                 idx = k % ring
                 slot = self._slot(idx, _batch_bytes(batch))
                 if self.armed[idx]:
                     self._wait(idx)
-                h._staged_cpu(batch, slot)
+                self._cpu(batch, slot)
                 self._dma(batch, idx, slot)
             for idx in range(ring):
                 if self.armed[idx]:
                     self._wait(idx)
+        st = self.stats
+        now = time.perf_counter()
+        st[0] += 1
+        st[1] += len(batches)
+        st[4] += now - t_start
+        if now - st[8] >= 30.0:
+            st[8] = now
+            logger.info(
+                "KV offload copy list %s: jobs=%d batches=%d copies=%d bytes=%.2fGB wall=%.2fs "
+                "slot_wait=%.2fs cpu=%.2fs dma_issue=%.2fs (cumulative)",
+                "store" if h.gpu_to_cpu else "load", st[0], st[1], st[2], st[3] / 1e9,
+                st[4], st[5], st[6], st[7],
+            )
