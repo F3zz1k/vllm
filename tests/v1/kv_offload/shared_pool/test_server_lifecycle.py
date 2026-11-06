@@ -248,7 +248,9 @@ def test_spill_and_restore_round_trip_across_a_restart(tmp_path):
         call(c, P.OP_ATTACH, attach_args())
         assert [r.tag for r in srv2.srv.arena.order] == [b"X", b"e1/r9"]  # the old order
         assert get(c, path, [key(3)]) == [9]
-        assert [r.tag for r in srv2.srv.arena.order] == [b"e1/r9", b"X"]  # loaded: oldest
+        # Loaded: it keeps its place and is held by the loader (Arena.hold).
+        assert [r.tag for r in srv2.srv.arena.order] == [b"X", b"e1/r9"]
+        assert srv2.srv.arena.order and any(r.tag == b"e1/r9" for r in srv2.srv.arena.held)
         c.close()
     finally:
         srv2.stop()

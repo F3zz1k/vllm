@@ -16,7 +16,7 @@ import marshal
 import socket
 import struct
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 _LEN = struct.Struct(">I")
 _MAX_MESSAGE = 256 << 20
@@ -51,6 +51,7 @@ OP_PREPARE_STORE_TAGGED = "prepare_store_tagged"
 OP_MERGE_TAG = "merge_tag"  # (src_tag, dst_tag)
 OP_COMPLETE_STORE = "complete_store"
 OP_TOUCH = "touch"
+OP_EVICTED = "evicted"  # -> [keys taken out of the client's class since its last call, overflow]
 OP_RELEASE_ALL = "release_all"
 OP_STATS = "stats"
 # Operator calls (no attach needed).

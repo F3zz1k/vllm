@@ -91,6 +91,7 @@ def band(monkeypatch):
     # Band mechanics on lone blocks; the state-class rule has its own test.
     scheduler._has_state_groups = False
     scheduler.manager.pool_free_fraction = MagicMock(return_value=0.0)
+    scheduler.manager.pool_evicted = MagicMock(return_value=([], False))
     present = {OffloadKey(bytes(blocks[3].block_hash))}
 
     def prepare_store(keys, req_context):
@@ -115,7 +116,7 @@ def test_band_holds_and_stores_only_what_the_pool_lacks(band):
     assert scheduler._build_write_back_jobs() == {}
 
 
-def test_completion_releases_to_queue_head_with_hash(band):
+def test_completion_returns_blocks_where_they_were_with_hash(band):
     scheduler, pool, blocks = band
     jobs = scheduler._build_write_back_jobs()
     meta = OffloadingWorkerMetadata()
@@ -126,9 +127,62 @@ def test_completion_releases_to_queue_head_with_hash(band):
     assert scheduler.manager.complete_store.call_count == 3
     assert not scheduler._wb_held and not scheduler._jobs
     assert all(b.ref_cnt == 0 for b in blocks)
-    ids = _queue_ids(pool)
-    assert set(ids[:3]) == {2, 3, 6} and ids[3:] == [1, 4, 5]
+    # Where they were: copying to RAM must not change what VRAM evicts (they
+    # used to go to the head, so VRAM dropped sessions that fit in it).
+    assert _queue_ids(pool) == [1, 2, 3, 4, 5, 6]
     assert blocks[1].block_hash is not None     # still a prefix-cache hit
+
+
+def _complete_all(scheduler, jobs):
+    meta = OffloadingWorkerMetadata()
+    for job_id in jobs:
+        for _ in range(scheduler.config.num_workers):
+            meta.mark_completed(job_id)
+    scheduler.update_connector_output(KVConnectorOutput(kv_connector_worker_meta=meta))
+
+
+def test_a_block_whose_predecessor_was_reused_returns_at_the_head(band):
+    scheduler, pool, blocks = band
+    jobs = scheduler._build_write_back_jobs()     # takes 2, 3, 6; queue 1 4 5
+    pool.touch([blocks[0]])                       # block 1 is allocated meanwhile
+    _complete_all(scheduler, jobs)
+    assert _queue_ids(pool) == [2, 3, 4, 5, 6]    # 3 still after 2, 6 after 5
+
+
+def test_band_stores_are_held_and_the_flush_is_not(band):
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    _register_run(scheduler, blocks, (1, 2, 5))
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
+    scheduler._build_write_back_jobs()
+    assert scheduler.manager.prepare_store_run.call_args.kwargs.get("held") is True
+
+
+def test_pool_evictions_reported_by_the_server_are_forgotten(band):
+    # The band skips a run whose chunks it believes the pool holds. Another
+    # engine's store evicted them: without the feed the GPU later dropped the
+    # only copy, counted as copied.
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    scheduler._note_in_pool(chain)
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
+    assert scheduler._build_write_back_jobs() == {}
+    scheduler.manager.pool_evicted = MagicMock(return_value=(chain, False))
+    jobs = scheduler._build_write_back_jobs()
+    assert not set(chain) & set(scheduler._pool_has)
+    assert scheduler._wb_counts["pool_evicted_seen"] == 3
+    assert sorted(_src_blocks(jobs)) == [2, 3, 6]
+
+
+def test_an_eviction_feed_overflow_forgets_the_whole_view(band):
+    scheduler, pool, blocks = band
+    scheduler._note_in_pool([OffloadKey(bytes(blocks[3].block_hash))])
+    scheduler.manager.pool_evicted = MagicMock(return_value=([], True))
+    scheduler._build_write_back_jobs()
+    assert scheduler._wb_counts["pool_view_reset"] == 1
 
 
 def test_held_budget_caps_the_band(band, monkeypatch):
@@ -172,7 +226,7 @@ def test_whole_run_is_written_root_first_under_its_tag(band):
     for k in chain:
         scheduler._key_run[k] = tag
     calls = []
-    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t, whole: (
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t, whole, held=False: (
         calls.append((list(keys), t, whole)) or PrepareStoreOutput(
             keys_to_store=list(keys), store_spec=CPULoadStoreSpec(list(range(len(keys)))),
             evicted_keys=[])))
@@ -188,7 +242,7 @@ def test_whole_run_is_written_root_first_under_its_tag(band):
 def test_a_block_of_no_known_run_is_a_run_of_its_own(band):
     scheduler, pool, blocks = band
     calls = []
-    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t, whole: (
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=lambda keys, t, whole, held=False: (
         calls.append((list(keys), t, whole)) or PrepareStoreOutput(
             keys_to_store=list(keys), store_spec=CPULoadStoreSpec([0]),
             evicted_keys=[])))
@@ -296,7 +350,7 @@ def test_a_run_larger_than_the_budget_is_written_once_nothing_is_held(band, monk
     monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 2)
     chain = _register_run(scheduler, blocks, (1, 2, 5))  # 3 storable members > 2
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
     scheduler._has_state_groups = True  # no lone blocks: only the run
     jobs = scheduler._build_write_back_jobs()
     (keys, tag), kwargs = scheduler.manager.prepare_store_run.call_args
@@ -403,7 +457,7 @@ def test_rescue_copies_an_evicted_member_and_flushes_it(band, monkeypatch):
     scheduler._has_state_groups = True
     chain = _register_run(scheduler, blocks, (1, 2))
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
     scheduler._on_gpu_evict(blocks[1])
     scheduler._on_gpu_evict(blocks[2])                      # over the per-step cap
     assert scheduler._wb_counts["evict_rescued"] == 1
@@ -564,7 +618,7 @@ def test_keys_a_store_evicted_leave_the_band_view(band):
     gone = _hkey(7, 0)
     scheduler._note_in_pool([gone])
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: PrepareStoreOutput(
+        side_effect=lambda keys, t, whole, held=False: PrepareStoreOutput(
             keys_to_store=list(keys), store_spec=CPULoadStoreSpec(list(range(len(keys)))),
             evicted_keys=[gone]))
     assert scheduler._build_write_back_jobs()
@@ -584,7 +638,7 @@ def test_a_refused_run_with_stale_pool_keys_is_retrimmed_at_once(band, monkeypat
     scheduler._note_in_pool([stale])
     calls = []
 
-    def prepare(keys, t, whole):
+    def prepare(keys, t, whole, held=False):
         calls.append(list(keys))
         if len(calls) == 1:
             return None
@@ -631,7 +685,7 @@ def test_the_budget_counts_only_members_the_pool_lacks(band, monkeypatch):
     chain = _register_run(scheduler, blocks, (1, 2, 5))  # 3 members, the root in the pool
     scheduler._note_in_pool(chain[:1])
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: _cpu_store_output([k for k in keys if k != chain[0]]))
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output([k for k in keys if k != chain[0]]))
     jobs = scheduler._build_write_back_jobs()
     assert sorted(_src_blocks(jobs)) == [3, 6]
     assert scheduler._wb_counts["run_oversize"] == 0
@@ -672,7 +726,7 @@ def test_a_finished_run_is_pinned_until_the_band_copies_it(band, monkeypatch):
     assert all(b.ref_cnt == 1 for b in run) and not {2, 3, 6} & set(_queue_ids(pool))
     _register_run(scheduler, blocks, (1, 2, 5))  # recorded at the end of the next step
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
     jobs = scheduler._build_write_back_jobs()
     assert sorted(_src_blocks(jobs)) == [2, 3, 6]
     # The copy job holds them now; the pins are gone.
@@ -700,7 +754,7 @@ def test_a_refused_pinned_run_stays_pinned_until_stored(band, monkeypatch):
     assert chain[-1] in scheduler._wb_pinned and all(b.ref_cnt == 1 for b in run)
     assert scheduler._wb_counts["pin_kept_refused"] == 1
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: _cpu_store_output(keys))
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output(keys))
     clock[0] += 1.0
     jobs = scheduler._build_write_back_jobs()
     assert sorted(_src_blocks(jobs)) == [2, 3, 6]
@@ -757,7 +811,7 @@ def test_a_pinned_run_never_recorded_is_released(band, monkeypatch):
     clock[0] += sched_mod.WRITE_BACK_PIN_S + 1
     scheduler._build_write_back_jobs()
     assert not scheduler._wb_pinned and all(b.ref_cnt == 0 for b in run)
-    assert _queue_ids(pool)[-2:] == [2, 3]       # back at the tail: the pool lacks them
+    assert _queue_ids(pool)[-2:] == [3, 2]       # the tail, end first, as vLLM frees
 
 
 def test_a_run_member_in_use_on_the_gpu_is_not_missing(band):
@@ -808,7 +862,7 @@ def test_a_run_store_joins_the_chain_keys_the_pool_already_holds(band):
         scheduler._key_run[k] = chain[-1]
     scheduler._note_in_pool([only_in_pool])
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, t, whole: _cpu_store_output([k for k in keys if k != only_in_pool]))
+        side_effect=lambda keys, t, whole, held=False: _cpu_store_output([k for k in keys if k != only_in_pool]))
     jobs = scheduler._build_write_back_jobs()
     (keys, tag), kwargs = scheduler.manager.prepare_store_run.call_args
     assert list(keys) == chain and tag == chain[-1] and kwargs["whole"]

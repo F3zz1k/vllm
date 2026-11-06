@@ -27,7 +27,7 @@ def flush(band, monkeypatch):  # noqa: F811
     calls = []
     scheduler.pool_present = set()  # keys the fake pool holds
 
-    def prepare_store_run(keys, tag, whole=False):
+    def prepare_store_run(keys, tag, whole=False, held=False):
         calls.append((list(keys), tag, whole))
         new = [k for k in keys if k not in scheduler.pool_present]
         return PrepareStoreOutput(

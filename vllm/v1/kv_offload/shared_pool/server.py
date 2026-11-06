@@ -96,6 +96,9 @@ DEAD_RUN_GRACE_SEC = 10.0
 # global order one computation walks at most.
 ADMIT_CACHE_SEC = 0.5
 ADMIT_WALK_RUNS = 20000
+# Keys queued per client for EVICTED before it overflows (then it forgets its
+# whole view of the pool, which is safe: it only re-copies more).
+EVICTED_MAX = 1 << 18
 # Tag prefix of the run an unpinned chunk in no conversation gets.
 _ORPHAN = b"orphan:"
 MANIFEST = "manifest.json"
@@ -232,7 +235,7 @@ class Run:
         self._groups: dict[bytes, set[int]] = {}
         self.complete = 0  # boundaries with every state group present
         self.stored_at = now
-        self.demoted_by: set = set()  # clients whose completed load demoted it
+        self.demoted_by: set = set()  # clients whose GPU holds it too (Arena.hold)
         # The superpage its last stored row went to: the run's next rows go
         # there first, so a run's rows share superpages and evicting it frees
         # them (rows of many runs interleaved, and an eviction freed none).
@@ -288,8 +291,14 @@ class ClientState:
     holds: dict[bytes, None] = field(default_factory=dict)
     loads: collections.Counter = field(default_factory=collections.Counter)
     writes: set[bytes] = field(default_factory=set)
-    # Runs this client's loads demoted and nobody has stored to since.
+    # Runs whose chunks this client's GPU holds too (it loaded them, or stored
+    # them from blocks it keeps); nobody else has stored to them since.
     demoted: dict[Run, None] = field(default_factory=dict)
+    # Keys of its class taken out of the index since its last EVICTED call, so
+    # its view of what the pool holds stays true (another engine's store, or
+    # the other class's, evicts them). Overflow: the client forgets its view.
+    evicted: list[bytes] = field(default_factory=list)
+    evicted_overflow: bool = False
 
 
 @dataclass(slots=True, eq=False)
@@ -585,6 +594,7 @@ class LayoutClass:
         self.pins: set[bytes] = set()
         self.pin_wanted: set[bytes] = set()
         self.clients = 0
+        self.watchers: list[ClientState] = []  # attached clients, for EVICTED
         self.cold: ColdTier | None = None
         self.counters = collections.Counter()
         # Kept as entries change, so stats cost nothing however large the index.
@@ -686,6 +696,11 @@ class LayoutClass:
 
     def forget(self, key: bytes, entry: Entry) -> None:
         """Take a chunk out of the index (its row is the caller's to free)."""
+        for w in self.watchers:
+            if len(w.evicted) < EVICTED_MAX:
+                w.evicted.append(key)
+            else:
+                w.evicted_overflow = True
         del self.index[key]
         del self.row_key[entry.row]
         self.n_pending -= not entry.ready
@@ -782,12 +797,17 @@ class Arena:
 
     def __init__(self, path: str | None, size: int, superpage_bytes: int,
                  pin_max_bytes: int = 0, quarantine_sec: float = 30.0,
-                 clock=time.monotonic, mover_threads: int = 0, notify=None) -> None:
+                 clock=time.monotonic, mover_threads: int = 0, notify=None,
+                 overlap_cap: float = 0.25) -> None:
         if superpage_bytes <= 0 or size < superpage_bytes:
             raise ValueError(f"an arena of {size} bytes holds no superpage of "
                              f"{superpage_bytes} bytes")
         self.path = path
         self.sp_bytes = superpage_bytes
+        # Runs an engine's GPU holds too, in marking order, and the share of
+        # the arena they may take before eviction prefers them (see _candidates).
+        self.held: dict[Run, None] = {}
+        self.overlap_cap = overlap_cap
         self.num_sp = size // superpage_bytes
         self.size = self.num_sp * superpage_bytes
         self.pin_sp_max = pin_max_bytes // superpage_bytes
@@ -990,17 +1010,32 @@ class Arena:
         self.unrestorable.pop(run, None)
         if run.cls.runs.get(run.tag) is run:
             del run.cls.runs[run.tag]
-        for client in run.demoted_by:
-            client.demoted.pop(run, None)
-        run.demoted_by.clear()
+        self.unhold(run)
 
     def refresh(self, run: Run) -> None:
-        """A store to the run: newest, and no longer demoted by anyone."""
+        """A store to the run: newest, and no longer held by anyone."""
         self.order.move_to_end(run)
         run.stored_at = self.clock()
-        for client in run.demoted_by:
-            client.demoted.pop(run, None)
-        run.demoted_by.clear()
+        self.unhold(run)
+
+    def hold(self, run: Run, client: ClientState) -> None:
+        """client's GPU holds the run's chunks too. It keeps its place in the
+        order; eviction prefers held runs only while they take more than
+        overlap_cap of the arena. Moving it to the eviction head instead (the
+        old demotion) evicted the sessions just restored under a burst, which
+        then had to be written again whole every turn (2026-11-05)."""
+        run.demoted_by.add(client)
+        client.demoted[run] = None
+        self.held[run] = None
+
+    def unhold(self, run: Run, client: ClientState | None = None) -> None:
+        """No longer held by client (by anyone when None)."""
+        for c in [client] if client is not None else list(run.demoted_by):
+            if c in run.demoted_by:
+                run.demoted_by.discard(c)
+                c.demoted.pop(run, None)
+        if not run.demoted_by:
+            self.held.pop(run, None)
 
     def orphan(self, cls: LayoutClass, key: bytes, entry: Entry) -> None:
         """An unpinned chunk in no run: a run of its own at the oldest end."""
@@ -1065,9 +1100,14 @@ class Arena:
         return rows + other_bytes // cls.stride
 
     def _candidates(self):
-        """Runs that restore nothing first, then every run oldest first."""
+        """Runs that restore nothing first; then, while runs a GPU also holds
+        take more than overlap_cap of the arena, those (oldest marked first);
+        then every run oldest first."""
         cutoff = self.clock() - DEAD_RUN_GRACE_SEC
         dead = [r for r in self.unrestorable if r.stored_at <= cutoff]
+        held_bytes = sum(len(r.keys) * r.cls.stride for r in self.held)
+        if held_bytes > self.overlap_cap * self.size:
+            return itertools.chain(dead, list(self.held), self.order)
         return itertools.chain(dead, self.order)
 
     def plan(self, cls: LayoutClass, need: int, keep: set[bytes],
@@ -1293,25 +1333,25 @@ class Arena:
                 entries.append(entry)
         if not cls.exclusive or not entries:
             return
-        # The loading engine's GPU holds this chain again: demote the runs
-        # that contain all of it (the conversation it continues), not the
-        # other conversations a shared head also belongs to.
+        # The loading engine's GPU holds this chain again: mark the runs that
+        # contain all of it (the conversation it continues), not the other
+        # conversations a shared head also belongs to.
         wanted = set(keys)
         for run in min((e.runs for e in entries), key=len):
             if wanted.issubset(run.keys):
-                self.order.move_to_end(run, last=False)
-                run.demoted_by.add(client)
-                client.demoted[run] = None
-                cls.counters["demoted_on_load"] += 1
+                self.hold(run, client)
+                cls.counters["held_on_load"] += 1
 
     def prepare_store(self, client: ClientState, keys: list[bytes], tag: bytes,
-                      whole: bool = False) -> tuple[list[bytes], list[int], list[bytes]] | None:
+                      whole: bool = False, held: bool = False
+                      ) -> tuple[list[bytes], list[int], list[bytes]] | None:
         """Allocate rows for the keys the class does not hold yet; every
         offered key joins run tag, which becomes newest. Space comes from
         evicting whole older runs of any class, never from waiting on a
         compaction. All or nothing: returns None and changes nothing when the
         walk cannot free enough. The run's rows share superpages (see
-        LayoutClass.alloc)."""
+        LayoutClass.alloc). ``held``: the client's GPU keeps the blocks it
+        stores from (see hold)."""
         cls = client.cls
         assert cls is not None
         self.maintain()
@@ -1365,6 +1405,8 @@ class Arena:
             self.join(run, key, entry)
             client.writes.add(key)
         cls.counters["chunks_stored"] += len(new_keys)
+        if held:
+            self.hold(run, client)
         return new_keys, rows, evicted
 
     def merge_tag(self, client: ClientState, src: bytes, dst: bytes) -> int:
@@ -1386,9 +1428,8 @@ class Arena:
             entry = cls.index[key]
             entry.runs.discard(run)
             self.join(target, key, entry)
-        for c in run.demoted_by:
-            target.demoted_by.add(c)
-            c.demoted[target] = None
+        for c in list(run.demoted_by):
+            self.hold(target, c)
         self.remove_run(run)
         cls.counters["tags_merged"] += 1
         return n
@@ -1423,6 +1464,7 @@ class Arena:
             entry.last_use = now
             for run in entry.runs:
                 self.order.move_to_end(run)
+                self.unhold(run, client)
 
     def release_client(self, client: ClientState) -> None:
         """Drop everything a client holds: on disconnect or a cache reset."""
@@ -1445,13 +1487,12 @@ class Arena:
                 cls.drop_entry(key, entry, quarantine=True)
                 cls.counters["store_aborted"] += 1
         client.writes.clear()
-        # Its GPU copies are gone: the runs it loaded are the only copies now.
-        for run in client.demoted:
-            run.demoted_by.discard(client)
+        # Its GPU copies are gone: the runs it held are the only copies now.
+        for run in list(client.demoted):
+            self.unhold(run, client)
             if run in self.order:
                 self.order.move_to_end(run)
                 cls.counters["promoted_on_release"] += 1
-        client.demoted.clear()
 
     # --- pins ---
 
@@ -2070,6 +2111,9 @@ class PoolServer:
         self.superpage_bytes = int(sp)
         self.arena_size = int(arena_cfg["bytes"]) // self.superpage_bytes * self.superpage_bytes
         self.pin_max_bytes = int(arena_cfg.get("pin_max_bytes", 0))
+        # Share of the arena runs an engine's GPU also holds may take before
+        # eviction prefers them: the RAM-and-VRAM overlap, kept in check.
+        self.overlap_cap = float(arena_cfg.get("overlap_cap", 0.25))
         self.populate_floor = int(arena_cfg.get("populate_floor_bytes", 8 << 30))
         self.spill = SpillStore(arena_cfg.get("spill_dir"),
                                 int(float(arena_cfg.get("spill_max_bytes", 0))),
@@ -2137,7 +2181,8 @@ class PoolServer:
     def _new_arena(self) -> Arena:
         return Arena(self.arena_path, self.arena_size, self.superpage_bytes,
                      self.pin_max_bytes, self.quarantine_sec, self.clock,
-                     mover_threads=self._io_threads, notify=self._notify)
+                     mover_threads=self._io_threads, notify=self._notify,
+                     overlap_cap=self.overlap_cap)
 
     def _start(self, kind: str, target, *args) -> None:
         def run() -> None:
@@ -2605,6 +2650,7 @@ class PoolServer:
             cls = self._class_for(args)
             client.cls = cls
             cls.clients += 1
+            cls.watchers.append(client)
             client.name = str(args.get("name", ""))
             logger.info("client %d (%s) attached to class %s",
                         client.client_id, client.name, cls.name)
@@ -2643,8 +2689,13 @@ class PoolServer:
             return None
         if op == P.OP_PREPARE_STORE_TAGGED:
             whole = bool(args[2]) if len(args) > 2 else False
-            res = self.arena.prepare_store(client, args[0], _tag(args[1]), whole)
+            held = bool(args[3]) if len(args) > 3 else False
+            res = self.arena.prepare_store(client, args[0], _tag(args[1]), whole, held)
             return None if res is None else list(res)
+        if op == P.OP_EVICTED:
+            keys, overflow = client.evicted, client.evicted_overflow
+            client.evicted, client.evicted_overflow = [], False
+            return [keys, overflow]
         if op == P.OP_MERGE_TAG:
             return self.arena.merge_tag(client, _tag(args[0]), _tag(args[1]))
         if op == P.OP_COMPLETE_STORE:
@@ -2677,6 +2728,7 @@ class PoolServer:
             held = len(client.holds) + sum(client.loads.values()) + len(client.writes)
             self.arena.release_client(client)
             client.cls.clients -= 1
+            client.cls.watchers.remove(client)
             logger.info("client %d (%s) detached, released %d references",
                         client.client_id, client.name, held)
 

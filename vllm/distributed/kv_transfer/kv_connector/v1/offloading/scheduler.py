@@ -775,6 +775,9 @@ class OffloadingConnectorScheduler:
         self._wb_touching = False
         self._wb_counts: Counter = Counter()
         self._wb_counts_emitted: Counter = Counter()  # already on /metrics
+        # Block id -> its free-queue predecessor when the band took it (None:
+        # it was not in the queue), so its release puts it back where it was.
+        self._wb_prev: dict[int, Any] = {}
         # Flush on stop: None -> "armed" (stop requested; this step records
         # the runs of requests the stop finished) -> "ready" -> "running"
         # (jobs submitted) -> "done" or "expired" (out of time: the engine
@@ -1066,20 +1069,18 @@ class OffloadingConnectorScheduler:
 
     def _unpin(self, tag: OffloadKey) -> None:
         """Drop a run's pins. A block left unreferenced returns to the free
-        queue: at the head if the pool holds it, else at the tail."""
+        queue where freeing would have put it: the tail, the chain's end first,
+        as vLLM frees a request's blocks (the band never shortens VRAM's hold)."""
         entry = self._wb_pinned.pop(tag, None)
         if entry is None:
             return
         queue = self._gpu_block_pool.free_block_queue
         self._wb_pinned_n -= len(entry[1])
-        for key, block in entry[1]:
+        for _key, block in reversed(entry[1]):
             self._wb_pinned_ids.discard(block.block_id)
             block.ref_cnt -= 1
             if block.ref_cnt == 0:
-                if key in self._pool_has:
-                    queue.prepend_n([block])
-                else:
-                    queue.append_n([block])
+                queue.append(block)
 
     def _record_run(self, req_status: "RequestOffloadState") -> None:
         """Name a finished request's run after its conversation (the request's
@@ -1349,8 +1350,11 @@ class OffloadingConnectorScheduler:
         self._note_evicted(out)
         return out
 
-    def _prepare_store_run(self, keys: Any, tag: OffloadKey, whole: bool = False) -> Any:
-        out = self.manager.prepare_store_run(keys, tag, whole=whole)
+    def _prepare_store_run(
+        self, keys: Any, tag: OffloadKey, whole: bool = False, held: bool = False
+    ) -> Any:
+        kw = {"held": True} if held else {}
+        out = self.manager.prepare_store_run(keys, tag, whole=whole, **kw)
         self._note_evicted(out)
         return out
 
@@ -1440,6 +1444,7 @@ class OffloadingConnectorScheduler:
         if self._wb_left:
             self.manager.touch(list(self._wb_left.values()), None)
             self._wb_left.clear()
+        self._note_pool_evictions()
         config_idx_by_group = self._config_idx_by_group
         units: list[tuple[OffloadKey | None, list]] = []
         seen_runs: set[OffloadKey] = set()
@@ -1476,7 +1481,8 @@ class OffloadingConnectorScheduler:
                 continue
             key = OffloadKey(bytes(block.block_hash))
             written = self._wb_written.get(block.block_id)
-            if written is not None and written[0] == key and now - written[1] < 10.0:
+            if (written is not None and written[0] == key and now - written[1] < 10.0
+                    and key in self._pool_has):
                 continue  # confirmed in the pool recently
             tag = self._key_run.get(key)
             if tag is not None:
@@ -1511,13 +1517,14 @@ class OffloadingConnectorScheduler:
 
         store_jobs = rescue_jobs
         refused: set[OffloadKey] = set()
+        taking: list = []  # taken together, once every position is known
         for tag, members in units:
             keys = self._offer_keys(tag, members)
             if hasattr(self.manager, "prepare_store_run"):
                 # A known run is a whole conversation; a block of no known
                 # run is stored alone, as a run of its own.
                 store_output = self._prepare_store_run(
-                    keys, tag if tag is not None else keys[0], whole=tag is not None
+                    keys, tag if tag is not None else keys[0], whole=tag is not None, held=True
                 )
             else:
                 store_output = self._prepare_store(keys, None)
@@ -1537,7 +1544,7 @@ class OffloadingConnectorScheduler:
                     if retry:
                         members = retry
                         keys = self._offer_keys(tag, members)
-                        store_output = self._prepare_store_run(keys, tag, whole=True)
+                        store_output = self._prepare_store_run(keys, tag, whole=True, held=True)
             if store_output is None:
                 self._wb_counts["store_refused"] += 1
                 if tag is not None:
@@ -1558,14 +1565,11 @@ class OffloadingConnectorScheduler:
                 new.append((key, block, config_idx, chunk))
             if not new:
                 continue
-            self._wb_touching = True
-            try:
-                pool.touch([m[1] for m in new])
-            finally:
-                self._wb_touching = False
+            taking += [m[1] for m in new]
             job_id, job = self._band_job(new, store_output, now)
             self._wb_held[job_id] = [m[1] for m in new]
             store_jobs[job_id] = job
+        self._take_for_copy(taking)
         for tag in pinned:
             if tag in refused:
                 self._wb_counts["pin_kept_refused"] += 1
@@ -1680,14 +1684,75 @@ class OffloadingConnectorScheduler:
         self._note_in_pool(keys)
         self._release_write_back(job_id)
 
+    def _note_pool_evictions(self) -> None:
+        """Forget what the pool dropped since the last step (another engine's
+        store, the other class's, or a held run evicted first). Without it the
+        band skipped such runs as present, and the GPU then dropped the only
+        copy, counted as copied."""
+        evicted_fn = getattr(self.manager, "pool_evicted", None)
+        if evicted_fn is None:
+            return
+        keys, overflow = evicted_fn()
+        if overflow:
+            self._wb_counts["pool_view_reset"] += 1
+            self._pool_has.clear()
+            self._state_sets.clear()
+        elif keys:
+            self._wb_counts["pool_evicted_seen"] += self._forget_in_pool(keys)
+
+    def _take_for_copy(self, blocks: list) -> None:
+        """Hold blocks for a copy, remembering where each sat in the free
+        queue (see _release_write_back)."""
+        for block in blocks:
+            self._wb_prev[block.block_id] = block.prev_free_block if block.ref_cnt == 0 else None
+        self._wb_touching = True
+        try:
+            self._gpu_block_pool.touch(blocks)
+        finally:
+            self._wb_touching = False
+
     def _release_write_back(self, job_id: int) -> None:
-        """Return a write-back job's blocks to the queue HEAD (still hashed), so
-        the hold did not change their eviction order."""
-        pool = self._gpu_block_pool
+        """Return a copy job's blocks (still hashed) where they were: after
+        their old free-queue predecessor, or at the head when it was reused
+        meanwhile (that end of the queue is being consumed). A block that was
+        not in the queue (a pin) goes to the tail, where freeing puts it. So
+        copying to RAM never changes what VRAM evicts. Releasing every copied
+        block to the head made VRAM drop sessions that fit in it (2026-11-05)."""
+        queue = self._gpu_block_pool.free_block_queue
+        head = queue.fake_free_list_head
+        back = []
         for block in self._wb_held.pop(job_id, ()):
             block.ref_cnt -= 1
+            prev = self._wb_prev.pop(block.block_id, None)
             if block.ref_cnt == 0:
-                pool.free_block_queue.prepend_n([block])
+                back.append((block, prev))
+        waiting = {b.block_id for b, _ in back}
+        while back:
+            rest = []
+            for block, prev in back:
+                # A predecessor another copy still holds: look past it.
+                for _ in range(len(self._wb_prev)):
+                    if (prev is None or prev is head or prev.block_id in waiting
+                            or prev.block_id not in self._wb_prev):
+                        break
+                    prev = self._wb_prev[prev.block_id]
+                if prev is None:
+                    queue.append(block)
+                elif prev is head or (prev.ref_cnt == 0 and prev.next_free_block is not None):
+                    nxt = prev.next_free_block
+                    prev.next_free_block, block.prev_free_block = block, prev
+                    block.next_free_block, nxt.prev_free_block = nxt, block
+                    queue.num_free_blocks += 1
+                elif prev.block_id in waiting:
+                    rest.append((block, prev))  # after its predecessor is back
+                    continue
+                else:
+                    queue.prepend_n([block])
+                waiting.discard(block.block_id)
+            if len(rest) == len(back):
+                queue.prepend_n([b for b, _ in rest])
+                break
+            back = rest
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -3367,7 +3432,7 @@ class OffloadingConnectorScheduler:
         if held:
             self.manager.touch(held, None)  # newest run's first: it ends newest
         jobs: list[tuple[int, TransferJob]] = []
-        pool = self._gpu_block_pool
+        taking: list = []
         for order, (tag, members, offer) in enumerate(reversed(chosen)):
             if not members:
                 counts["runs_already_in_pool"] += 1
@@ -3393,11 +3458,7 @@ class OffloadingConnectorScheduler:
             if not new:
                 counts["runs_already_in_pool"] += 1
                 continue
-            self._wb_touching = True
-            try:
-                pool.touch([m[1] for m in new])
-            finally:
-                self._wb_touching = False
+            taking += [m[1] for m in new]
             job_id, job = self._band_job(new, store_output, now)
             self._wb_held[job_id] = [m[1] for m in new]
             self._flush_jobs[job_id] = (order, len(new))
@@ -3405,6 +3466,7 @@ class OffloadingConnectorScheduler:
             counts["blocks_submitted"] += len(new)
             counts["tokens_submitted"] += max(m[3] for m in members)
             jobs.append((job_id, job))
+        self._take_for_copy(taking)
         # Newest first: the worker submits store jobs in this order.
         jobs.reverse()
         logger.info(
@@ -3657,6 +3719,7 @@ class OffloadingConnectorScheduler:
             self._release_write_back(job_id)
         for tag in list(self._wb_pinned):
             self._unpin(tag)
+        self._wb_prev.clear()
         self._wb_written.clear()
         self._wb_inflight.clear()
         self._wb_submitted.clear()

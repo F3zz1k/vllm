@@ -303,13 +303,56 @@ def test_held_run_keeps_its_place_and_is_skipped():
     assert store(arena, a, [key(5)])[2] == [key(1)]
 
 
-def test_completed_load_demotes_its_run():
+def test_completed_load_holds_its_run_and_goes_first_over_the_overlap_cap():
     arena, cls, a, b = single(rows=3)
     for i in (1, 2, 3):
         store(arena, a, [key(i)])
     load(arena, b, [key(3)])
-    assert cls.counters["demoted_on_load"] == 1
-    assert store(arena, a, [key(4)])[2] == [key(3)]
+    assert cls.counters["held_on_load"] == 1
+    assert store(arena, a, [key(4)])[2] == [key(3)]  # 1 of 3 rows held > 25%
+
+
+def test_a_held_run_keeps_its_place_under_the_overlap_cap():
+    # Moving a loaded run to the eviction head evicted, under a burst, the
+    # sessions just restored, which then had to be written again whole every
+    # turn (2026-11-05). Under the cap a held run is evicted by age like any.
+    arena, cls, a, b = single(rows=3)
+    arena.overlap_cap = 0.9
+    for i in (1, 2, 3):
+        store(arena, a, [key(i)])
+    load(arena, b, [key(3)])
+    assert store(arena, a, [key(4)])[2] == [key(1)]
+    check(arena)
+
+
+def test_a_held_store_is_marked_and_a_touch_ends_it():
+    arena, cls, a, b = single(rows=4)
+    res = arena.prepare_store(a, [key(1)], b"X", held=True)
+    arena.complete_store(a, res[0], True)
+    run = cls.runs[b"X"]
+    assert a in run.demoted_by and run in arena.held
+    arena.touch(a, [key(1)])  # a's GPU dropped the block: RAM has the only copy
+    assert not run.demoted_by and run not in arena.held
+    check(arena)
+
+
+def test_evicted_reports_what_left_the_index_to_every_attached_client():
+    arena, cls, a, b = single(rows=2)
+    cls.watchers += [a, b]
+    store(arena, a, [key(1)])
+    store(arena, a, [key(2)])
+    store(arena, b, [key(3)])  # evicts key(1)
+    assert a.evicted == [key(1)] and b.evicted == [key(1)]
+    assert not a.evicted_overflow
+
+
+def test_evicted_overflows_to_a_flag(monkeypatch):
+    monkeypatch.setattr(S, "EVICTED_MAX", 1)
+    arena, cls, a, b = single(rows=2)
+    cls.watchers.append(a)
+    for i in range(1, 5):
+        store(arena, a, [key(i)])
+    assert len(a.evicted) == 1 and a.evicted_overflow
 
 
 def test_non_exclusive_class_does_not_demote_on_load():

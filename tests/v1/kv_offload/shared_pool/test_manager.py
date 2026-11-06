@@ -264,13 +264,13 @@ def test_canonical_worker_refuses_layers_the_key_does_not_promise(tmp_path):
 # --- attach and run tags ---
 
 
-def test_attach_sends_protocol_v2_and_sizes_from_the_reply(server):
+def test_attach_sends_the_protocol_version_and_sizes_from_the_reply(server):
     spec = make_spec(server.sock_path)
     manager = manager_of(spec)
     assert manager.available and spec.num_chunks == ROWS
     op, args = server.calls[0]
     assert op == P.OP_ATTACH
-    assert args["version"] == 2 and args["pool"] == "p"
+    assert args["version"] == P.PROTOCOL_VERSION == 3 and args["pool"] == "p"
     assert args["row_stride"] == PAGE and args["name"] == "engine-a"
     assert args["state_groups"] == []
 

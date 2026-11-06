@@ -232,18 +232,34 @@ class SharedPoolOffloadingManager(OffloadingManager):
         return self._prepare_store(keys, self._request_tag(req_context))
 
     def prepare_store_run(
-        self, keys: Collection[OffloadKey], tag: OffloadKey, whole: bool = False
+        self, keys: Collection[OffloadKey], tag: OffloadKey, whole: bool = False,
+        held: bool = False,
     ) -> PrepareStoreOutput | None:
         """Store keys in the run of ``tag``, all or nothing. ``whole`` marks a
         whole conversation, which the server refuses when the run could not
-        restore anything (no recurrent state at any of its boundaries)."""
-        return self._prepare_store(keys, bytes(tag), whole)
+        restore anything (no recurrent state at any of its boundaries).
+        ``held``: this engine's GPU keeps the blocks stored from."""
+        return self._prepare_store(keys, bytes(tag), whole, held)
+
+    def pool_evicted(self) -> tuple[list[OffloadKey], bool]:
+        """Keys of this class the pool dropped since the last call, and whether
+        that list overflowed (forget everything then)."""
+        if self._client is None:
+            return [], False
+        try:
+            keys, overflow = self._call_soft(P.OP_EVICTED)
+        except ConnectionError:
+            return [], False
+        return [OffloadKey(k) for k in keys], bool(overflow)
 
     def _prepare_store(
-        self, keys: Collection[OffloadKey], tag: str | bytes, whole: bool = False
+        self, keys: Collection[OffloadKey], tag: str | bytes, whole: bool = False,
+        held: bool = False,
     ) -> PrepareStoreOutput | None:
         args: list[Any] = [[bytes(k) for k in keys], tag]
-        if whole:
+        if whole or held:
+            args.append(whole)
+        if held:
             args.append(True)
         try:
             result = self._call_soft(P.OP_PREPARE_STORE_TAGGED, args)
