@@ -615,6 +615,7 @@ def test_a_lost_older_point_is_forgotten_without_trimming(band):
     by_group, attn, state, tag = _two_point_run(scheduler)
     old_point = {by_group[s][1] for s in state}
     scheduler._note_in_pool([k for k in scheduler._run_keys[tag] if k not in old_point])
+    scheduler._forget_in_pool(old_point)  # the pool evicted the older point
     assert scheduler._run_members(tag, scheduler._config_idx_by_group) == []
     keys = scheduler._run_keys[tag]
     assert by_group[attn][3] in keys and not (old_point & set(keys))
