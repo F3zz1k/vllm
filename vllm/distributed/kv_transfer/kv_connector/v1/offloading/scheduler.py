@@ -121,6 +121,10 @@ _STATE_SETS_MAX = 1 << 16
 _POOL_HAS_MAX = 1 << 18
 # Conversations ("runs") remembered for whole-run write-back.
 WRITE_BACK_MAX_RUNS = 4096
+# Older restore points a hybrid run keeps besides its deepest one (state keys,
+# and the sliding window there): a break below the deepest point re-trims to
+# one, and a branch or fan-out from earlier in the conversation restores there.
+WRITE_BACK_KEEP_POINTS = int(os.environ.get("VLLM_KV_WRITE_BACK_KEEP_POINTS", "2"))
 WRITE_THROUGH_MIN_FREE = float(os.environ.get("VLLM_KV_WRITE_THROUGH_MIN_FREE", "0.02"))
 # With the band on, compute-time stores are off (2026-11-03, owner's decision:
 # the RAM tier extends VRAM, it does not mirror it). Only the aligned boundary
@@ -736,6 +740,8 @@ class OffloadingConnectorScheduler:
         # The request's offload keys per group, kept per run so a run whose
         # chain broke (a member left the GPU uncopied) can be re-trimmed.
         self._run_by_group: dict[OffloadKey, list[list[OffloadKey]]] = {}
+        # Per run, the keys of its older restore points (see WRITE_BACK_KEEP_POINTS).
+        self._run_extras: dict[OffloadKey, set] = {}
         self._key_run: dict[OffloadKey, OffloadKey] = {}
         self._write_through = True
         # A class with recurrent state restores only from a run holding every
@@ -1151,8 +1157,9 @@ class OffloadingConnectorScheduler:
             merge_tag(req_status.req_context, tag)
         if not WRITE_BACK:
             return
+        extras: set = set()
         chain = self._restore_chain(
-            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k)
+            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k), extras=extras
         )
         self._drop_run(tag)
         if not chain:
@@ -1169,6 +1176,7 @@ class OffloadingConnectorScheduler:
                 )
             return
         self._run_keys[tag] = chain
+        self._run_extras[tag] = extras
         self._run_by_group[tag] = [list(keys) for keys in by_group]
         for key in chain:
             self._key_run[key] = tag
@@ -1178,6 +1186,7 @@ class OffloadingConnectorScheduler:
     def _drop_run(self, tag: OffloadKey) -> None:
         old = self._run_keys.pop(tag, None)
         self._run_by_group.pop(tag, None)
+        self._run_extras.pop(tag, None)
         if old is not None:
             for key in old:
                 if self._key_run.get(key) == tag:
@@ -1200,6 +1209,18 @@ class OffloadingConnectorScheduler:
                     members.append((run_key, *found))
                 elif run_key not in self._pool_has and not self._gpu_has(run_key):
                     missing.append(run_key)  # in use on the GPU is not missing
+            extras = self._run_extras.get(tag, ())
+            lost_points = [k for k in missing if k in extras]
+            if lost_points:
+                # An older restore point left the pool: forget it, keep the run.
+                gone = set(lost_points)
+                self._run_keys[tag] = [k for k in self._run_keys[tag] if k not in gone]
+                extras.difference_update(gone)
+                for key in lost_points:
+                    if self._key_run.get(key) == tag:
+                        del self._key_run[key]
+                self._wb_counts["run_point_lost"] += 1
+                missing = [k for k in missing if k not in gone]
             if not missing:
                 return members
             by_group = self._run_by_group.get(tag)
@@ -1215,11 +1236,13 @@ class OffloadingConnectorScheduler:
                         end = (i + 1) * tpc - 1  # usable depths end before it
                         limit = end if limit is None else min(limit, end)
                         break
+            trimmed_extras: set = set()
             chain = self._restore_chain(
                 by_group,
                 limit=limit,
                 have=lambda k: k in self._pool_has
                 or self._storable_free_block(k, config_idx_by_group) is not None,
+                extras=trimmed_extras,
             )
             if not chain:
                 break
@@ -1228,6 +1251,7 @@ class OffloadingConnectorScheduler:
                 if self._key_run.get(key) == tag:
                     del self._key_run[key]
             self._run_keys[tag] = chain
+            self._run_extras[tag] = trimmed_extras
             for key in chain:
                 self._key_run[key] = tag
         self._wb_counts["run_broken_dropped"] += 1
@@ -1283,6 +1307,7 @@ class OffloadingConnectorScheduler:
         by_group: list[list[OffloadKey]],
         limit: int | None = None,
         have: Callable[[OffloadKey], bool] | None = None,
+        extras: set | None = None,
     ) -> list[OffloadKey]:
         """The keys a restore of this conversation reads, root first.
 
@@ -1359,12 +1384,53 @@ class OffloadingConnectorScheduler:
                 first = 0
             per_group.append((first, end, idx))
         n = max(end for _, end, _ in per_group)
-        return [
+        chain = [
             by_group[idx][i]
             for i in range(n)
             for first, end, idx in per_group
             if first <= i < end
         ]
+        if WRITE_BACK_KEEP_POINTS > 0:
+            seen = set(chain)
+            kept = 0
+            for i in range(depth // ref_tpc - 2, -1, -1):
+                boundary = (i + 1) * ref_tpc
+                if not eagle_fits(boundary):
+                    continue
+                groups = self._state_sets.get(bytes(by_group[ref][i])[:-4])
+                if not (groups is not None and self._state_group_ids <= groups) and not (
+                    have is not None and self._states_present(by_group, boundary, have)
+                ):
+                    continue
+                for key in self._point_keys(by_group, boundary):
+                    if key not in seen:
+                        seen.add(key)
+                        chain.append(key)
+                        if extras is not None:
+                            extras.add(key)
+                kept += 1
+                if kept >= WRITE_BACK_KEEP_POINTS:
+                    break
+        return chain
+
+    def _point_keys(self, by_group: list[list[OffloadKey]], boundary: int) -> list[OffloadKey]:
+        """What a restore at ``boundary`` reads besides the attention prefix a
+        deeper chain already holds: the state keys there and the sliding
+        window ending there."""
+        keys = []
+        for idx, config in enumerate(self.config.kv_group_configs):
+            tpc = config.tokens_per_chunk
+            if boundary % tpc:
+                continue
+            end = min(len(by_group[idx]), boundary // tpc)
+            if end <= 0:
+                continue
+            if isinstance(config.kv_cache_spec, MambaSpec):
+                keys.append(by_group[idx][end - 1])
+            elif config.sliding_window_size_in_chunks is not None:
+                window = config.load_window_size_in_chunks(boundary) or end
+                keys.extend(by_group[idx][max(0, end - window):end])
+        return keys
 
     def _states_present(
         self, by_group: list[list[OffloadKey]], boundary: int, have
@@ -1422,6 +1488,17 @@ class OffloadingConnectorScheduler:
             has.move_to_end(key)
         while len(has) > _POOL_HAS_MAX:
             has.popitem(last=False)
+
+    def _pool_lacks(self, keys: list[OffloadKey]) -> list[OffloadKey]:
+        """Of keys the band believes in the pool, those the pool does not hold
+        (one lookup; its holds end with the step's session). Without a batch
+        lookup every key is assumed gone, the old behaviour."""
+        believed = [k for k in keys if k in self._pool_has]
+        lookup = getattr(self.manager, "lookup_batch", None)
+        if not believed or lookup is None:
+            return believed
+        results = lookup(believed, None)
+        return [k for k, r in zip(believed, results) if r == LookupResult.MISS]
 
     def _forget_in_pool(self, keys: Iterable[OffloadKey]) -> int:
         """Keys the pool no longer holds: drop them (and, for a state key, its
@@ -1627,15 +1704,16 @@ class OffloadingConnectorScheduler:
             else:
                 store_output = self._prepare_store(keys, None)
             if store_output is None and tag is not None:
-                # The pool found the run unrestorable without the keys the
-                # band left out as present (another engine's store evicted
-                # them, or a load demoted their run and it went first):
-                # forget them and re-trim now, to what the GPU still holds
-                # (waiting would lose the run: the GPU reuses its blocks).
+                # The pool may have found the run unrestorable without keys
+                # the band left out as present (another engine's store
+                # evicted them before the feed said so): forget those the pool
+                # no longer has and re-trim now, to what the GPU still holds
+                # (waiting would lose the run: the GPU reuses its blocks). A
+                # refusal for room forgets nothing; the run is offered again.
                 offered = {m[0] for m in members}
-                forgot = self._forget_in_pool(
-                    k for k in self._run_keys.get(tag, ()) if k not in offered
-                )
+                forgot = self._forget_in_pool(self._pool_lacks(
+                    [k for k in self._run_keys.get(tag, ()) if k not in offered]
+                ))
                 if forgot and tag in self._run_keys:
                     self._wb_counts["store_refused_retrimmed"] += 1
                     retry = self._run_members(tag, config_idx_by_group)

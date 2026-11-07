@@ -29,7 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.kv_offload.base import OffloadKey, PrepareStoreOutput, ReqContext
+from vllm.v1.kv_offload.base import LookupResult, OffloadKey, PrepareStoreOutput, ReqContext
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -577,6 +577,52 @@ def test_a_broken_run_is_retrimmed_then_dropped(band):
     assert scheduler._wb_counts["run_broken_dropped"] == 1
 
 
+def _two_point_run(scheduler):
+    """A recorded run with stored states at chunks 1 and 3 (boundaries 2 and 4 chunks)."""
+    configs, attn, state = _groups(scheduler)
+    by_group = [[_hkey(i, c.group_idx) for i in range(4)] for c in configs]
+    for s in state:
+        scheduler._note_state_stored(by_group[s][1])
+        scheduler._note_state_stored(by_group[s][3])
+    scheduler.manager.merge_tag = MagicMock()
+    scheduler._record_run(_finished(scheduler, by_group))
+    return by_group, attn, state, by_group[attn][-1]
+
+
+def test_a_run_keeps_an_older_restore_point(band):
+    """A branch or fan-out from earlier in the conversation, and a break below
+    the deepest point, need an older boundary's state: the run keeps it."""
+    scheduler, _, _ = band
+    scheduler._has_state_groups = True
+    by_group, attn, state, tag = _two_point_run(scheduler)
+    keys = scheduler._run_keys[tag]
+    assert all(by_group[s][3] in keys and by_group[s][1] in keys for s in state)
+    assert scheduler._run_extras[tag] == {by_group[s][1] for s in state}
+    assert all(by_group[s][0] not in keys and by_group[s][2] not in keys for s in state)
+
+
+def test_keep_points_zero_keeps_only_the_deepest(band, monkeypatch):
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_KEEP_POINTS", 0)
+    scheduler, _, _ = band
+    scheduler._has_state_groups = True
+    by_group, attn, state, tag = _two_point_run(scheduler)
+    assert all(by_group[s][1] not in scheduler._run_keys[tag] for s in state)
+
+
+def test_a_lost_older_point_is_forgotten_without_trimming(band):
+    scheduler, _, _ = band
+    scheduler._has_state_groups = True
+    by_group, attn, state, tag = _two_point_run(scheduler)
+    old_point = {by_group[s][1] for s in state}
+    scheduler._note_in_pool([k for k in scheduler._run_keys[tag] if k not in old_point])
+    assert scheduler._run_members(tag, scheduler._config_idx_by_group) == []
+    keys = scheduler._run_keys[tag]
+    assert by_group[attn][3] in keys and not (old_point & set(keys))
+    assert scheduler._wb_counts["run_point_lost"] == 1
+    assert scheduler._wb_counts["run_broken_trimmed"] == 0
+    assert scheduler._wb_counts["run_broken_dropped"] == 0
+
+
 def test_restore_chain_carries_the_eagle_chunk_past_the_state(band):
     """A lookup drops a drafter group's trailing chunk, so a restore at the
     state boundary d reads that group to d + one chunk: the chain holds it."""
@@ -649,6 +695,8 @@ def test_a_refused_run_with_stale_pool_keys_is_retrimmed_at_once(band, monkeypat
         return _cpu_store_output(keys)
 
     scheduler.manager.prepare_store_run = MagicMock(side_effect=prepare)
+    scheduler.manager.lookup_batch = MagicMock(side_effect=lambda keys, ctx: [
+        LookupResult.MISS if k == stale else LookupResult.HIT for k in keys])
     real = scheduler._run_members
     retried = []
 
@@ -666,6 +714,25 @@ def test_a_refused_run_with_stale_pool_keys_is_retrimmed_at_once(band, monkeypat
     assert sorted(_src_blocks(jobs)) == [2, 3, 6]
     assert scheduler._wb_counts["store_refused_retrimmed"] == 1
     assert scheduler._wb_counts["store_refused"] == 0
+
+
+def test_a_refusal_for_room_forgets_nothing_the_pool_still_holds(band):
+    """A refused run whose keys the pool still holds (no room, not stale) keeps
+    the band's view: forgetting them made the run look broken and dropped it."""
+    scheduler, pool, blocks = band
+    scheduler._has_state_groups = True
+    chain = _register_run(scheduler, blocks, (1, 2, 5))
+    held = _hkey(9, 0)
+    scheduler._run_keys[chain[-1]] = [held] + chain
+    scheduler._key_run[held] = chain[-1]
+    scheduler._note_in_pool([held])
+    scheduler.manager.prepare_store_run = MagicMock(return_value=None)
+    scheduler.manager.lookup_batch = MagicMock(side_effect=lambda keys, ctx: [LookupResult.HIT] * len(keys))
+    assert scheduler._build_write_back_jobs() == {}
+    assert held in scheduler._pool_has
+    assert scheduler._wb_counts["store_refused"] == 1
+    assert scheduler._wb_counts["store_refused_retrimmed"] == 0
+    assert chain[-1] in scheduler._run_keys
 
 
 # --- 2026-11-04: the pool evicts runs the GPU still holds first ---
