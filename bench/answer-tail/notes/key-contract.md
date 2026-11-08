@@ -209,43 +209,55 @@ decided
 
 ## 7. The block a state row may be copied from
 
-**The rule.** A state row for an align group is stored only from a block that is durable at
-store time. A block the request's own table still holds at the boundary's position is never
-durable at a sub-block boundary: in align mode the state for a position lives in the table row
-that covers it (`boundary // block_size`, the same index the non-recurrent groups read), and
-the next forward writes the running state into that row. The step path tests this before it
-asks the pool for anything (`_state_source_is_live`, `offloading/scheduler.py:3322`, called at
-`3301`) and refuses the tail whole with the counter `live_state_source`.
+**The rule.** A recurrent state row is stored only from the block the finish checkpoint
+wrote. The worker's FINALIZE pass (`postprocess_mamba_fused_kernel`, FINALIZE=True) copies
+the state after the exact last computed token into that token's block in the step that
+detected the finish, before any later forward, and that is the only place a sub-block
+position ever becomes bytes. The step route therefore stores no state row at all: every
+tail it is handed is refused whole with the counter `live_state_source`
+(`offloading/scheduler.py`, `_build_partial_tail_store_jobs`).
 
-**Why it is not a rule about positions.** The functional-test-2 triage read the poisoned rows
-as a state stored at a position that is not a checkpoint position, and that is wrong: every
-partial-tail store in arm A sits exactly on its producer's own reusable prompt boundary
-(`get_mamba_prefill_checkpoint_position(prompt, hash_block_size, drop_eagle)`, which is what
-the manager's `_cache_partial_tail_block` re-keys a block at). The positions were valid. What
-was wrong was the bytes: `single_type_kv_cache_manager.py:2113-2123` registers the producer's
-tail from the live state block and says so in its own comment ("the boundary state currently
-lives in `source_block` but the next step's forward overwrites it"), and because that branch
-also rewinds `num_cached_block` to the block's index, the next `cache_blocks` pass offers the
-same live block through `_pending_boundary_state_offloads`. The copy then lands the state at
-the request's running position under the boundary key with the state group's suffix, which is
-the key a later restore reads as the state at the boundary. Arm A restored exactly that: rows
-4, 5 and 6, key `80facefd82a3de48` with groups 0, 1 and 2, offered by the step path at
-boundary 23808 while the producer decoded 640 tokens past it.
+**Why the step route has no correct source.** Inside a block a recurrent group has one
+state slot, and it holds the position the last forward reached -- never a position between
+two forwards. The boundary a partial tail names is a *hashing* position: the manager
+re-keys at `get_mamba_prefill_checkpoint_position(prompt, hash_block_size, drop_eagle)`,
+which sits below the end of the chunk that computed it. So the slot the manager registers
+as the producer's source holds the state at the chunk end, and its copy-on-write block --
+which is what the hand-off actually carries, the request's table being append-only -- holds
+the same bytes however early the copy is taken. Being durable is not being the boundary.
 
-**What stays storable.** A copy-on-write block is not in the request's table at that position
-(the worker table of a running request is append-only, so the request stays on the source
-block and the cache entry moves), so a producer's tail is stored as soon as a later request's
-CoW makes it durable. The finish path needs no such test: `finalize_partial_tail_offload`
-(`single_type_kv_cache_manager.py:1931`) returns a block only when nothing is in flight and
-the request computed exactly up to the boundary, so no further forward can rewrite it.
+**What the two GPU proofs decided.** Functional-test-2 arm A poisoned rows 4, 5 and 6 under
+key `80facefd82a3de48` with groups 0, 1 and 2, at boundary 23808 of a 23909-token prompt.
+The first fix refused a hand-off that named the request's own table row at
+`boundary // block_size`, and that premise is now retracted too: functional-test-3 ran the
+fix and `live_state_source` fired zero times while the same three keys were written again
+and the same degenerate reply came back (`ids_sha 52fc9fb9`, 2 distinct ids in 640 tokens).
+The hand-off had named the manager's copy-on-write block, which is in no position of the
+request's table, so the identity check passed it. The pool log puts that store 2.4 s after
+the aligned store for the same request at 20800 and 13.7 s before the request finished
+generating, so the copy was taken during the producer's own decode, from a slot 101 tokens
+past the boundary it was keyed at.
 
-**What the refusal costs.** Nothing selectable. The probe in `_lookup` names the boundary key
-for every tail group and misses without the state row, so no partial restore is offered and no
-load asks for a row the store refused. The step route can no longer write that key shape at a
-sub-block boundary at all; the finish route still can, and only from a block the manager has
-made final, which is the case its own gate above is for. The pair of tests is
-`test_partial_tail_a_live_state_block_leaves_the_restore_no_state_row`
-and `test_partial_tail_a_durable_state_block_is_stored_and_the_restore_loads_it`
-(`test_scheduler.py`), which run store and restore against one pool.
+**What stays storable.** The finish route: `finalize_partial_tail_offload`
+(`single_type_kv_cache_manager.py:1931`) returns a source only when nothing is in flight
+and the request computed exactly up to the boundary, which is exactly when that block is
+the FINALIZE target. The aligned route at exact block boundaries is unaffected, because a
+block boundary is a position a forward ends at by construction, and full-attention rows
+need no capture at all: their KV for those tokens already sits in the block. The answer
+tail keeps its own route.
+
+**What the refusal costs.** Nothing selectable. The probe in `_lookup` names the boundary
+key for every tail group and misses without the state row, so no partial restore is
+offered and no load asks for a row the store refused. With the flag off a refusal is
+reported nowhere, and now stores nothing either: a flag-off engine writes no tail rows at
+all, which is the point, since the rows it used to write there were the poison.
+
+**The tests.** `test_partial_tail_step_path_refuses_the_state_row_the_request_holds` and
+`test_partial_tail_step_path_refuses_a_copy_of_that_row_made_mid_run` are the two hand-off
+shapes the rig produced, and both are refused.
+`test_partial_tail_a_step_tail_leaves_the_restore_no_state_row` and
+`test_partial_tail_a_finished_tail_is_stored_and_the_restore_loads_it` run store and
+restore against one pool, one conversation asking twice, so the refused key is absent from
+a later load and the finish route's key is present.
 
 decided

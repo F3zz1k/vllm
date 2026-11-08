@@ -457,31 +457,27 @@ def _reduce_kv_connector_stats(runner):
     return reduced
 
 
-def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
-    scheduler = _make_partial_tail_scheduler()
-    _make_partial_tail_request(scheduler)
-    req_status = scheduler._req_status["req"]
-    req_status.group_states[0].block_ids[:] = [11, 12]
-    req_status.group_states[1].block_ids[:] = [0, 21]
+def test_partial_tail_store_uses_attention_and_finish_state_sources():
+    """One tail, one store: a full-attention group reads its row from its own
+    table at the boundary and a recurrent group reads the state block the finish
+    hand-off named, and the two land under one job with the events a reader
+    needs. This is the only route that stores a state row."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    request = _make_partial_tail_request(scheduler)
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
 
-    output = SimpleNamespace(
-        kv_connector_block_state=KVConnectorBlockState(
-            req_ids=set(),
-            resolve_block_ids={}.__getitem__,
-            boundary_state_offloads={"req": [(1, 99, 28)]},
-        )
+    scheduler.register_finished_partial_tail(
+        request, ([11, 12], [0, 21]), [(1, 99, 28)]
     )
-    jobs = scheduler._build_partial_tail_store_jobs(output)
 
-    assert len(jobs) == 1
+    assert len(scheduler._finished_partial_tail_jobs) == 1
     offered_keys = scheduler.manager.prepare_store.call_args.args[0]
     req_context = scheduler._req_status["req"].req_context
     assert all(req_context.get_offload_key_position(key) == 28 for key in offered_keys)
-    [job_id] = jobs
-    src_spec = jobs[job_id].src_spec
+    [job_id] = scheduler._finished_partial_tail_jobs
+    src_spec = scheduler._finished_partial_tail_jobs[job_id].src_spec
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [12, 99]
     assert src_spec.group_sizes == [1, 1]
@@ -496,7 +492,7 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
         scheduler._events_tracker.take_events(
             [
                 OffloadingEvent(
-                    keys=list(scheduler._jobs[job_id].keys),
+                    keys=list(offered_keys),
                     medium=Medium.CPU,
                     removed=False,
                 )
@@ -521,7 +517,10 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
 
 
 def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
-    scheduler = _make_partial_tail_scheduler()
+    """An aligned boundary and a sub-block tail in one hand-off are told apart:
+    the aligned entry is stored from the exact block the manager named, and the
+    tail entry is refused by the step path."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
@@ -539,7 +538,10 @@ def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
     )
     jobs = scheduler._build_partial_tail_store_jobs(output)
 
-    assert len(jobs) == 2
+    # Only the aligned entry is stored: the sub-block entry is the recurrent
+    # state the step path refuses, so it leaves one job and one refusal.
+    assert len(jobs) == 1
+    assert scheduler._tail_counts == {"live_state_source": 1}
     src_spec = next(
         job.src_spec for job in jobs.values() if len(job.src_spec.block_ids) == 1
     )
@@ -680,29 +682,21 @@ def test_partial_tail_store_offers_no_key_for_the_drafter_group():
     """A drafter group contributes no tail key and no source block, and the
     transfer spec keeps one slot per KV cache group."""
     scheduler = _make_drafter_partial_tail_scheduler(True)
-    _make_partial_tail_request(scheduler)
-    req_status = scheduler._req_status["req"]
-    req_status.group_states[0].block_ids[:] = [11, 12]
-    req_status.group_states[1].block_ids[:] = [0, 21]
+    request = _make_partial_tail_request(scheduler)
     # The drafter group is left without blocks: were it still required, the
-    # hand-off would be skipped and no job created.
+    # hand-off would be refused and no job created.
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
 
-    output = SimpleNamespace(
-        kv_connector_block_state=KVConnectorBlockState(
-            req_ids=set(),
-            resolve_block_ids={}.__getitem__,
-            boundary_state_offloads={"req": [(1, 99, 28)]},
-        )
+    scheduler.register_finished_partial_tail(
+        request, ([11, 12], [0, 21], []), [(1, 99, 28)]
     )
-    jobs = scheduler._build_partial_tail_store_jobs(output)
 
-    [job_id] = jobs
+    [job_id] = scheduler._finished_partial_tail_jobs
     offered_keys = scheduler.manager.prepare_store.call_args.args[0]
     assert {get_offload_group_idx(key) for key in offered_keys} == {0, 1}
-    src_spec = jobs[job_id].src_spec
+    src_spec = scheduler._finished_partial_tail_jobs[job_id].src_spec
     assert isinstance(src_spec, GPULoadStoreSpec)
     assert src_spec.block_ids.tolist() == [12, 99]
     assert src_spec.group_sizes == [1, 1, 0]
@@ -869,10 +863,9 @@ def test_partial_tail_step_path_names_a_missing_state_source_its_own_reason():
 
 
 def test_partial_tail_step_path_refuses_a_null_source_block():
-    """The step path reads its block table blind, so the check the finish path
-    had on its hand-off sits where both paths meet it: a null block carries no
-    bytes, and storing one writes residue under a key that reads back as the
-    state at the tail."""
+    """The step route refuses before it reads a source at all: a hand-off whose
+    state block is null is refused for the state reason, not for the source
+    reason, because no source on that route could be stored anyway."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     _make_partial_tail_request(scheduler)
     _arm_step_tail_store(scheduler)
@@ -883,26 +876,22 @@ def test_partial_tail_step_path_refuses_a_null_source_block():
 
     assert not jobs
     scheduler.manager.prepare_store.assert_not_called()
-    assert scheduler._tail_counts == {"null_source_block": 1}
+    assert scheduler._tail_counts == {"live_state_source": 1}
     _assert_nothing_half_built(scheduler)
 
 
-def test_partial_tail_step_path_refuses_a_group_whose_block_table_is_short():
+def test_finished_partial_tail_refuses_a_group_whose_table_stops_short():
     """A non-recurrent group reads its source from position
-    ``boundary // block_size`` of its own table. A table that stops short has
-    no source, and that is the one thing the reason source_block_missing should
-    ever mean."""
+    ``boundary // block_size`` of the table the hand-off carried. A table that
+    stops short has no source, and that is the one thing the reason
+    source_block_missing should ever mean."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
-    _make_partial_tail_request(scheduler)
-    _arm_step_tail_store(scheduler)
-    # The tail reads position 28 // 16 = 1 of every non-recurrent group.
-    scheduler._req_status["req"].group_states[0].block_ids[:] = [11]
+    request = _make_partial_tail_request(scheduler)
+    _arm_tail_pool(scheduler)
 
-    jobs = scheduler._build_partial_tail_store_jobs(
-        _step_hand_off({"req": [(1, 99, 28)]})
-    )
+    scheduler.register_finished_partial_tail(request, ([31], [41]), [(1, 99, 28)])
 
-    assert not jobs
+    assert not scheduler._finished_partial_tail_jobs
     scheduler.manager.prepare_store.assert_not_called()
     assert scheduler._tail_counts == {"source_block_missing": 1}
     _assert_nothing_half_built(scheduler)
@@ -929,14 +918,12 @@ def _arm_tail_pool(
     return stored
 
 
-def test_partial_tail_step_path_refuses_a_state_block_the_next_forward_overwrites():
-    """The functional-test-2 shape: the manager re-keys the request's own state
-    block at the prompt's hash boundary and hands that same block to the
-    connector, while the request keeps decoding into it. The bytes are then the
-    state at the request's running position, and the key they land under is the
-    one a later restore reads as the state at the boundary, which is how a
-    restored conversation came back generating from a wrong state. The step path
-    is where that hand-off arrives, so it refuses it there."""
+def test_partial_tail_step_path_refuses_the_state_row_the_request_holds():
+    """Functional-test-2's shape: the manager re-keys the request's own state
+    block at the prompt's hash boundary and hands that same block over while the
+    request keeps decoding into it. The bytes are the state at the request's
+    running position and the key they land under is the one a later restore
+    reads as the state at the boundary, so the step path refuses it."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     _make_partial_tail_request(scheduler)
     _arm_step_tail_store(scheduler)
@@ -954,34 +941,27 @@ def test_partial_tail_step_path_refuses_a_state_block_the_next_forward_overwrite
     _assert_nothing_half_built(scheduler)
 
 
-def test_partial_tail_step_path_stores_a_state_block_the_request_does_not_hold():
-    """The refusal narrows the tail store, it does not close it. A producer's
-    state is durable once a later request's copy-on-write moves it out of the
-    block the producer decodes into, and that copy is not the row the request's
-    own table names at the boundary. Such a hand-off is stored whole, one key per
-    tail group, with one source block paired to each."""
+def test_partial_tail_step_path_refuses_a_copy_of_that_row_made_mid_run():
+    """Functional-test-3's shape, the one the rig actually produced and the one
+    a check on table identity waved through: the manager handed a copy-on-write
+    block that is in no position of the request's table. The copy is of the same
+    single state slot the request writes every step, taken at a later step, so
+    it carries the state the producer had reached rather than the state at the
+    boundary. Being durable is not being the boundary, so this is refused too."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     _make_partial_tail_request(scheduler)
-    # The recurrent table holds 21 at position 1; the hand-off names 99, a block
-    # the request's own table does not hold.
+    # The fixture's recurrent table holds 21 at position 1; the hand-off names
+    # 99, a block the request's own table does not hold at any position.
     _arm_step_tail_store(scheduler)
 
     jobs = scheduler._build_partial_tail_store_jobs(
         _step_hand_off({"req": [(1, 99, 28)]})
     )
 
-    [job_id] = jobs
-    offered = scheduler.manager.prepare_store.call_args.args[0]
-    assert {get_offload_group_idx(key) for key in offered} == {0, 1}
-    src_spec = jobs[job_id].src_spec
-    assert isinstance(src_spec, GPULoadStoreSpec)
-    assert src_spec.block_ids.tolist() == [12, 99]
-    keys = scheduler._jobs[job_id].keys
-    assert sum(src_spec.group_sizes) == len(src_spec.block_ids) == len(keys)
-    # The one count a stored tail leaves with the flag on: this fixture request
-    # keyed no full-attention chunk, so its tail has no run to belong to. No
-    # refusal was counted, which is what the refusal test counts instead.
-    assert dict(scheduler._tail_counts) == {"tail_run_missing": 1}
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"live_state_source": 1}
+    _assert_nothing_half_built(scheduler)
 
 
 def _settle_store(scheduler: OffloadingConnectorScheduler) -> None:
@@ -995,18 +975,17 @@ def _settle_store(scheduler: OffloadingConnectorScheduler) -> None:
         req_status.transfer_jobs.clear()
 
 
-def test_partial_tail_a_live_state_block_leaves_the_restore_no_state_row():
+def test_partial_tail_a_step_tail_leaves_the_restore_no_state_row():
     """What the refusal costs the restore: the poisoned key is the boundary hash
     with a state group's suffix, and a row under it is what a later request of
-    the same conversation would be loaded from. Refused at the store, it is in
-    no pool, so the probe at that boundary misses and the load asks only whole
-    chunks. The producer and the asker are the same request here, as P1 and P2
-    were on the rig: one conversation asking twice."""
+    the same conversation loads from. Refused at the store, it is in no pool, so
+    the probe at that boundary misses and the load asks only whole chunks. The
+    producer and the asker are the same request here, as P1 and P2 were on the
+    rig: one conversation asking twice."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     request = _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]
     _arm_step_tail_store(scheduler)
-    req_status.group_states[1].block_ids[:] = [0, 99]
     pool = _arm_tail_pool(scheduler)
     # The band's own chunk at 16 tokens, both groups: the complete hit the
     # probe starts from, written by the ordinary store and not by any tail.
@@ -1016,7 +995,6 @@ def test_partial_tail_a_live_state_block_leaves_the_restore_no_state_row():
 
     boundary_state_key = make_offload_key(BlockHash(b"h6"), 1)
     assert boundary_state_key not in pool
-    _settle_store(scheduler)
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
     assert scheduler._lookup(req_status) == 16
@@ -1032,19 +1010,20 @@ def test_partial_tail_a_live_state_block_leaves_the_restore_no_state_row():
     assert boundary_state_key not in job.keys
 
 
-def test_partial_tail_a_durable_state_block_is_stored_and_the_restore_loads_it():
-    """The other arm of the same pair: when the state block is durable the row
-    lands under the boundary key, the probe hits it, and the load asks for it.
-    Without this arm the refusal above would be indistinguishable from a tail
-    store that never worked."""
+def test_partial_tail_a_finished_tail_is_stored_and_the_restore_loads_it():
+    """The other arm of the pair, and the only route that stores a state row: a
+    tail registered as the producer finished has its state block written by the
+    finish checkpoint at the exact boundary, so the row lands under the boundary
+    key, the probe hits it, and the load asks for it. Without this arm the
+    refusal above would be indistinguishable from a tail store that never
+    worked."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     request = _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]
-    _arm_step_tail_store(scheduler)
     pool = _arm_tail_pool(scheduler)
     pool.update(make_offload_key(BlockHash(b"h3"), g) for g in (0, 1))
 
-    scheduler._build_partial_tail_store_jobs(_step_hand_off({"req": [(1, 99, 28)]}))
+    scheduler.register_finished_partial_tail(request, ([31, 32], [41]), [(1, 99, 28)])
 
     boundary_state_key = make_offload_key(BlockHash(b"h6"), 1)
     assert boundary_state_key in pool
@@ -1069,35 +1048,31 @@ def test_partial_tail_a_durable_state_block_is_stored_and_the_restore_loads_it()
     assert boundary_state_key in job.keys
 
 
-def test_partial_tail_step_path_counts_a_store_the_pool_refused():
+def test_partial_tail_store_counts_a_store_the_pool_refused():
     """A full pool is not a vanished source block: the refusal the aligned path
     already reports as an allocation failure gets its own tail reason, so an
     operator reading a climbing counter knows to look at the arena, not at the
     block tables."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
-    _make_partial_tail_request(scheduler)
-    _arm_step_tail_store(scheduler)
+    request = _make_partial_tail_request(scheduler)
     scheduler.manager.prepare_store.side_effect = None
     scheduler.manager.prepare_store.return_value = None
 
-    jobs = scheduler._build_partial_tail_store_jobs(
-        _step_hand_off({"req": [(1, 99, 28)]})
-    )
+    scheduler.register_finished_partial_tail(request, ([31, 32], [41]), [(1, 99, 28)])
 
-    assert not jobs
+    assert not scheduler._finished_partial_tail_jobs
     assert scheduler._tail_counts == {"store_pool_refused": 1}
     counters = scheduler._connector_stats.data["data"]
     assert counters[_ConnectorMetricName.ALLOCATION_FAILURE] == {(): 1}
     _assert_nothing_half_built(scheduler)
 
 
-def test_partial_tail_step_path_reports_keys_that_are_already_resident():
+def test_partial_tail_store_reports_keys_that_are_already_resident():
     """When the pool holds every tail key there is nothing to write and nothing
     is lost. That is counted apart from a source that is gone, because the two
     answer different questions about the same tail."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
-    _make_partial_tail_request(scheduler)
-    _arm_step_tail_store(scheduler)
+    request = _make_partial_tail_request(scheduler)
 
     def already_resident(keys, req_context):
         return PrepareStoreOutput(
@@ -1106,11 +1081,9 @@ def test_partial_tail_step_path_reports_keys_that_are_already_resident():
 
     scheduler.manager.prepare_store.side_effect = already_resident
 
-    jobs = scheduler._build_partial_tail_store_jobs(
-        _step_hand_off({"req": [(1, 99, 28)]})
-    )
+    scheduler.register_finished_partial_tail(request, ([31, 32], [41]), [(1, 99, 28)])
 
-    assert not jobs
+    assert not scheduler._finished_partial_tail_jobs
     offered = scheduler.manager.prepare_store.call_args.args[0]
     # One key per tail group, exactly the rows a store would have paired with
     # the two source blocks the fixtures armed.
@@ -1491,10 +1464,10 @@ def test_finished_partial_tail_refused_when_a_group_has_no_tail_key():
 
 def test_finished_partial_tail_refuses_a_null_source_block():
     """The finish hand-off carries the block ids the scheduler read before the
-    request's blocks were freed, so a null can reach it as well as the step
-    path's table read. The shared check in _tail_store_job refuses it: the
-    finish path gets no later step to try again, so storing residue under the
-    tail's key is the one outcome it must not reach for."""
+    request's blocks were freed, and the state block it names is the tail's
+    source. The shared check in _tail_store_job refuses a null: the finish path
+    gets no later step to try again, so storing residue under the tail's key is
+    the one outcome it must not reach for."""
     scheduler = _make_drafter_partial_tail_scheduler(True)
     request = _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]

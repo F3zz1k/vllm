@@ -3263,12 +3263,6 @@ class OffloadingConnectorScheduler:
                 self._refuse_partial_tail("untracked_request", req_id, boundary)
                 continue
             req = req_status.req
-            group_states = {
-                group.group_idx: state
-                for group, state in zip(
-                    self.config.kv_group_configs, req_status.group_states
-                )
-            }
             max_boundary = min(
                 req.num_prompt_tokens,
                 req_status.max_offload_tokens or req.num_prompt_tokens,
@@ -3295,55 +3289,22 @@ class OffloadingConnectorScheduler:
                 self._refuse_partial_tail("hand_off_incomplete", req_id, boundary)
                 continue
 
-            block_ids_by_group = {
-                idx: state.block_ids for idx, state in group_states.items()
-            }
-            if self._state_source_is_live(block_ids_by_group, cow_blocks, boundary):
-                # Step-only reason, and the one the functional-test-2 triage
-                # found: the manager re-keys the request's own state block at a
-                # sub-block boundary while the request keeps decoding into it, so
-                # the copy would hold the state at the request's running position
-                # under the key a restore reads as the state at the boundary.
-                self._refuse_partial_tail("live_state_source", req_id, boundary)
-                continue
-
-            job = self._tail_store_job(
-                req_status, boundary, cow_blocks, block_ids_by_group
-            )
-            if isinstance(job, TailStoreRefusal):
-                self._refuse_partial_tail(job.reason, req_id, boundary)
-                continue
-            job_id, store_job = job
-            store_jobs[job_id] = store_job
+            # No sub-block state row is storeable on this route, so this is
+            # where every tail the aligned path left over goes. Inside a block
+            # a recurrent group has one state slot, and it holds the position
+            # the last forward reached, never a position between two forwards.
+            # The manager's copy-on-write block is a copy of that slot, so it
+            # carries the same bytes however early the copy is taken. Only the
+            # finish route hands over a boundary snapshot: its block is written
+            # by the finish checkpoint's FINALIZE pass, which copies the state
+            # after the exact last token into the block in the step that
+            # detected the finish, before any later forward. Functional-test-3
+            # measured the alternative: the tail this route stored at boundary
+            # 23808 held the producer's state 101 tokens further on, and every
+            # restore of that key came back degenerate.
+            self._refuse_partial_tail("live_state_source", req_id, boundary)
 
         return store_jobs
-
-    def _state_source_is_live(
-        self,
-        block_ids_by_group: dict[int, list[int]],
-        cow_blocks: dict[int, int],
-        boundary: int,
-    ) -> bool:
-        """Whether a hand-off names a block the request is still writing.
-
-        A recurrent group's state at a sub-block boundary lives in the table row
-        that covers it, ``boundary // block_size``, and the next forward writes
-        the running state into that same row. A hand-off naming it is therefore
-        good for the boundary only until the next step, which is not durable
-        enough for a row another instance restores from after a restart. A copy
-        that left the request's table -- the copy-on-write block a producer's
-        tail waits for -- is durable at store time and passes, as is a hand-off
-        whose position the request's table does not reach, where there is no
-        live row for the block to be.
-        """
-        block_idx = boundary // self._partial_tail_block_size
-        for group_idx in self._cow_source_groups:
-            block_ids = block_ids_by_group.get(group_idx, ())
-            if block_idx >= len(block_ids):
-                continue
-            if block_ids[block_idx] == cow_blocks[group_idx]:
-                return True
-        return False
 
     def _hand_off_tail_count(
         self, handoffs: dict[str, list[tuple[int, int, int]]]
@@ -3374,14 +3335,15 @@ class OffloadingConnectorScheduler:
     ) -> tuple[int, TransferJob] | TailStoreRefusal:
         """Build the one store job a partial tail at ``boundary`` needs.
 
-        A recurrent group takes its source from the scheduler's CoW hand-off
+        A recurrent group takes its source from the scheduler's hand-off
         (``cow_blocks``); every other group from position
         ``boundary // block_size`` of its own block table, read out of
-        ``block_ids_by_group``. The step path feeds that from the request's
-        running block ids, the finish path from the hand-off the scheduler got
-        before the blocks were freed. Returns the job id with the job, or a
-        refusal naming why nothing was stored. Nothing is reserved before a
-        refusal: the pool is asked only once every source block is known good.
+        ``block_ids_by_group``. Only the finish path calls this: it passes the
+        tables the scheduler read before the request's blocks were freed, and a
+        state block the finish checkpoint wrote at the boundary. Returns the job
+        id with the job, or a refusal naming why nothing was stored. Nothing is
+        reserved before a refusal: the pool is asked only once every source
+        block is known good.
         """
         assert self._cow_source_groups.issubset(cow_blocks)
         assert boundary % self._partial_tail_block_size != 0
@@ -3514,10 +3476,10 @@ class OffloadingConnectorScheduler:
         With the flag off a refusal is reported nowhere: no counter, so no
         partial-tail series, and no log line. The two bookkeeping counters,
         tail_run_missing and tail_evicted, are gated the same way in
-        _note_tail_keys, while the step path still stores tails with the flag
-        off as it did before the flag existed. A flag-off deployment is
-        therefore tail-blind rather than tail-free: it writes tail rows and
-        keeps no record of them.
+        _note_tail_keys. No route stores a tail with the flag off, so a flag-off
+        deployment writes no tail rows at all: the rows the step route used to
+        write held the producer's running state under a boundary key, which is
+        the corruption this refusal exists to stop.
         """
         if not count:
             return False
@@ -3553,10 +3515,13 @@ class OffloadingConnectorScheduler:
         reports store completion through completed jobs rather than
         ``finished_sending``, so a True would hold the request's blocks forever.
 
-        No live-source check here, unlike the step path: the manager only hands
-        a finished request's state block when nothing is in flight and the
-        request computed exactly up to the boundary, so the block still holds
-        the state that boundary names and no further forward can rewrite it.
+        This is the only route that stores a recurrent state row. The manager
+        hands the block only when nothing is in flight and the request computed
+        exactly up to the boundary, and that block is the finish checkpoint's
+        FINALIZE target: the worker copied the state after the exact last token
+        into it in the step that detected the finish, so its bytes are the state
+        the boundary names at a sub-block position too, and no further forward
+        can rewrite them.
         """
         if not self.config.enable_partial_tail_offload or not partial_tail_offloads:
             return False
