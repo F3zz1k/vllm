@@ -802,6 +802,7 @@ class EngineArgs:
         CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
     enable_mamba_finish_checkpoint: bool = CacheConfig.enable_mamba_finish_checkpoint
+    enable_partial_tail_offload: bool = CacheConfig.enable_partial_tail_offload
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
 
@@ -1412,6 +1413,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--enable-mamba-finish-checkpoint",
             **cache_kwargs["enable_mamba_finish_checkpoint"],
+        )
+        cache_group.add_argument(
+            "--enable-partial-tail-offload",
+            **cache_kwargs["enable_partial_tail_offload"],
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -2290,6 +2295,7 @@ class EngineArgs:
                 self.enable_mamba_shared_prefix_checkpoint
             ),
             enable_mamba_finish_checkpoint=self.enable_mamba_finish_checkpoint,
+            enable_partial_tail_offload=self.enable_partial_tail_offload,
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,

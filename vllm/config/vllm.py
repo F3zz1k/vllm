@@ -2023,6 +2023,7 @@ class VllmConfig:
         self._validate_batch_sharded_sampling()
         self._validate_adaptive_verification()
         self._validate_mamba_finish_checkpoint()
+        self._validate_partial_tail_offload()
 
         # Re-compute compile ranges after platform-specific config updates
         # (e.g., XPU may lower max_num_batched_tokens when MLA is enabled)
@@ -3092,6 +3093,36 @@ class VllmConfig:
         from vllm.v1.core.answer_tail import validate_mamba_finish_checkpoint
 
         validate_mamba_finish_checkpoint(self)
+
+    def _validate_partial_tail_offload(self) -> None:
+        """Validate `enable_partial_tail_offload` against the rest of the config.
+
+        The relaxation it grants lives in the offloading connector's partial-tail
+        gate, so the blockers here are the ones that gate cannot inspect: the
+        cache mode the tail state comes from, and the connector that carries it.
+        """
+        if not self.cache_config.enable_partial_tail_offload:
+            return
+
+        blockers: list[str] = []
+        if not (
+            self.cache_config.enable_prefix_caching
+            and self.cache_config.mamba_cache_mode == "align"
+        ):
+            blockers.append("it needs prefix caching with mamba_cache_mode='align'")
+        if self.kv_transfer_config is not None and (
+            self.kv_transfer_config.kv_connector
+            not in (None, "OffloadingConnector", "SimpleCPUOffloadConnector")
+        ):
+            blockers.append("only the offloading KV connectors are supported")
+        if self.parallel_config.decode_context_parallel_size > 1:
+            blockers.append("decode context parallelism is not supported")
+
+        if blockers:
+            raise ValueError(
+                "--enable-partial-tail-offload is not supported in this "
+                f"configuration: {'; '.join(blockers)}."
+            )
 
     def _get_dbo_unsupported_features(self) -> list[str]:
         """Collect what the V2 model runner cannot combine with DBO.

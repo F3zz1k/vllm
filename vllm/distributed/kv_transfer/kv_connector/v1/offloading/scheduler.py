@@ -254,6 +254,12 @@ def resolve_mamba_align_size(
 
 class SchedulerOffloadConfig(NamedTuple):
     kv_group_configs: tuple[GroupOffloadConfig, ...]
+    # The groups a partial tail must carry. Every group while the drafter
+    # exemption is off; with `enable_partial_tail_offload`, the drafter
+    # attention groups leave the set, so a tail is stored, probed and loaded
+    # for the rest. Positions in a transfer spec stay dense over
+    # `kv_group_configs`, so an excluded group contributes zero blocks.
+    partial_tail_groups: tuple[GroupOffloadConfig, ...]
     blocks_per_chunk: int
     tokens_per_hash: int
     num_workers: int
@@ -413,6 +419,7 @@ class SchedulerOffloadConfig(NamedTuple):
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
+            partial_tail_groups=kv_group_configs,
             blocks_per_chunk=spec.blocks_per_chunk,
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,

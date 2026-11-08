@@ -210,6 +210,14 @@ class CacheConfig:
     or context parallelism, a KV connector other than the offloading ones, a
     draft model with Mamba layers, ReplaySSM, multi-module MTP or KV cache
     events."""
+    enable_partial_tail_offload: bool = False
+    """Offload the prompt's partial tail, the sub-block boundary a prefix hit
+    ends inside, for a model whose only obstacle is an EAGLE/MTP drafter group:
+    the drafter group leaves the set of groups a tail must carry instead of
+    rejecting the model. Off by default, which keeps the upstream gate where a
+    drafter group closes the partial tail. Requires prefix caching with
+    mamba_cache_mode "align" and an offloading KV connector. Not supported with
+    decode context parallelism."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
@@ -308,6 +316,7 @@ class CacheConfig:
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
             "enable_mamba_finish_checkpoint",
+            "enable_partial_tail_offload",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",
