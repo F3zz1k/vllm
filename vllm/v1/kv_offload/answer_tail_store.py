@@ -16,7 +16,39 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashWithGroupId
+from vllm.v1.kv_cache_interface import (
+    ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
+    FullAttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    SlidingWindowSpec,
+)
+
+
+def tail_rows_for_group(
+    kv_cache_spec: KVCacheSpec, tokens_per_block: int
+) -> int | None:
+    """How many arena rows one group's tail state costs.
+
+    A group whose state at a position is one block costs one row. A windowed
+    group's state at a position is the window, so it costs the blocks the
+    window spans: ``window / block_size`` rounded up. None when the spec does
+    not say, which is a geometry the store cannot size and must refuse.
+    """
+    if isinstance(kv_cache_spec, SlidingWindowSpec):
+        window = kv_cache_spec.sliding_window
+    elif isinstance(kv_cache_spec, ChunkedLocalAttentionSpec):
+        window = kv_cache_spec.attention_chunk_size
+    elif isinstance(kv_cache_spec, (FullAttentionSpec, MambaSpec, CircularBufferSpec)):
+        return 1
+    else:
+        return None
+    if window <= 0 or tokens_per_block <= 0:
+        return None
+    return cdiv(window, tokens_per_block)
 
 
 @dataclass(frozen=True)
@@ -75,13 +107,16 @@ class AnswerTailStore(ABC):
         self,
         handoff: AnswerTailHandoff,
         group_id: int,
-        block_id: int,
+        block_ids: Sequence[int],
     ) -> bool:
-        """Offer one group's tail block to the tier. False if it refused.
+        """Offer one group's tail rows to the tier, oldest block first. False
+        if it refused.
 
-        A refusal costs the registration nothing: the GPU-side tail key stands
-        on its own, and a tier that cannot take the tail today loses only the
-        resume the RAM tier would have served.
+        The list is the group's state at the tail: one block for a group whose
+        state is one block, the window's worth of blocks for a windowed group
+        (``tail_rows_for_group``). A refusal costs the registration nothing:
+        the GPU-side tail key stands on its own, and a tier that cannot take
+        the tail today loses only the resume the RAM tier would have served.
         """
 
     @abstractmethod
@@ -131,7 +166,7 @@ class NullAnswerTailStore(AnswerTailStore):
         self,
         handoff: AnswerTailHandoff,
         group_id: int,
-        block_id: int,
+        block_ids: Sequence[int],
     ) -> bool:
         return False
 

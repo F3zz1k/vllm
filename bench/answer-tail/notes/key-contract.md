@@ -1,7 +1,8 @@
 # The answer-tail key and bookkeeping contract
 
 Phase 2 step A, branch `answer-tail`: one section per item of `spec-phase2-A.md`, at this
-branch's line numbers. No store hand-off here: step 3, blocked on the Flash-Next window.
+branch's line numbers. Sections 1 to 5 predate the store hand-off; section 6 is the rows a
+tail costs.
 
 ## 1. Tail key naming, and who computes it on lookup
 
@@ -164,5 +165,44 @@ blocks. Every new test asserts it through a helper that reads a real spec, named
 bookkeeping rather than a transfer first stores a real finish tail
 (`_finish_tail_store`, `test_write_back.py:980`) and asserts on that job, so the invariant
 is checked on a store that happened, not on a table the test wrote.
+
+decided
+
+## 6. The rows a tail costs
+
+**The count, and where it comes from.** A tail is stored as the finished turn's state at
+the tail, and one group's state there is not always one block: a resume reads a windowed
+group's whole window, so that group costs `ceil(window / block_size)` arena rows and every
+other group one. The number is `GroupOffloadConfig.tail_rows`
+(`offloading/scheduler.py:206`), read once from the real `kv_cache_config` spec by
+`tail_rows_for_group` (`kv_offload/answer_tail_store.py:31`), which takes the window from
+the spec object that carries it and never from a model's name. A spec that does not say
+yields None, and the store refuses the tail with `window_rows_unresolved` rather than
+storing it at a shape guessed from another layout.
+
+**Only the last row of a group carries the tail key.** The rows before it are whole blocks
+ending at hash-aligned positions, so each is stored under the key its own block owns at
+that position: the key the core registers the same block under for the GPU registry
+(`answer_tail.py:318-330`) and the key `_build_boundary_attention_jobs` writes for the same
+block at an aligned boundary. A new key form was rejected (D10), and sharing one namespace
+is what makes the pool's own dedup the tail's dedup: a window row the band already wrote is
+not taken twice. Only the tail's own keys reach `_note_tail_keys`, because a window row's
+key is a chunk key and the band must stay free to copy that block later.
+
+**Production behaviour for a sliding-window layout is unchanged.** A layout with a
+`SlidingWindowSpec` group still fails the sliding-window clause of `supports_partial_tail`
+(`offloading/scheduler.py:452-456`), and `_build_answer_tail_store_jobs` refuses every offer
+with `layout_unsupported` before it names a key (`offloading/scheduler.py:3610`). Lifting
+that clause is its own commit (D12); what this section fixes is the arithmetic that commit
+will find in place.
+
+**What the gpu-gate finding was, and what it was not.** The finding at `answer_tail.py:291`
+is about the GPU-side registration: the core registers one row at the tail hash per group,
+which is right for the GPU, because `_finish_tail_blocks` reads the window's earlier blocks
+from the prefix cache under their own keys. The store route never stored a windowed tail at
+the wrong row count, because with the clause closed it stores no windowed tail at all. The
+offer now carries the ordered list of blocks per group (`TailOffer.block_ids`), and the
+store allocates, pairs and pins that many rows, so the clause's commit inherits a store that
+counts correctly instead of one that has to be fixed alongside it.
 
 decided

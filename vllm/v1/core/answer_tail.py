@@ -36,6 +36,7 @@ from vllm.v1.kv_offload.answer_tail_store import (
     AnswerTailHandoff,
     AnswerTailStore,
     NullAnswerTailStore,
+    tail_rows_for_group,
 )
 from vllm.v1.request import Request, RequestStatus
 
@@ -261,8 +262,10 @@ class AnswerTail:
         included, and full attention also registers that unit as a lookup-only
         entry. A sliding-window group also registers the in-window blocks
         before the tail under their own keys, and a circular buffer (the ring of
-        the open compression group) is kept under the tail key whole. Must run
-        before the request's blocks are freed.
+        the open compression group) is kept under the tail key whole. The tier
+        is offered the group's state at the tail, which is the window's worth of
+        blocks for a windowed group and one block for the rest. Must run before
+        the request's blocks are freed.
         """
         params = request.sampling_params
         if params is None or finish_stop_token_ids(params) is None:
@@ -309,7 +312,7 @@ class AnswerTail:
                 # The GPU-side registration stands on its own: a tier that
                 # refuses the tail costs nothing here.
                 self.store.store_tail(
-                    handoff, manager.kv_cache_group_id, blocks[0].block_id
+                    handoff, manager.kv_cache_group_id, [blocks[0].block_id]
                 )
                 continue
             if isinstance(manager, SlidingWindowManager):
@@ -335,10 +338,13 @@ class AnswerTail:
                     blocks[(start - 1) // manager.block_size],
                 )
             key = make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id)
-            tail_block = blocks[(num_tokens - 2) // manager.block_size]
+            tail_idx = (num_tokens - 2) // manager.block_size
+            tail_block = blocks[tail_idx]
             registry.register(pool, key, tail_block, tail)
             self.store.store_tail(
-                handoff, manager.kv_cache_group_id, tail_block.block_id
+                handoff,
+                manager.kv_cache_group_id,
+                self._store_row_blocks(manager, blocks, tail_idx),
             )
         logger.debug(
             "Registered the final state of request %s at %d tokens.",
@@ -471,6 +477,21 @@ class AnswerTail:
                     return None
                 hit_blocks[group_id] = list(ring)
         return tuple(hit_blocks)
+
+    @staticmethod
+    def _store_row_blocks(
+        manager: SingleTypeKVCacheManager,
+        blocks: list[KVCacheBlock],
+        tail_idx: int,
+    ) -> list[int]:
+        """The blocks a group's tail rows read, oldest first: the window's
+        worth of blocks for a windowed group, the tail block for the rest. A
+        table shorter than the row count is offered as it stands, and the
+        store refuses a tail that cannot name all of its rows rather than
+        storing half of one."""
+        rows = tail_rows_for_group(manager.kv_cache_spec, manager.block_size)
+        first = tail_idx if rows is None else max(0, tail_idx - rows + 1)
+        return [block.block_id for block in blocks[first : tail_idx + 1]]
 
     @staticmethod
     def _finish_window_start(manager: SingleTypeKVCacheManager, num_computed: int) -> int:

@@ -57,6 +57,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -285,6 +286,147 @@ def _make_drafter_partial_tail_scheduler(
     )
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+# The Flash-Next store geometry: a sliding window that does not divide the
+# block, so a windowed group's tail costs the rounded-up rows, and a hash
+# granularity finer than the block, so a window row has a key to be named by.
+_FN_BLOCK = 1600
+_FN_WINDOW = 8192
+_FN_HASH = 400
+
+
+def _make_flash_next_kv_cache_config(
+    swa_window: int = _FN_WINDOW, swa_block: int = _FN_BLOCK
+) -> KVCacheConfig:
+    """A Flash-Next-shaped group set out of real specs: full attention, a
+    Mamba-align recurrent group, a sliding-window group and the ring of the
+    open compression group. The ring is not prefix-cacheable, which is what
+    puts it outside the offloading group set and makes it a group that no tail
+    key can name."""
+    return KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full_layer"], _full_attention_spec(_FN_BLOCK)),
+            KVCacheGroupSpec(["mamba_layer"], _mamba_align_spec()),
+            KVCacheGroupSpec(
+                ["swa_layer"],
+                SlidingWindowSpec(
+                    block_size=swa_block,
+                    num_kv_heads=4,
+                    head_size=128,
+                    dtype=torch.float32,
+                    sliding_window=swa_window,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["ring_layer"],
+                CircularBufferSpec(
+                    block_size=_FN_BLOCK,
+                    num_kv_heads=4,
+                    head_size=128,
+                    dtype=torch.float32,
+                ),
+            ),
+        ],
+    )
+
+
+def _mamba_align_spec() -> MambaSpec:
+    return MambaSpec(
+        block_size=_FN_BLOCK,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+
+def _make_flash_next_vllm_config() -> Any:
+    vllm_config = _make_vllm_config(
+        extra_config={"self_describing_kv_events": True}
+    )
+    vllm_config.cache_config.prefix_match_unit = _FN_HASH
+    vllm_config.cache_config.enable_partial_tail_offload = True
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    return vllm_config
+
+
+def _make_flash_next_scheduler(**kwargs) -> OffloadingConnectorScheduler:
+    """The connector a Flash-Next-shaped cache config describes, with nothing
+    opened by hand: what it says about group roles and rows is what
+    ``SchedulerOffloadConfig.from_spec`` read out of the specs."""
+    vllm_config = _make_flash_next_vllm_config()
+    kv_cache_config = _make_flash_next_kv_cache_config(**kwargs)
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+def _make_windowed_tail_scheduler(
+    sliding_window: int = _FN_WINDOW,
+    block_size: int = _FN_BLOCK,
+) -> OffloadingConnectorScheduler:
+    """The store shape of a Flash-Next tail: two full-attention groups and one
+    sliding-window group, all at ``block_size`` tokens per block.
+
+    Only the gate is opened by hand here. The clause that closes
+    ``supports_partial_tail`` for a windowed group is a commit of its own, so
+    the store route is reached the way that commit will reach it, while the
+    group roles, the row counts and the keys all come from the real specs. The
+    layout-wide ``_partial_tail_block_size`` stays as the closed gate leaves it
+    because the store route reads its geometry per group, not from it.
+    """
+    vllm_config = _make_flash_next_vllm_config()
+    kv_cache_config = KVCacheConfig(
+        num_blocks=8,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["full_a"], _full_attention_spec(block_size)),
+            KVCacheGroupSpec(["full_b"], _full_attention_spec(block_size)),
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=4,
+                    head_size=128,
+                    dtype=torch.float32,
+                    sliding_window=sliding_window,
+                ),
+            ),
+        ],
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    scheduler = OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+    scheduler.config = scheduler.config._replace(supports_partial_tail=True)
+    return scheduler
+
+
+def test_a_tail_costs_the_rows_the_real_cache_groups_define():
+    # The rows a tail costs are a property of the layout, not of a model name:
+    # a windowed group pays the blocks its window spans, every other group one
+    # block, and a group outside the offloading set is one no tail can name.
+    config = _make_flash_next_scheduler().config
+    assert [(c.group_idx, c.tail_rows) for c in config.kv_group_configs] == [
+        (0, 1),
+        (1, 1),
+        (2, (_FN_WINDOW + _FN_BLOCK - 1) // _FN_BLOCK),
+    ]
+    assert config.tail_omitted_groups == (3,)
+    assert [c.group_idx for c in config.partial_tail_groups] == [0, 1, 2]
+    # The store route is still closed for this layout by the sliding-window
+    # clause, a commit of its own: what this pins is the arithmetic that commit
+    # will find in place, not a tail being stored.
+    assert config.supports_partial_tail is False
+
+
+def test_an_undivided_window_rounds_up_the_group_row_count():
+    # 5000 tokens of window at 1600 tokens per block is 3.125 blocks: the
+    # config says four, because a resume reads the fourth one whole.
+    config = _make_flash_next_scheduler(swa_window=5000, swa_block=_FN_BLOCK).config
+    assert config.kv_group_configs[2].tail_rows == 4
 
 
 def test_create_req_context_preserves_kv_hints():

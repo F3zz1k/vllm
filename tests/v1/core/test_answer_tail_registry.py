@@ -35,7 +35,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 try:  # The tail store is new; base 539da2bff6 has no answer_tail_store module.
-    from vllm.v1.kv_offload.answer_tail_store import NullAnswerTailStore
+    from vllm.v1.kv_offload.answer_tail_store import (
+        AnswerTailHandoff,
+        NullAnswerTailStore,
+    )
 except ImportError:  # base 539da2bff6
     pytest.skip("answer_tail_store absent", allow_module_level=True)
 
@@ -297,11 +300,19 @@ def test_reset_prefix_cache_clears_the_tail_registry():
 
 class _RecordingTailStore(NullAnswerTailStore):
     """The tier a finished turn's tails are offered to, keeping the keys it was
-    told the GPU forgot. The store side of the seam is tested with the store
-    that actually serves it; here only the reach of the registry's forget is."""
+    told the GPU forgot and the rows it was offered per group. The store side
+    of the seam is tested with the store that actually serves it; here only the
+    reach of the registry's forget and what the core hands over."""
 
     def __init__(self) -> None:
         self.forgotten: list[BlockHashWithGroupId] = []
+        self.offered: list[tuple[int, list[int]]] = []
+
+    def store_tail(
+        self, handoff: AnswerTailHandoff, group_id: int, block_ids: list[int]
+    ) -> bool:
+        self.offered.append((group_id, list(block_ids)))
+        return False
 
     def forget_tail(self, tail_key: BlockHashWithGroupId) -> None:
         self.forgotten.append(tail_key)
@@ -327,3 +338,25 @@ def test_a_tail_the_gpu_forgot_reaches_the_store_it_was_offered_to():
 
     assert pool.get_cached_block(tail, [MAMBA]) is None
     assert store.forgotten == [make_block_hash_with_group_id(tail, MAMBA)]
+
+
+def test_the_store_is_offered_the_window_a_windowed_group_state_sits_in():
+    """A tier keeps the rows it is handed rather than blocks it can reach on the
+    GPU, so a windowed group is offered the blocks its window spans (ceil(20 /
+    16) = 2 here) and every other group the one block its state at the tail is."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    manager.answer_tail.store = store
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    held = _run_to_finish(manager, finished, OUTPUT)
+    tail_block_idx = (finished.num_tokens - 2) // BLOCK
+    offered = dict(store.offered)
+
+    assert offered[FULL] == [held[FULL][tail_block_idx].block_id]
+    assert offered[MAMBA] == [held[MAMBA][tail_block_idx].block_id]
+    assert offered[RING] == [held[RING][0].block_id]
+    assert len(offered[SWA]) == (WINDOW + BLOCK - 1) // BLOCK
+    first = tail_block_idx - len(offered[SWA]) + 1
+    assert offered[SWA] == [
+        block.block_id for block in held[SWA][first : tail_block_idx + 1]
+    ]

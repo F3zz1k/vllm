@@ -35,12 +35,12 @@ _MAX_OFFERS = 1 << 12
 
 @dataclass
 class TailOffer:
-    """One tail waiting to become a store: the hand-off the core named, the
-    GPU block per group the tail's state sits in, and how many steps the pool
-    has refused it for."""
+    """One tail waiting to become a store: the hand-off the core named, the GPU
+    blocks the tail's state sits in, oldest row first and one list per group,
+    and how many steps the pool has refused it for."""
 
     handoff: AnswerTailHandoff
-    block_ids: dict[int, int] = field(default_factory=dict)
+    block_ids: dict[int, list[int]] = field(default_factory=dict)
     tries: int = 0
 
 
@@ -61,11 +61,12 @@ class AnswerTailNotifier(AnswerTailStore):
         self,
         handoff: AnswerTailHandoff,
         group_id: int,
-        block_id: int,
+        block_ids: Sequence[int],
     ) -> bool:
-        """Queue one group's tail block. The tail is complete when every group
-        the core registered for it has been offered, which is true by the time
-        the connector drains the queue on its next step."""
+        """Queue one group's tail rows, oldest block first. The tail is
+        complete when every group the core registered for it has been offered,
+        which is true by the time the connector drains the queue on its next
+        step."""
         key = (handoff.request_id, bytes(handoff.tail_hash))
         offer = self.pending.get(key)
         if offer is None:
@@ -74,7 +75,7 @@ class AnswerTailNotifier(AnswerTailStore):
             offer = self.pending[key] = TailOffer(handoff)
         else:
             self.pending.move_to_end(key)
-        offer.block_ids[group_id] = block_id
+        offer.block_ids[group_id] = list(block_ids)
         return True
 
     def take_offers(self) -> list[TailOffer]:
@@ -101,8 +102,13 @@ class AnswerTailNotifier(AnswerTailStore):
         The queue key names the request as well as the hash, and the core's
         forget hook has only the key, so this walks the queue: it holds at most
         ``_MAX_OFFERS`` tails and the hook is rare, a block losing its hashes.
-        Every group of one tail shares the tail's hash, so one block losing it
-        drops the whole offer: a tail missing a group is never stored.
+        Every group of one tail shares the tail's hash, and every row of one
+        group shares that group's tail key, so one block losing it drops the
+        whole offer: a tail missing a group, or a group missing a row, is never
+        stored. The rows a windowed group takes before its tail block are keyed
+        by their own chunk hashes, which are not tail keys and so never reach
+        here; a store that has to wait for room re-reads those blocks instead
+        (see the connector's ``_tail_rows_on_gpu``).
         """
         wanted = bytes(tail_key)[:-4]
         for key in [k for k in self.pending if k[1] == wanted]:

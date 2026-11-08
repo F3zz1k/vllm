@@ -17,12 +17,16 @@ from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
     _make_drafter_partial_tail_scheduler,
     _make_partial_tail_request,
     _make_partial_tail_scheduler,
+    _make_windowed_tail_scheduler,
 )
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
     generate_store_output,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
 )
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -1141,13 +1145,21 @@ def _answer_tail_offer(
     pool_refused: bool = False,
     groups: tuple[int, ...] | None = None,
     null_group: int | None = None,
+    scheduler: OffloadingConnectorScheduler | None = None,
+    rows_override: dict[int, int] | None = None,
 ):
     """A finished turn's tail as the engine core offers it, and the connector
-    that could store it: the scheduler, the hand-off and the GPU block the
-    offer named per group. Nothing is stored here; the test drains.
+    that could store it: the scheduler, the hand-off and the GPU blocks the
+    offer named per group, oldest row first. Nothing is stored here; the test
+    drains the queue.
     """
-    scheduler = _make_drafter_partial_tail_scheduler(True)
-    request = _make_partial_tail_request(scheduler)
+    if scheduler is None:
+        scheduler = _make_drafter_partial_tail_scheduler(True)
+        prompt_tokens = 30
+    else:
+        # Long enough that a windowed group's rows all sit inside its table.
+        prompt_tokens = 12_000
+    request = _make_partial_tail_request(scheduler, num_prompt_tokens=prompt_tokens)
     req_status = scheduler._req_status["req"]
     if keyed_chunk:
         req_status.update_offload_keys()       # the conversation keyed a chunk
@@ -1160,12 +1172,20 @@ def _answer_tail_offer(
         length=12,
         resume_token=request.num_tokens - 1,
     )
+    rows = {g.group_idx: g.tail_rows for g in tail_configs}
+    if rows_override:
+        rows.update(rows_override)
     blocks = {
-        group_idx: (0 if group_idx == null_group else 100 + group_idx)
+        group_idx: [
+            0
+            if group_idx == null_group and row == 0
+            else 100 + 10 * group_idx + row
+            for row in range(rows[group_idx])
+        ]
         for group_idx in wanted
     }
-    for group_idx, block_id in blocks.items():
-        assert scheduler.answer_tail_store.store_tail(handoff, group_idx, block_id)
+    for group_idx, block_ids in blocks.items():
+        assert scheduler.answer_tail_store.store_tail(handoff, group_idx, block_ids)
     scheduler.manager.prepare_store_run = MagicMock(
         side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
     )
@@ -1205,7 +1225,7 @@ def test_an_offered_answer_tail_becomes_one_store_in_its_run():
     assert tag == _tail_run_tag(scheduler)
     assert not kwargs["whole"]
     assert jobs[job_id].src_spec.block_ids.tolist() == [
-        blocks[group] for group in sorted(blocks)
+        block for group in sorted(blocks) for block in blocks[group]
     ]
     assert scheduler._tail_counts["tail_offered"] == 1
     assert scheduler._tail_counts["tail_stored"] == 1
@@ -1246,11 +1266,12 @@ def test_a_tail_store_is_offered_again_until_its_retries_run_out():
     _assert_nothing_half_built(scheduler)
 
 
-def _tail_gpu_blocks(handoff, blocks: dict[int, int]) -> dict[int, KVCacheBlock]:
-    """The GPU as a retried offer sees it: one block per group, each cached
-    under that group's tail key, which is what the retry is checked against."""
+def _tail_gpu_blocks(handoff, blocks: dict[int, list[int]]) -> dict[int, KVCacheBlock]:
+    """The GPU as a retried offer sees a one-row-per-group layout: one block
+    per group, cached under that group's tail key, which is what the retry is
+    checked against."""
     tail_blocks = {
-        group_idx: KVCacheBlock(block_id) for group_idx, block_id in blocks.items()
+        group_idx: KVCacheBlock(block_ids[0]) for group_idx, block_ids in blocks.items()
     }
     for group_idx, block in tail_blocks.items():
         block.set_block_hash(
@@ -1456,6 +1477,177 @@ def test_a_tail_pin_left_by_a_shutdown_is_released():
     assert scheduler._tail_counts.get("tail_pin_leaked", 0) == 0
 
 
+# --- a windowed group's rows: the store shape of a Flash-Next tail ---
+
+
+def _windowed_tail_offer(
+    sliding_window: int = 8192,
+    block_size: int = 1600,
+    **offer_kwargs,
+):
+    """A Flash-Next tail offered to a store: two full-attention groups and one
+    sliding-window group, so the windowed group costs the blocks its window
+    spans and the other two one block each.
+    """
+    return _answer_tail_offer(
+        scheduler=_make_windowed_tail_scheduler(
+            sliding_window=sliding_window, block_size=block_size
+        ),
+        **offer_kwargs,
+    )
+
+
+def _window_row_key(scheduler, block_idx: int, group_idx: int = 2) -> OffloadKey:
+    """The key a windowed group's row is stored under: the key the block at
+    ``block_idx`` owns at the position that block ends at, which is the key an
+    aligned store of the same block would use."""
+    group = next(
+        g for g in scheduler.config.kv_group_configs if g.group_idx == group_idx
+    )
+    boundary = (block_idx + 1) * group.tokens_per_block
+    hashes = scheduler._req_status["req"].req.block_hashes
+    return make_offload_key(
+        hashes[boundary // scheduler.config.tokens_per_hash - 1], group_idx
+    )
+
+
+def test_a_windowed_group_costs_its_window_of_rows_in_the_store():
+    # A resume at the tail reads the whole window of a windowed group, so the
+    # store takes a row for every block that window spans and pairs each with
+    # the block its key names: here 1 + 1 + ceil(8192 / 1600) rows.
+    scheduler, handoff, blocks = _windowed_tail_offer()
+    jobs = scheduler._build_answer_tail_store_jobs()
+
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
+    src = jobs[job_id].src_spec
+    assert list(src.group_sizes) == [1, 1, 6]
+    assert src.block_ids.tolist() == [
+        block for group in sorted(blocks) for block in blocks[group]
+    ]
+    # The window's rows are the six blocks ending at the tail block, so the
+    # group's transfer starts at its third block and runs six on.
+    assert src.block_indices[2] == 2
+    # The pool numbers its rows in the order it was offered its keys, so the
+    # rows the job hands the worker pair with those blocks one for one.
+    assert jobs[job_id].dst_spec.block_ids.tolist() == list(range(8))
+    (offered, tag), _ = scheduler.manager.prepare_store_run.call_args
+    assert tag == _tail_run_tag(scheduler)
+    tail_keys = _tail_keys(handoff, sorted(blocks))
+    assert sorted(k for k in offered if k in tail_keys) == sorted(tail_keys)
+    assert len(offered) - len(tail_keys) == 5  # the window's other rows
+    assert all(scheduler._tail_run[k] == tag for k in tail_keys)
+
+
+def test_a_window_row_the_pool_already_holds_is_not_stored_twice():
+    # A window row carries the key its block owns, the same key an aligned
+    # store of that block uses, so the pool's own dedup is the tail's: the row
+    # is taken once, the rows that are left stay paired with the blocks their
+    # keys name, and a chunk key is never recorded as a tail.
+    scheduler, _, blocks = _windowed_tail_offer()
+    # The window is the six blocks ending at the tail block, so its third row
+    # is the block three places before that one.
+    resident = _window_row_key(scheduler, 4)
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(
+            [key for key in keys if key != resident]
+        )
+    )
+    jobs = scheduler._build_answer_tail_store_jobs()
+
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
+    src = jobs[job_id].src_spec
+    assert list(src.group_sizes) == [1, 1, 5]
+    kept = blocks[2][:2] + blocks[2][3:]
+    assert src.block_ids.tolist() == blocks[0] + blocks[1] + kept
+    assert jobs[job_id].dst_spec.block_ids.tolist() == list(range(7))
+    assert resident not in scheduler._jobs[job_id].keys
+    assert resident not in scheduler._tail_run
+
+
+def test_a_window_that_does_not_divide_the_block_rounds_the_rows_up():
+    # 5000 tokens of window at 1600 tokens per block is 3.125 blocks, and the
+    # store pays for the fourth because a resume reads it whole.
+    scheduler, _, _ = _windowed_tail_offer(sliding_window=5000)
+    assert scheduler.config.kv_group_configs[2].tail_rows == 4
+
+    jobs = scheduler._build_answer_tail_store_jobs()
+
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
+    assert list(jobs[job_id].src_spec.group_sizes) == [1, 1, 4]
+    assert len(scheduler._jobs[job_id].keys) == 6
+
+
+def test_a_tail_that_names_fewer_rows_than_a_group_costs_is_refused_whole():
+    # A tail naming three of the four rows its windowed group costs is half a
+    # tail, and a restore missing a window row reads the wrong KV and reports
+    # nothing. The pool is asked for nothing and nothing is left half-built.
+    scheduler, _, _ = _windowed_tail_offer(sliding_window=5000, rows_override={2: 3})
+
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert scheduler._tail_counts["hand_off_incomplete"] == 1
+    _assert_nothing_half_built(scheduler)
+
+
+def test_a_group_the_store_cannot_size_refuses_the_tail_before_asking_the_pool():
+    # A row count the specs do not give is not guessed at: a tail stored at a
+    # shape borrowed from another layout costs rows no restore can read back,
+    # which is the defect this row count exists to close.
+    scheduler, _, _ = _windowed_tail_offer()
+    groups = list(scheduler.config.partial_tail_groups)
+    groups[2] = groups[2]._replace(tail_rows=None)
+    scheduler.config = scheduler.config._replace(partial_tail_groups=tuple(groups))
+
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert scheduler._tail_counts["window_rows_unresolved"] == 1
+    _assert_nothing_half_built(scheduler)
+
+
+def test_a_retry_revalidates_every_row_the_offer_named():
+    # The blocks a retried offer named went back to the free queue with the
+    # finished turn, and a window row is keyed by the key its own block owns,
+    # so the tail keys are not the only ones at risk. A row whose block moved
+    # holds someone else's bytes, and the tail is given up on whole.
+    scheduler, _, _ = _windowed_tail_offer(pool_refused=True)
+    [offer] = scheduler.answer_tail_store.take_offers()
+    rows = scheduler._tail_store_rows(offer, scheduler._req_status["req"])
+    assert scheduler.answer_tail_store.requeue(offer)
+    gpu = {}
+    for row in rows:
+        block = KVCacheBlock(row.block_id)
+        block.set_block_hash(
+            make_block_hash_with_group_id(
+                BlockHash(bytes(row.key)[:-4]), row.group.group_idx
+            ),
+            12,
+        )
+        gpu[row.block_id] = block
+    scheduler.bind_gpu_block_pool(FakeGPUPool(list(gpu.values())))
+
+    # Step N: the pool is full, and every row is still where the offer named it.
+    assert not scheduler._build_answer_tail_store_jobs()
+    assert scheduler._tail_counts["tail_retried"] == 1
+
+    # A new owner takes the block a window row named, and its key with it.
+    moved = next(row for row in rows if not row.is_tail)
+    gpu[moved.block_id].reset_hash()
+    gpu[moved.block_id].set_block_hash(
+        make_block_hash_with_group_id(BlockHash(b"owner"), moved.group.group_idx), 12
+    )
+
+    # Step N+2: the retry sees the moved row and gives the tail up.
+    assert not scheduler._build_answer_tail_store_jobs()
+    assert scheduler._tail_counts["stale_offer"] == 1
+    assert scheduler._tail_counts["tail_stored"] == 0
+    assert scheduler.manager.prepare_store_run.call_count == 1
+    assert scheduler.answer_tail_store.pending == {}
+    _assert_nothing_half_built(scheduler)
+
+
 def test_the_restore_of_a_tail_is_refused_by_name():
     # A tail that comes back missing a group, or carrying a state that is not
     # the one the resume position needs, is read silently. So the load side
@@ -1498,7 +1690,7 @@ def test_an_offered_answer_tail_is_inert_without_the_flag():
         length=12,
         resume_token=29,
     )
-    scheduler.answer_tail_store.store_tail(handoff, 0, 100)
+    scheduler.answer_tail_store.store_tail(handoff, 0, [100])
 
     assert not scheduler._build_answer_tail_store_jobs()
     scheduler.manager.prepare_store_run.assert_not_called()

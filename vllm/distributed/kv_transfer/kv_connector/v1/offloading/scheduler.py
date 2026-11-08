@@ -51,6 +51,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+from vllm.v1.kv_offload.answer_tail_store import tail_rows_for_group
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     Locality,
@@ -198,6 +199,11 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # Arena rows an answer tail costs this group: one for a group whose state
+    # at a position is one block, the window's worth of blocks for a windowed
+    # group. None when the spec does not say, and a tail the store cannot size
+    # is refused rather than stored at a shape no restore can read.
+    tail_rows: int | None = None
 
     @property
     def tail_optional(self) -> bool:
@@ -407,6 +413,7 @@ class SchedulerOffloadConfig(NamedTuple):
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
                     ),
+                    tail_rows=tail_rows_for_group(kv_spec, tokens_per_block),
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
@@ -661,6 +668,23 @@ class TailStoreRefusal:
     """
 
     reason: str
+
+
+class TailRow(NamedTuple):
+    """One arena row an answer-tail store takes.
+
+    ``is_tail`` marks the row a resume probes, keyed by the tail's own hash.
+    The rows before it belong to a windowed group and carry the key their GPU
+    block owns at the position that block ends at, so a row the pool already
+    holds is the same row the tail needs rather than a second copy of it.
+    """
+
+    group: GroupOffloadConfig
+    key: OffloadKey
+    block_id: int
+    # Index of ``block_id`` in the group's block table.
+    block_idx: int
+    is_tail: bool
 
 
 def _parse_tier_filter(raw: Any) -> TierFilter:
@@ -1627,19 +1651,27 @@ class OffloadingConnectorScheduler:
         group = int.from_bytes(bytes(key)[-4:], "big")
         return bool(pool.get_cached_block(BlockHash(bytes(key)[:-4]), [group]))
 
-    def _tail_keys_on_gpu(self, keys: list[OffloadKey]) -> bool:
-        """Whether the GPU still caches the tail key of every group.
+    def _tail_rows_on_gpu(self, rows: list[TailRow]) -> bool:
+        """Whether the GPU still caches every row's block under that row's key.
 
         A tail key is lookup-only and lives as long as the block carrying it
-        keeps its hashes, so this says whether the blocks an offer named are
-        still the tail's. With no GPU pool bound the connector has nothing to
-        ask and a retried offer is taken as offered: the store route is
-        installed by the same bind that hands over the pool, so an engine that
-        can be offered a tail can always answer.
+        keeps its hashes, and a windowed group's earlier rows are keyed by the
+        key their block owns, so this says whether every block an offer named
+        is still the row it named. With no GPU pool bound the connector has
+        nothing to ask and a retried offer is taken as offered: the store route
+        is installed by the same bind that hands over the pool, so an engine
+        that can be offered a tail can always answer.
         """
-        if self._gpu_block_pool is None:
+        pool = self._gpu_block_pool
+        if pool is None:
             return True
-        return all(self._gpu_has(key) for key in keys)
+        for row in rows:
+            found = pool.get_cached_block(
+                BlockHash(bytes(row.key)[:-4]), [get_offload_group_idx(row.key)]
+            )
+            if not found or found[0].block_id != row.block_id:
+                return False
+        return True
 
     def _storable_free_block(self, key: OffloadKey, config_idx_by_group: dict[int, int]):
         """(block, config_idx, num_tokens) for key if its GPU block is free (settled,
@@ -3654,9 +3686,13 @@ class OffloadingConnectorScheduler:
         """Build the one store job an answer tail needs, or a refusal naming
         why nothing was reserved.
 
-        The keys are the tail's own, made from the hash the core computed: a
-        tail sits between two hash boundaries, so no key the connector can name
-        from ``request.block_hashes`` reaches it. The source blocks are the ones
+        A tail is stored as the finished turn's state at the tail, one row per
+        group whose state there is one block and the window's worth of rows per
+        windowed group (``GroupOffloadConfig.tail_rows``). Only the last row of
+        a group carries the tail's own key: a tail sits between two hash
+        boundaries, so no key the connector can name from
+        ``request.block_hashes`` reaches it, while the rows before it are whole
+        blocks that do have a key of their own. The source blocks are the ones
         the core offered with those keys, so the job reads exactly the blocks
         the finished turn left its state in.
 
@@ -3671,19 +3707,27 @@ class OffloadingConnectorScheduler:
             # and no request left to fence the source blocks for.
             return TailStoreRefusal("untracked_request")
         tail_configs = self.config.partial_tail_groups
-        if any(group.group_idx not in offer.block_ids for group in tail_configs):
-            # A group the tail must carry and did not name. Storing half a
-            # tail is the one outcome to avoid: a restore missing a recurrent
-            # state group reads a wrong state and reports nothing.
-            return TailStoreRefusal("hand_off_incomplete")
-        block_ids = [offer.block_ids[group.group_idx] for group in tail_configs]
-        if any(block_id == 0 for block_id in block_ids):
-            return TailStoreRefusal("null_source_block")
-        keys = [
-            make_offload_key(bytes(handoff.tail_hash), group.group_idx)
+        if any(group.tail_rows is None for group in tail_configs):
+            # A group this store cannot size. Storing it at a shape guessed
+            # from another layout is how a tail ends up costing rows no restore
+            # can read back, so the tail is refused whole.
+            return TailStoreRefusal("window_rows_unresolved")
+        if any(
+            len(offer.block_ids.get(group.group_idx, ())) != group.tail_rows
             for group in tail_configs
-        ]
-        if offer.tries and not self._tail_keys_on_gpu(keys):
+        ):
+            # A group the tail must carry and did not name every row for.
+            # Storing half a tail is the one outcome to avoid: a restore
+            # missing a recurrent state group reads a wrong state and reports
+            # nothing.
+            return TailStoreRefusal("hand_off_incomplete")
+        rows = self._tail_store_rows(offer, req_status)
+        if isinstance(rows, TailStoreRefusal):
+            return rows
+        if any(row.block_id == 0 for row in rows):
+            return TailStoreRefusal("null_source_block")
+        keys = [row.key for row in rows]
+        if offer.tries and not self._tail_rows_on_gpu(rows):
             # The blocks an offer named are the finished turn's, and they went
             # back to the free queue with it: while the retry waited one of
             # them may have been given to a new owner and written. Its bytes
@@ -3708,11 +3752,10 @@ class OffloadingConnectorScheduler:
                 _ConnectorMetricName.ALLOCATION_FAILURE
             )
             return TailStoreRefusal("store_pool_refused")
-        accepted = [
-            (group, key, block_id)
-            for group, key, block_id in zip(tail_configs, keys, block_ids)
-            if key in store_output.keys_to_store
-        ]
+        # The pool returns its rows in the order it was offered its keys, minus
+        # the keys it already holds, so taking the rows in that same order
+        # pairs each row with the block its key names.
+        accepted = [row for row in rows if row.key in store_output.keys_to_store]
         if not accepted:
             # The pool holds every tail row already: nothing was written and
             # nothing was lost, but there is no job to hand over.
@@ -3720,28 +3763,30 @@ class OffloadingConnectorScheduler:
 
         # Record the tail before the job can complete: on completion the band
         # must believe the pool holds these keys without reading them as the
-        # state of a chunk boundary.
-        self._note_tail_keys(req_status, [key for _, key, _ in accepted])
+        # state of a chunk boundary. Only the tail's own keys are tails: a
+        # window row's key is the key its block owns, and a block the band
+        # could copy later must stay copyable.
+        self._note_tail_keys(req_status, [row.key for row in accepted if row.is_tail])
         # No KV event here, unlike the aligned tail stores: a self-describing
         # event describes the hash-aligned prefix of one physical block, and an
         # answer tail is neither aligned nor a prefix of anything. A tail key is
         # lookup-only, so publishing one would advertise a key no lookup can
         # name to a consumer that would then never find it.
 
-        # A tail is one block per group, and the layout that gets here at all
-        # agrees on one block size (see supports_partial_tail).
         req = req_status.req
-        block_idx = handoff.resume_token // self._partial_tail_block_size
         group_sizes = [0] * len(self.config.kv_group_configs)
         block_indices = [0] * len(self.config.kv_group_configs)
         source_blocks: list[int] = []
-        for group, _, block_id in accepted:
-            config_idx = self._config_idx_by_group[group.group_idx]
-            group_sizes[config_idx] = 1
-            block_indices[config_idx] = block_idx
-            source_blocks.append(block_id)
+        for row in accepted:
+            config_idx = self._config_idx_by_group[row.group.group_idx]
+            # A group's rows are logically contiguous in its table, so one
+            # index names where they start and its size how many there are.
+            if group_sizes[config_idx] == 0:
+                block_indices[config_idx] = row.block_idx
+            group_sizes[config_idx] += 1
+            source_blocks.append(row.block_id)
 
-        pinned = self._pin_tail_rows([key for _, key, _ in accepted])
+        pinned = self._pin_tail_rows([row.key for row in accepted])
         job_id = self._generate_job_id()
         req_status.transfer_jobs.add(job_id)
         for block_id in source_blocks:
@@ -3749,7 +3794,7 @@ class OffloadingConnectorScheduler:
         self._jobs[job_id] = TransferJobStatus(
             req_id=req.request_id,
             pending_count=self.config.num_workers,
-            keys=set(key for _, key, _ in accepted),
+            keys=set(row.key for row in accepted),
             is_store=True,
             is_tail_store=True,
             fenced_block_ids=source_blocks,
@@ -3782,13 +3827,68 @@ class OffloadingConnectorScheduler:
             dst_spec=store_output.store_spec,
         )
 
+    def _tail_store_rows(
+        self, offer: TailOffer, req_status: "RequestOffloadState"
+    ) -> list[TailRow] | TailStoreRefusal:
+        """The rows an answer tail is stored as, in the order the store offers
+        them: each group's rows oldest block first, the groups in config order.
+
+        The last row of a group is the tail's own. The rows before it are a
+        windowed group's window, and each is keyed by the key its block owns at
+        the position that block ends at, the same key the core registers that
+        block under, so the tail's rows and the conversation's own rows share
+        one namespace instead of standing up copies of each other.
+        """
+        handoff = offer.handoff
+        rows: list[TailRow] = []
+        for group in self.config.partial_tail_groups:
+            block_ids = offer.block_ids[group.group_idx]
+            # The core's tail block: the state before the finished turn's last
+            # token, which is the position the resume restarts at.
+            first_idx = (
+                (handoff.resume_token - 1) // group.tokens_per_block
+                - len(block_ids)
+                + 1
+            )
+            for offset, block_id in enumerate(block_ids):
+                block_idx = first_idx + offset
+                is_tail = offset == len(block_ids) - 1
+                if is_tail:
+                    key = make_offload_key(bytes(handoff.tail_hash), group.group_idx)
+                else:
+                    key = self._tail_window_key(req_status, group, block_idx)
+                    if key is None:
+                        return TailStoreRefusal("window_rows_unresolved")
+                rows.append(TailRow(group, key, block_id, block_idx, is_tail))
+        return rows
+
+    def _tail_window_key(
+        self,
+        req_status: "RequestOffloadState",
+        group: GroupOffloadConfig,
+        block_idx: int,
+    ) -> OffloadKey | None:
+        """The key a windowed group's row is stored under: the key of the block
+        at ``block_idx``, named at the token count that block ends at. None
+        when the request's own hashes do not reach that far or do not fall on
+        that position, which is a row no lookup could ever name again."""
+        boundary = (block_idx + 1) * group.tokens_per_block
+        tokens_per_hash = self.config.tokens_per_hash
+        if block_idx < 0 or boundary % tokens_per_hash:
+            return None
+        if boundary // tokens_per_hash > len(req_status.req.block_hashes):
+            return None
+        return self._make_boundary_key(
+            req_status.req, group.group_idx, boundary, req_status.req_context
+        )
+
     def _pin_tail_rows(self, keys: list[OffloadKey]) -> list[OffloadKey]:
         """The short pin: hold the rows a tail store just took for its copy.
 
         The pool's pin is the only hold it offers a client, and it outlives the
         client, so it is taken here for one copy and released by
         ``_unpin_tail_rows`` on every path that ends the job. The rows this
-        pins are the tail's own, so the count is a level read as
+        pins are the ones the store just took, so the count is a level read as
         ``tail_pinned - tail_unpinned``.
         """
         pin = getattr(self.manager, "pin", None)
