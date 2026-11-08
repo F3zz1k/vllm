@@ -783,10 +783,8 @@ def test_partial_tail_step_path_counts_a_store_the_pool_refused():
 
     assert not jobs
     assert scheduler._tail_counts == {"store_pool_refused": 1}
-    assert (
-        scheduler._connector_stats.data["data"][_ConnectorMetricName.ALLOCATION_FAILURE]
-        == {(): 1}
-    )
+    counters = scheduler._connector_stats.data["data"]
+    assert counters[_ConnectorMetricName.ALLOCATION_FAILURE] == {(): 1}
     _assert_nothing_half_built(scheduler)
 
 
