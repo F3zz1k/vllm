@@ -641,6 +641,17 @@ class RequestOffloadState:
             )
 
 
+@dataclass(frozen=True)
+class TailStoreRefusal:
+    """Why a partial tail could not be stored, carried in place of a job.
+
+    ``_tail_store_job`` returns the job it built or one of these, so the step
+    path and the finish path count the same reason for the same failure.
+    """
+
+    reason: str
+
+
 def _parse_tier_filter(raw: Any) -> TierFilter:
     """Parse raw kv_transfer_params tier matchers into a TierFilter."""
     if not isinstance(raw, list):
@@ -3149,18 +3160,18 @@ class OffloadingConnectorScheduler:
 
         store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
         # Same whole-tail policy as the finish path: a layout with a group
-        # outside the offload set cannot name every tail key, so no tail. A
-        # hand-off repeats every step and names no request here, so the refusal
-        # is counted every step and announced once, and only under the flag:
-        # with the flag off an unsupported layout is the ordinary case.
+        # outside the offload set cannot name every tail key, so no tail. The
+        # hand-off names no request here and repeats every step, so the refusal
+        # counts the tails it drops rather than the step that carried them.
         if self.config.tail_omitted_groups or not self.config.supports_partial_tail:
-            if self.config.enable_partial_tail_offload:
-                reason = (
-                    "groups_without_tail_keys"
-                    if self.config.tail_omitted_groups
-                    else "layout_unsupported"
-                )
-                self._refuse_partial_tail(reason, None, None)
+            reason = (
+                "groups_without_tail_keys"
+                if self.config.tail_omitted_groups
+                else "layout_unsupported"
+            )
+            self._refuse_partial_tail(
+                reason, None, None, count=self._hand_off_tail_count(handoffs)
+            )
             return store_jobs
 
         for req_id, entries in handoffs.items():
@@ -3191,21 +3202,26 @@ class OffloadingConnectorScheduler:
                 req.num_prompt_tokens,
                 req_status.max_offload_tokens or req.num_prompt_tokens,
             )
-            # A hand-off that names tokens the request may not offload, e.g. a
-            # caller-set max_offload_tokens below the boundary, is a refusal:
-            # this runs inside build_connector_meta on the engine core, and the
-            # aligned path skips the same entry.
-            if (
-                boundary <= 0
-                or boundary % self.config.tokens_per_hash != 0
-                or boundary > max_boundary
-            ):
+            # An unusable boundary is refused here, as the aligned path skips
+            # the entry: this runs inside build_connector_meta on the engine
+            # core, where raising takes every session down with it.
+            if boundary <= 0 or boundary % self.config.tokens_per_hash != 0:
                 self._refuse_partial_tail("boundary_unusable", req_id, boundary)
+                continue
+            if boundary > max_boundary:
+                # A caller-set max_offload_tokens below the boundary names
+                # tokens the request may not offload. Step-only reason: the
+                # finish path counts the same shape as boundary_unusable, and
+                # a cap that keeps cutting a tail off is a separate signal.
+                self._refuse_partial_tail("beyond_offload_cap", req_id, boundary)
                 continue
 
             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
             if not self._cow_source_groups.issubset(cow_blocks):
-                self._refuse_partial_tail("state_source_missing", req_id, boundary)
+                # Step-only reason: a hand-off that names no state block for a
+                # recurrent group this step is routine, unlike the finish
+                # path's, where the tail is gone for good.
+                self._refuse_partial_tail("hand_off_incomplete", req_id, boundary)
                 continue
 
             job = self._tail_store_job(
@@ -3214,13 +3230,33 @@ class OffloadingConnectorScheduler:
                 cow_blocks,
                 {idx: state.block_ids for idx, state in group_states.items()},
             )
-            if job is None:
-                self._refuse_partial_tail("source_block_missing", req_id, boundary)
+            if isinstance(job, TailStoreRefusal):
+                self._refuse_partial_tail(job.reason, req_id, boundary)
                 continue
             job_id, store_job = job
             store_jobs[job_id] = store_job
 
         return store_jobs
+
+    def _hand_off_tail_count(
+        self, handoffs: dict[str, list[tuple[int, int, int]]]
+    ) -> int:
+        """How many tails a step's hand-offs ask for.
+
+        One per request that carries a boundary the aligned path cannot store,
+        the same unit a per-request refusal counts. A layout the partial tail
+        does not serve cannot tell an aligned boundary from a tail, because the
+        block size that separates them is only resolved for a supported layout,
+        so there every hand-off is taken for a tail.
+        """
+        block_size = self._partial_tail_block_size
+        if not block_size:
+            return len(handoffs)
+        return sum(
+            1
+            for entries in handoffs.values()
+            if any(entry[2] % block_size != 0 for entry in entries)
+        )
 
     def _tail_store_job(
         self,
@@ -3228,7 +3264,7 @@ class OffloadingConnectorScheduler:
         boundary: int,
         cow_blocks: dict[int, int],
         block_ids_by_group: dict[int, list[int]],
-    ) -> tuple[int, TransferJob] | None:
+    ) -> tuple[int, TransferJob] | TailStoreRefusal:
         """Build the one store job a partial tail at ``boundary`` needs.
 
         A recurrent group takes its source from the scheduler's CoW hand-off
@@ -3236,8 +3272,9 @@ class OffloadingConnectorScheduler:
         ``boundary // block_size`` of its own block table, read out of
         ``block_ids_by_group``. The step path feeds that from the request's
         running block ids, the finish path from the hand-off the scheduler got
-        before the blocks were freed. Returns the job id with the job, or None
-        when a group has no source block at that position.
+        before the blocks were freed. Returns the job id with the job, or a
+        refusal naming why nothing was stored. Nothing is reserved before a
+        refusal: the pool is asked only once every source block is known good.
         """
         assert self._cow_source_groups.issubset(cow_blocks)
         assert boundary % self._partial_tail_block_size != 0
@@ -3249,7 +3286,7 @@ class OffloadingConnectorScheduler:
             and block_idx >= len(block_ids_by_group.get(group.group_idx, ()))
             for group in tail_configs
         ):
-            return None
+            return TailStoreRefusal("source_block_missing")
         keys = [
             self._make_boundary_key(
                 req, group.group_idx, boundary, req_status.req_context
@@ -3273,9 +3310,11 @@ class OffloadingConnectorScheduler:
             self._connector_stats.increase_counter(
                 _ConnectorMetricName.ALLOCATION_FAILURE
             )
-            return None
+            return TailStoreRefusal("store_pool_refused")
         if not store_output.keys_to_store:
-            return None
+            # The pool holds every tail key already: nothing was written and
+            # nothing was lost, but there is no job to hand over.
+            return TailStoreRefusal("keys_already_resident")
 
         # Record the tail before the job can complete: on completion the band
         # must believe the pool holds these keys without reading them as the
@@ -3337,19 +3376,31 @@ class OffloadingConnectorScheduler:
         )
 
     def _refuse_partial_tail(
-        self, reason: str, request_id: str | None, boundary: int | None
+        self,
+        reason: str,
+        request_id: str | None,
+        boundary: int | None,
+        count: int = 1,
     ) -> bool:
-        """Count a partial tail that is dropped, and say why once per reason.
+        """Count the tails a partial store dropped, and say why once per reason.
 
         The step path and the finish path refuse under one rule: a tail whose
         sources are gone, or whose boundary the request cannot reach, is refused
         whole and never raised, because a partially restored tail reads a wrong
         recurrent state or ring silently. The counter carries every occurrence,
         which a repeating hand-off inflates, so the reason is announced once and
-        the per-request detail stays at debug level. Returns False for the finish
-        path, which never accepts a tail.
+        the per-request detail stays at debug level. ``count`` is how many tails
+        the refusal drops: a layout refusal covers every tail in the hand-off, a
+        per-request refusal exactly one. Returns False for the finish path,
+        which never accepts a tail.
+
+        With the flag off nothing asked for a tail, so a refusal is reported
+        nowhere: the flag-off connector emits no partial-tail series and no log
+        line, the same observability it had before the partial tail existed.
         """
-        self._tail_counts[reason] += 1
+        if not self.config.enable_partial_tail_offload:
+            return False
+        self._tail_counts[reason] += count
         logger.info_once(
             "KV offloading: refused a partial tail (%s); a tail is stored "
             "whole or not at all.",
@@ -3418,8 +3469,8 @@ class OffloadingConnectorScheduler:
             cow_blocks,
             {idx: list(ids) for idx, ids in enumerate(block_ids)},
         )
-        if job is None:
-            return self._refuse_partial_tail("source_block_missing", req_id, boundary)
+        if isinstance(job, TailStoreRefusal):
+            return self._refuse_partial_tail(job.reason, req_id, boundary)
         job_id, store_job = job
         self._finished_partial_tail_jobs[job_id] = store_job
         self._tail_counts["finish_tail_stored"] += 1

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, call
 import pytest
 import torch
 
+import vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler as sched_mod
 from tests.v1.kv_connector.unit.offloading_connector.test_config import (
     _full_attention_spec,
     _make_mamba_hybrid_kv_cache_config,
@@ -604,7 +605,9 @@ def test_partial_tail_step_path_refuses_a_boundary_over_the_offload_cap():
     """A caller-set max_offload_tokens below the hand-off boundary is a refusal,
     not an assertion. The step path runs inside build_connector_meta on the
     engine core, so raising here takes every session down with it; the aligned
-    path skips the same entry and the finish path refuses it."""
+    path skips the same entry and the finish path refuses it. The reason is
+    step-only, so a cap that keeps cutting tails off is readable apart from the
+    finish path's unusable boundary."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     # The fixtures' hand-off boundary is 28 tokens; the cap stops this request
     # offloading at 20, so the tail names tokens the request may not offload.
@@ -629,7 +632,97 @@ def test_partial_tail_step_path_refuses_a_boundary_over_the_offload_cap():
 
     assert not jobs
     scheduler.manager.prepare_store.assert_not_called()
-    assert scheduler._tail_counts == {"boundary_unusable": 1}
+    assert scheduler._tail_counts == {"beyond_offload_cap": 1}
+
+
+def _step_hand_off(
+    handoffs: dict[str, list[tuple[int, int, int]]],
+) -> SimpleNamespace:
+    """The step output shape `build_connector_meta` reads its hand-offs from."""
+    return SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads=handoffs,
+        )
+    )
+
+
+def _arm_step_tail_store(scheduler: OffloadingConnectorScheduler) -> None:
+    """Give every tail group a source block at the fixtures' boundary 28 and
+    let the pool take the store: the state under which a step-path tail is
+    stored, so a refusal a test provokes is the only thing left in the way."""
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    req_status.group_states[1].block_ids[:] = [0, 21]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+
+def _assert_nothing_half_built(scheduler: OffloadingConnectorScheduler) -> None:
+    """A refusal reserves nothing. With no job there is no group split, GPU
+    block or key to pair, so the invariant a store is checked on,
+    ``sum(group_sizes) == len(block_ids) == len(keys)``, holds here at zero on
+    every side: nothing is left for the transfer layer to mis-pair."""
+    assert not scheduler._jobs
+    assert scheduler._block_id_to_pending_jobs == {}
+    for req_status in scheduler._req_status.values():
+        assert not req_status.transfer_jobs
+
+
+@pytest.mark.parametrize(
+    "hand_off,omitted_groups",
+    [
+        ({"req": [(1, 99, 28), (1, 98, 44)]}, ()),
+        ({"ghost": [(1, 99, 28)]}, ()),
+        ({"req": [(0, 12, 28)]}, ()),
+        ({"req": [(1, 99, 28)]}, (7,)),
+    ],
+    ids=[
+        "mixed_boundaries",
+        "untracked_request",
+        "hand_off_incomplete",
+        "layout",
+    ],
+)
+def test_partial_tail_refusals_are_observably_inert_without_the_flag(
+    hand_off: dict[str, list[tuple[int, int, int]]],
+    omitted_groups: tuple[int, ...],
+    monkeypatch,
+):
+    """Every step-path refusal is silent with the flag off: no tail counter, so
+    no vllm:kv_partial_tail_events series, and no log line. A flag-off
+    deployment has to look like the connector that predates the partial tail,
+    and a refusal is the observable surface it leaves behind.
+
+    The second occurrence of this class: the flag was first read on a
+    per-request path and put back on the hot path, and now the refusal that
+    replaced the old assert leaks a series and a log line into a deployment
+    that never asked for a tail."""
+    scheduler = _make_partial_tail_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+    if omitted_groups:
+        scheduler.config = scheduler.config._replace(tail_omitted_groups=omitted_groups)
+    log = MagicMock()
+    monkeypatch.setattr(sched_mod, "logger", log)
+
+    assert not scheduler._build_partial_tail_store_jobs(_step_hand_off(hand_off))
+    assert (
+        scheduler.register_finished_partial_tail(
+            request, ([31, 32], [41]), [(1, 99, 28), (1, 98, 44)]
+        )
+        is False
+    )
+
+    assert dict(scheduler._tail_counts) == {}
+    stats = scheduler.get_stats()
+    series = stats.data["data"] if stats is not None else {}
+    assert _ConnectorMetricName.PARTIAL_TAIL_EVENTS not in series
+    log.info_once.assert_not_called()
+    log.debug.assert_not_called()
+    _assert_nothing_half_built(scheduler)
 
 
 def test_partial_tail_probe_ignores_a_missing_drafter_key():
