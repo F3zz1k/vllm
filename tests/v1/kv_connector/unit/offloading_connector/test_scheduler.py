@@ -542,11 +542,16 @@ def test_partial_tail_store_offers_no_key_for_the_drafter_group():
     assert src_spec.block_indices == [1, 1, 0]
 
 
-def test_partial_tail_step_path_refuses_a_group_with_no_tail_key():
+@pytest.mark.parametrize("partial_tail_offload", [False, True])
+def test_partial_tail_step_path_refuses_a_group_with_no_tail_key(
+    partial_tail_offload: bool,
+):
     """The mid-step hand-off carries the finish path's whole-tail policy: a
     group outside the offloading set has no tail key, so the step path offers no
-    store at all rather than a tail that cannot be restored whole."""
-    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    store at all rather than a tail that cannot be restored whole. The refusal
+    reaches the tail counter under the flag, and stays out of it without the
+    flag, where no tail was ever asked for."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=partial_tail_offload)
     scheduler.config = scheduler.config._replace(tail_omitted_groups=(7,))
     _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]
@@ -569,6 +574,8 @@ def test_partial_tail_step_path_refuses_a_group_with_no_tail_key():
 
     assert not jobs
     scheduler.manager.prepare_store.assert_not_called()
+    expected = {"groups_without_tail_keys": 1} if partial_tail_offload else {}
+    assert dict(scheduler._tail_counts) == expected
 
 
 def test_partial_tail_probe_ignores_a_missing_drafter_key():

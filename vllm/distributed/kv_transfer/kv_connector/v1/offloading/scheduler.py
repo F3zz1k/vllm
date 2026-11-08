@@ -3061,8 +3061,19 @@ class OffloadingConnectorScheduler:
 
         store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
         # Same whole-tail policy as the finish path: a layout with a group
-        # outside the offload set cannot name every tail key, so no tail.
-        if not self.config.supports_partial_tail or self.config.tail_omitted_groups:
+        # outside the offload set cannot name every tail key, so no tail. The
+        # step path counts that refusal under the finish path's counter. A
+        # hand-off repeats every step and names no request, so it is counted
+        # rather than logged, and only under the flag: with the flag off an
+        # unsupported layout is the ordinary case, not a refusal.
+        if self.config.tail_omitted_groups or not self.config.supports_partial_tail:
+            if self._enable_partial_tail_offload:
+                reason = (
+                    "groups_without_tail_keys"
+                    if self.config.tail_omitted_groups
+                    else "layout_unsupported"
+                )
+                self._tail_counts[reason] += 1
             return store_jobs
 
         for req_id, entries in handoffs.items():

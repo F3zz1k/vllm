@@ -138,9 +138,11 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         _ConnectorMetricName.PARTIAL_TAIL_EVENTS: OffloadingCounterMetadata(
             documentation=(
-                "Partial-tail events by kind: finish-time tail hand-offs "
-                "refused, and why (a group with no tail key, a layout the "
-                "partial tail does not serve, a source block that is gone)."
+                "Partial-tail events by kind, from the step and the finish "
+                "path: a tail stored (finish_tail_stored) and a tail refused "
+                "whole, by reason (a group with no tail key, a layout the "
+                "partial tail does not serve, a mixed or unusable boundary, a "
+                "source block that is gone)."
             ),
             labelnames=("event",),
         ),
