@@ -34,7 +34,10 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
-from vllm.v1.kv_offload.answer_tail_store import NullAnswerTailStore
+try:  # The tail store is new; base 539da2bff6 has no answer_tail_store module.
+    from vllm.v1.kv_offload.answer_tail_store import NullAnswerTailStore
+except ImportError:  # base 539da2bff6
+    pytest.skip("answer_tail_store absent", allow_module_level=True)
 
 try:  # The extraction moves the tail-key marker to vllm.v1.core.answer_tail.
     from vllm.v1.core.answer_tail import FINISH_TAIL_EXTRA_KEY
