@@ -3398,10 +3398,22 @@ class OffloadingConnectorScheduler:
         per-request refusal exactly one. Returns False for the finish path,
         which never accepts a tail.
 
-        With the flag off nothing asked for a tail, so a refusal is reported
-        nowhere: the flag-off connector emits no partial-tail series and no log
-        line, the same observability it had before the partial tail existed.
+        A refusal that drops no tail reports nothing, and the layout gate can
+        reach here with nothing to refuse: it runs before the block size that
+        separates an aligned boundary from a tail is resolved, so a hand-off
+        carrying only aligned boundaries would otherwise leave a zero-valued
+        counter key and a line about a tail that was in fact stored.
+
+        With the flag off a refusal is reported nowhere: no counter, so no
+        partial-tail series, and no log line. The two bookkeeping counters,
+        tail_run_missing and tail_evicted, are gated the same way in
+        _note_tail_keys, while the step path still stores tails with the flag
+        off as it did before the flag existed. A flag-off deployment is
+        therefore tail-blind rather than tail-free: it writes tail rows and
+        keeps no record of them.
         """
+        if not count:
+            return False
         if not self.config.enable_partial_tail_offload:
             return False
         self._tail_counts[reason] += count

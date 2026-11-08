@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The RAM side of the answer tail: the store the finished turns' tail blocks
-are offered to, the hit a lookup returns, and the null default that keeps the
+"""The RAM side of the answer tail: the seam a finished turn's tail blocks are
+offered through, the hit a lookup returns, and the null default that keeps the
 feature inert until a real store exists.
+
+The store is a notifier. Arena rows are allocated by the connector's offloading
+manager and bytes move only in a worker's transfer job, so a store called from
+the engine core can neither reserve a row nor take lane time: it records the
+offer and the connector turns it into a store.
 
 A tail key is lookup-only. Nothing here publishes a KV event, offloads a block
 under a tail key or pins a GPU block."""
@@ -12,6 +17,35 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashWithGroupId
+
+
+@dataclass(frozen=True)
+class AnswerTailHandoff:
+    """One finished request's tail, as the engine core names it.
+
+    The hash is the tail's own, chained on the last hash-boundary parent and
+    salted so that it never equals a full-unit key. Only the core can compute
+    it: it needs the finished request's tokens, its extra keys and its parent
+    chain, none of which survive the request's release.
+    """
+
+    request_id: str
+    """The request the tail was registered for, so the connector can find its
+    offload state, its run and the blocks to fence."""
+
+    tail_hash: BlockHash
+    """The tail's hash, the same one every group's key is made from."""
+
+    parent: BlockHash | None
+    """The hash the tail is chained on, None for a tail that starts the
+    conversation."""
+
+    length: int
+    """Tokens the tail covers, the last token included."""
+
+    resume_token: int
+    """Where a resume restarts: one token before the finished request's last
+    token, which is the position the tail's blocks hold the state at."""
 
 
 @dataclass(frozen=True)
@@ -34,17 +68,21 @@ class AnswerTailHit:
 
 class AnswerTailStore(ABC):
     """The tier that keeps finished requests' tail blocks after the GPU drops
-    them. One key per (tail, group): a tail is registered once per group."""
+    them. One key per (tail, group): a tail is offered once per group."""
 
     @abstractmethod
     def store_tail(
         self,
-        tail_key: BlockHashWithGroupId,
-        parent: BlockHash | None,
-        length: int,
+        handoff: AnswerTailHandoff,
+        group_id: int,
         block_id: int,
     ) -> bool:
-        """Offer one finished-tail GPU block to the tier. False if it refused."""
+        """Offer one group's tail block to the tier. False if it refused.
+
+        A refusal costs the registration nothing: the GPU-side tail key stands
+        on its own, and a tier that cannot take the tail today loses only the
+        resume the RAM tier would have served.
+        """
 
     @abstractmethod
     def lookup_tail(
@@ -91,9 +129,8 @@ class NullAnswerTailStore(AnswerTailStore):
 
     def store_tail(
         self,
-        tail_key: BlockHashWithGroupId,
-        parent: BlockHash | None,
-        length: int,
+        handoff: AnswerTailHandoff,
+        group_id: int,
         block_id: int,
     ) -> bool:
         return False

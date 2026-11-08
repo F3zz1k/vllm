@@ -836,6 +836,33 @@ def test_partial_tail_layout_refusal_counts_the_tails_it_drops():
     assert scheduler._tail_counts == {"groups_without_tail_keys": 2}
 
 
+def test_partial_tail_layout_refusal_says_nothing_when_it_dropped_nothing(
+    monkeypatch,
+):
+    """The layout gate fires before the block size that tells an aligned
+    boundary from a tail is resolved, so it can reach the refusal on a hand-off
+    that asked for no tail at all. Nothing was dropped, so nothing is
+    reported: a zero-valued counter key and a log line would mourn a tail that
+    the aligned path went on storing."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    scheduler.config = scheduler.config._replace(tail_omitted_groups=(7,))
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    log = MagicMock()
+    monkeypatch.setattr(sched_mod, "logger", log)
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"a": [(1, 99, 16)], "b": [(1, 98, 32)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert dict(scheduler._tail_counts) == {}
+    log.info_once.assert_not_called()
+    log.debug.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "hand_off,omitted_groups",
     [
@@ -1157,6 +1184,33 @@ def test_finished_partial_tail_refused_when_a_group_has_no_tail_key():
     assert not scheduler._finished_partial_tail_jobs
     scheduler.manager.prepare_store.assert_not_called()
     assert scheduler._tail_counts["groups_without_tail_keys"] == 1
+
+
+def test_finished_partial_tail_refuses_a_null_source_block():
+    """The finish hand-off carries the block ids the scheduler read before the
+    request's blocks were freed, so a null can reach it as well as the step
+    path's table read. The shared check in _tail_store_job refuses it: the
+    finish path gets no later step to try again, so storing residue under the
+    tail's key is the one outcome it must not reach for."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    assert (
+        scheduler.register_finished_partial_tail(
+            request, ([31, 32], [41], [51, 52]), [(1, 0, 28)]
+        )
+        is False
+    )
+
+    assert not scheduler._finished_partial_tail_jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts["null_source_block"] == 1
+    _assert_nothing_half_built(scheduler)
 
 
 def test_finished_partial_tail_refuses_a_hand_off_with_no_state_source():

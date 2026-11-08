@@ -138,15 +138,20 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         _ConnectorMetricName.PARTIAL_TAIL_EVENTS: OffloadingCounterMetadata(
             documentation=(
-                "Partial-tail events by kind, counted only with "
-                "enable_partial_tail_offload: a tail stored ("
+                "Partial-tail events by kind, every one of them counted only "
+                "with enable_partial_tail_offload: a tail stored ("
                 "finish_tail_stored) and a tail refused whole, by reason (a "
                 "group with no tail key, a layout the partial tail does not "
                 "serve, a mixed or unusable boundary, a boundary past the "
                 "offload cap, a hand-off missing a state group, a source block "
                 "that is gone or null, a store the pool refused, keys already "
-                "resident). A layout refusal counts the tails the hand-off "
-                "carried, every other reason one."
+                "resident), and the two bookkeeping kinds for a tail the band "
+                "recorded (tail_run_missing, tail_evicted). A layout refusal "
+                "counts the tails the hand-off carried, every other reason one. "
+                "The step path stores tails without the flag, as it did before "
+                "it existed, so a flag-off deployment writes tail rows and "
+                "reports none of these kinds: the absence of a series is not "
+                "proof that no tail was stored."
             ),
             labelnames=("event",),
         ),

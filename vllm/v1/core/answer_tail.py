@@ -33,6 +33,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.kv_offload.answer_tail_store import (
+    AnswerTailHandoff,
     AnswerTailStore,
     NullAnswerTailStore,
 )
@@ -268,6 +269,13 @@ class AnswerTail:
 
         tail_hash = self._finish_tail_hash(request, start, num_tokens)
         tail = (self._finish_tail_parent(request, start), num_tokens - start)
+        handoff = AnswerTailHandoff(
+            request_id=request.request_id,
+            tail_hash=tail_hash,
+            parent=tail[0],
+            length=tail[1],
+            resume_token=num_tokens - 1,
+        )
         for manager, blocks in tail_blocks:
             if isinstance(manager, CircularBufferManager):
                 key = make_block_hash_with_group_id(
@@ -276,7 +284,9 @@ class AnswerTail:
                 registry.register(pool, key, blocks[0], tail)
                 # The GPU-side registration stands on its own: a tier that
                 # refuses the tail costs nothing here.
-                self.store.store_tail(key, tail[0], tail[1], blocks[0].block_id)
+                self.store.store_tail(
+                    handoff, manager.kv_cache_group_id, blocks[0].block_id
+                )
                 continue
             if isinstance(manager, SlidingWindowManager):
                 block_idx = (num_tokens - 2) // manager.block_size
@@ -303,7 +313,9 @@ class AnswerTail:
             key = make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id)
             tail_block = blocks[(num_tokens - 2) // manager.block_size]
             registry.register(pool, key, tail_block, tail)
-            self.store.store_tail(key, tail[0], tail[1], tail_block.block_id)
+            self.store.store_tail(
+                handoff, manager.kv_cache_group_id, tail_block.block_id
+            )
         logger.debug(
             "Registered the final state of request %s at %d tokens.",
             request.request_id,
