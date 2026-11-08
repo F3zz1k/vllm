@@ -239,9 +239,11 @@ def _make_partial_tail_request(
 
 def _make_drafter_partial_tail_scheduler(
     enable_partial_tail_offload: bool,
+    drafter_group_idx: int = 2,
 ) -> OffloadingConnectorScheduler:
     """The partial-tail layout plus an EAGLE/MTP drafter attention group, the
-    shape `enable_partial_tail_offload` decides on."""
+    shape `enable_partial_tail_offload` decides on. ``drafter_group_idx`` is
+    the position the exempt group takes among the offloaded groups."""
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
     vllm_config.cache_config.prefix_match_unit = 4
     vllm_config.cache_config.enable_partial_tail_offload = enable_partial_tail_offload
@@ -250,8 +252,11 @@ def _make_drafter_partial_tail_scheduler(
         enable_kv_cache_events=True, publisher="null"
     )
     kv_cache_config = _make_mamba_hybrid_kv_cache_config()
-    kv_cache_config.kv_cache_groups.append(
-        KVCacheGroupSpec(["drafter_layer"], _full_attention_spec(), is_eagle_group=True)
+    kv_cache_config.kv_cache_groups.insert(
+        drafter_group_idx,
+        KVCacheGroupSpec(
+            ["drafter_layer"], _full_attention_spec(), is_eagle_group=True
+        ),
     )
     spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
@@ -561,10 +566,16 @@ def test_partial_tail_probe_ignores_a_missing_drafter_key():
     assert req_status.partial_tail_boundary == 28
 
 
-def test_partial_tail_load_asks_no_boundary_key_for_the_drafter_group():
+@pytest.mark.parametrize("drafter_group_idx", [1, 2])
+def test_partial_tail_load_asks_no_boundary_key_for_the_drafter_group(
+    drafter_group_idx: int,
+):
     """The load walks every group for destination blocks but asks for the
-    boundary key only where the tail could have stored one."""
-    scheduler = _make_drafter_partial_tail_scheduler(True)
+    boundary key only where the tail could have stored one, and an exempt
+    group drops its partial tail destination block so every key stays paired
+    with one block. The exempt group sits last and in the middle: a middle
+    position is where a mismatched count shifts every later group's blocks."""
+    scheduler = _make_drafter_partial_tail_scheduler(True, drafter_group_idx)
     request = _make_partial_tail_request(scheduler)
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
@@ -572,26 +583,35 @@ def test_partial_tail_load_asks_no_boundary_key_for_the_drafter_group():
     scheduler.manager.lookup.return_value = LookupResult.HIT
     assert scheduler._lookup(req_status) == 28
 
+    mamba_group_idx = 1 if drafter_group_idx == 2 else 2
+    blocks_by_group = {
+        0: [KVCacheBlock(31), KVCacheBlock(32)],
+        drafter_group_idx: [KVCacheBlock(51), KVCacheBlock(52)],
+        mamba_group_idx: [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+    }
     scheduler.update_state_after_alloc(
         request,
-        KVCacheBlocks(
-            (
-                [KVCacheBlock(31), KVCacheBlock(32)],
-                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
-                [KVCacheBlock(51), KVCacheBlock(52)],
-            )
-        ),
+        KVCacheBlocks(tuple(blocks_by_group[i] for i in range(3))),
         num_external_tokens=28,
     )
 
     [load_job] = scheduler._current_batch_load_jobs.values()
     dst_spec = load_job.dst_spec
     assert isinstance(dst_spec, GPULoadStoreSpec)
-    assert dst_spec.group_sizes == [2, 1, 2]
+    # The exempt group keeps its whole-chunk block but not the partial tail
+    # block that no key could fill.
+    assert dst_spec.group_sizes == [2, 1, 1]
+    loaded_ids_by_group = {0: [31, 32], drafter_group_idx: [51], mamba_group_idx: [41]}
+    assert dst_spec.block_ids.tolist() == [
+        block_id for i in range(3) for block_id in loaded_ids_by_group[i]
+    ]
     [job] = scheduler._jobs.values()
     assert make_offload_key(BlockHash(b"h6"), 0) in job.keys
-    assert make_offload_key(BlockHash(b"h6"), 1) in job.keys
-    assert make_offload_key(BlockHash(b"h6"), 2) not in job.keys
+    assert make_offload_key(BlockHash(b"h6"), drafter_group_idx) not in job.keys
+    assert make_offload_key(BlockHash(b"h6"), mamba_group_idx) in job.keys
+    # The invariant the transfer layer relies on: one source key per
+    # destination block, in the same group order.
+    assert sum(dst_spec.group_sizes) == len(dst_spec.block_ids) == len(job.keys)
 
 
 def test_finished_partial_tail_is_inert_without_the_flag():
