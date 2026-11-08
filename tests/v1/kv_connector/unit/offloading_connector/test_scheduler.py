@@ -134,8 +134,13 @@ def test_swa_offload_window_covers_unaligned_hit(
     )
     config = SimpleNamespace(
         speculative_config=None,
+        # The cache fields the connector reads at construction. The tail flag
+        # is off, its CacheConfig default: this test predates the flag and pins
+        # SWA window behaviour the flag does not change.
         cache_config=SimpleNamespace(
-            enable_prefix_caching=True, prefix_cache_retention_interval=None
+            enable_prefix_caching=True,
+            prefix_cache_retention_interval=None,
+            enable_partial_tail_offload=False,
         ),
         parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
     )

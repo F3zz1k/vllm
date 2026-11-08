@@ -280,6 +280,10 @@ class SchedulerOffloadConfig(NamedTuple):
     num_workers: int
     offload_prompt_only: bool
     supports_partial_tail: bool
+    # `CacheConfig.enable_partial_tail_offload`, resolved once here so that no
+    # per-request path reads engine-core configuration. Off, every tail rule
+    # behaves as it did before the flag existed.
+    enable_partial_tail_offload: bool
     alignment_tokens: int | None = None
     retention_interval: int | None = None
     dcp_world_size: int = 1
@@ -398,14 +402,17 @@ class SchedulerOffloadConfig(NamedTuple):
             and config.tokens_per_block > spec.tokens_per_hash
             for config in kv_group_configs
         )
-        # `enable_partial_tail_offload` lets a tail carry fewer than every
-        # group: the drafter groups that `tail_optional` names leave the set,
-        # the rest must all be there. Without the flag every group is required
-        # and a drafter group closes the gate, as it always did.
-        partial_tail_offload = vllm_config.cache_config.enable_partial_tail_offload
+        # The one place the connector reads `enable_partial_tail_offload`. It
+        # lets a tail carry fewer than every group: the drafter groups that
+        # `tail_optional` names leave the set, the rest must all be there.
+        # Without the flag every group is required and a drafter group closes
+        # the gate, as it always did.
+        enable_partial_tail_offload = (
+            vllm_config.cache_config.enable_partial_tail_offload
+        )
         partial_tail_groups = (
             tuple(c for c in kv_group_configs if not c.tail_optional)
-            if partial_tail_offload
+            if enable_partial_tail_offload
             else kv_group_configs
         )
         tail_omitted_groups = tuple(
@@ -428,7 +435,7 @@ class SchedulerOffloadConfig(NamedTuple):
             )
             and (
                 not any(config.is_eagle_group for config in kv_group_configs)
-                or partial_tail_offload
+                or enable_partial_tail_offload
             )
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
@@ -459,6 +466,7 @@ class SchedulerOffloadConfig(NamedTuple):
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
+            enable_partial_tail_offload=enable_partial_tail_offload,
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
@@ -744,9 +752,6 @@ class OffloadingConnectorScheduler:
         # boundary key is appended only where the store could have written one.
         self._partial_tail_group_ids = frozenset(
             config.group_idx for config in self.config.partial_tail_groups
-        )
-        self._enable_partial_tail_offload = (
-            vllm_config.cache_config.enable_partial_tail_offload
         )
         self._cow_source_groups = frozenset(
             config.group_idx
@@ -3067,7 +3072,7 @@ class OffloadingConnectorScheduler:
         # rather than logged, and only under the flag: with the flag off an
         # unsupported layout is the ordinary case, not a refusal.
         if self.config.tail_omitted_groups or not self.config.supports_partial_tail:
-            if self._enable_partial_tail_offload:
+            if self.config.enable_partial_tail_offload:
                 reason = (
                     "groups_without_tail_keys"
                     if self.config.tail_omitted_groups
@@ -3263,7 +3268,7 @@ class OffloadingConnectorScheduler:
         reports store completion through completed jobs rather than
         ``finished_sending``, so a True would hold the request's blocks forever.
         """
-        if not self._enable_partial_tail_offload or not partial_tail_offloads:
+        if not self.config.enable_partial_tail_offload or not partial_tail_offloads:
             return False
         if self.config.tail_omitted_groups:
             return self._refuse_finish_tail("groups_without_tail_keys", request, None)
