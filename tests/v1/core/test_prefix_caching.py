@@ -549,9 +549,13 @@ def test_connector_completes_partial_prefix_without_importing_missing_host_kv(
 
     connector = object.__new__(OffloadingConnector)
     connector._kv_cache_config = manager.kv_cache_config
-    # bind_kv_cache_manager hands the scheduler side the GPU block pool.
+    # bind_kv_cache_manager hands the scheduler side the GPU block pool and
+    # the answer-tail store. The tail store is a no-op: this test keeps the
+    # null store the core was built with, as a flag-off engine does.
     connector.connector_scheduler = SimpleNamespace(
-        get_num_new_matched_tokens=lookup, bind_gpu_block_pool=lambda pool: None
+        get_num_new_matched_tokens=lookup,
+        bind_gpu_block_pool=lambda pool: None,
+        bind_answer_tail_store=lambda manager: None,
     )
     if nested:
         for _ in range(2):
