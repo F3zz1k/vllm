@@ -145,6 +145,20 @@ def check(arena):
         assert end <= start
 
 
+def group_sizes(keys):
+    """Rows per KV cache group for a store's keys."""
+    sizes = collections.Counter(S._group(k) for k in keys)
+    return list(sizes.values())
+
+
+def assert_one_row_per_key(keys, rows):
+    """The invariant the transfer layer pairs on, in the arena's own terms: one
+    row per key, and the per-group split summing to that same count. A store
+    whose split does not add up to its keys mis-pairs rows with GPU blocks, the
+    phase-1 P0 class."""
+    assert sum(group_sizes(keys)) == len(rows) == len(keys)
+
+
 # --- single class: stores, loads, holds ---
 
 
@@ -583,6 +597,76 @@ def test_whole_store_of_an_unrestorable_run_is_rejected():
     assert cls.counters["store_rejected_unrestorable"] == 1 and not cls.index
     res = arena.prepare_store(a, [key(1, ATT), key(1, ST1), key(1, ST2)], b"X", whole=True)
     assert res is not None and len(res[0]) == 3
+
+
+def test_a_run_of_state_rows_with_nothing_restorable_ages_out_of_protection():
+    # The run the arena must not take first, and the bound that stops that
+    # protection from being a leak: it holds recurrent state, restores nothing,
+    # and nothing on its own will ever make it restorable.
+    clock = Clock()
+    arena, cls, a = hybrid(rows=8, clock=clock)
+    keys = [key(1, ST1), key(1, ST2)]
+    new, rows, _ = store(arena, a, keys, b"stub")
+    assert_one_row_per_key(new, rows)
+    run = cls.runs[b"stub"]
+    assert run.state_only and run.holds_state_and_restores_nothing
+    assert run.state_stub_protected(clock())
+    clock.t += S.STATE_STUB_MAX_AGE_SEC + 1
+    assert not run.state_stub_protected(clock())
+    check(arena)
+
+
+def test_a_run_holding_the_state_beside_an_attention_row_still_restores_nothing():
+    # The guard is wider than state_only: the band's first attention row ends
+    # the state-only streak while the state still sits at a boundary the
+    # attention does not reach, so the run is still the pool's only copy of it.
+    clock = Clock()
+    arena, cls, a = hybrid(clock=clock)
+    new, rows, _ = store(arena, a, [key(1, ST1), key(1, ST2), key(2, ATT)], b"part")
+    assert_one_row_per_key(new, rows)
+    run = cls.runs[b"part"]
+    assert not run.state_only and not run.restorable
+    assert run.holds_state_and_restores_nothing and run.state_stub_protected(clock())
+    check(arena)
+
+
+def test_a_finish_tail_pseudo_boundary_reads_as_a_complete_boundary():
+    # A finish tail stores one row per contributing group under one tail hash,
+    # and the server reads key[:-4] as a boundary hash. So a run whose only keys
+    # are a tail's rows completes a boundary here and reads as restorable to a
+    # client that can name that hash only by computing the tail hash itself. The
+    # guard is therefore that a tail never stands up a run of its own, not the
+    # state_only ordering nor the predicate, neither of which can see this run.
+    arena, cls, a = hybrid()
+    tail = b"t".ljust(32, b"t")          # never a chunk hash
+    keys = [tail + g.to_bytes(4, "big") for g in (ATT, ST1, ST2)]
+    new, rows, _ = store(arena, a, keys, b"tail")
+    assert_one_row_per_key(new, rows)
+    run = cls.runs[b"tail"]
+    assert run.complete == 1 and run.restorable and not run.state_only
+    assert not run.holds_state_and_restores_nothing
+    check(arena)
+
+
+def test_a_store_into_a_run_makes_it_newest_and_clears_its_held_marking():
+    # Arena.refresh, which is what a tail store into a session's run does to
+    # everything already saved for that session: the whole run moves to newest
+    # and the marking that a GPU still holds it is dropped.
+    arena, cls, a = hybrid(rows=8)
+    first = [key(1, ATT), key(1, ST1), key(1, ST2)]
+    new, rows, _ = store(arena, a, first, b"conv")
+    assert_one_row_per_key(new, rows)
+    res = arena.prepare_store(a, first, b"conv", held=True)
+    arena.complete_store(a, res[0], True)
+    run = cls.runs[b"conv"]
+    assert run in arena.held
+    store(arena, a, [key(2, ATT)], b"other")        # another session takes newest
+    assert list(arena.order)[-1] is not run
+    tail = [b"t".ljust(32, b"t") + g.to_bytes(4, "big") for g in (ATT, ST1, ST2)]
+    new, rows, _ = store(arena, a, tail, b"conv")   # the tail store lands in it
+    assert_one_row_per_key(new, rows)
+    assert list(arena.order)[-1] is run and run not in arena.held
+    check(arena)
 
 
 # --- several classes in one arena ---

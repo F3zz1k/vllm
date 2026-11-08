@@ -119,6 +119,9 @@ WRITE_BACK_PIN_HOLD_S = float(os.environ.get("VLLM_KV_WRITE_BACK_PIN_HOLD_S", "3
 # Bounds of the band's bookkeeping maps.
 _STATE_SETS_MAX = 1 << 16
 _POOL_HAS_MAX = 1 << 18
+# Tail keys remembered as tails (see _note_tail_keys). One per group per
+# stored tail, so this is far more than the number of sessions.
+_TAIL_KEYS_MAX = 1 << 14
 # Conversations ("runs") remembered for whole-run write-back.
 WRITE_BACK_MAX_RUNS = 4096
 # Older restore points a hybrid run keeps besides its deepest one (state keys,
@@ -801,6 +804,13 @@ class OffloadingConnectorScheduler:
         # Per run, the keys of its older restore points (see WRITE_BACK_KEEP_POINTS).
         self._run_extras: dict[OffloadKey, set] = {}
         self._key_run: dict[OffloadKey, OffloadKey] = {}
+        # A tail key names a position that is not a chunk boundary, so it is
+        # neither a chain member nor a restore point. Tail key -> the run that
+        # owns it (None while its request has keyed no full-attention chunk, so
+        # no run is named after it yet), and the run's tail keys in store order.
+        # A tail leaves when its run leaves.
+        self._tail_run: "OrderedDict[OffloadKey, OffloadKey | None]" = OrderedDict()
+        self._run_tails: dict[OffloadKey, list[OffloadKey]] = {}
         self._write_through = True
         # A class with recurrent state restores only from a run holding every
         # state group at some boundary; a lone block can never be one.
@@ -1224,7 +1234,18 @@ class OffloadingConnectorScheduler:
         chain = self._restore_chain(
             by_group, have=lambda k: k in self._pool_has or self._gpu_has(k), extras=extras
         )
+        # The tails this request stored, wherever they were tagged: a step-path
+        # tail was named after the attention key of its own step, and merge_tag
+        # has just moved those rows into this run, so the record moves with them.
+        keyed = {k for keys in by_group for k in keys}
+        moved = [
+            k for k, owned in self._tail_run.items() if owned is tag or owned in keyed
+        ]
         self._drop_run(tag)
+        for key in moved:
+            self._forget_tail_key(key)
+            self._tail_run[key] = tag
+            self._run_tails.setdefault(tag, []).append(key)
         if not chain:
             # Nothing a restore could read (no boundary with every state
             # group stored): never offered, so never refused every step.
@@ -1250,6 +1271,10 @@ class OffloadingConnectorScheduler:
         old = self._run_keys.pop(tag, None)
         self._run_by_group.pop(tag, None)
         self._run_extras.pop(tag, None)
+        # A tail leaves when its run leaves: the band stops offering it, and no
+        # later store of another run takes it along.
+        for key in self._run_tails.pop(tag, ()):
+            self._tail_run.pop(key, None)
         if old is not None:
             for key in old:
                 if self._key_run.get(key) == tag:
@@ -1362,8 +1387,53 @@ class OffloadingConnectorScheduler:
 
     def _note_states(self, keys: Iterable[OffloadKey]) -> None:
         for key in keys:
+            if key in self._tail_run:
+                # A tail key names a position that is not a chunk boundary, so
+                # it belongs in the pool view (the eviction feed is the only
+                # way to learn the arena dropped it) and not in a boundary's
+                # state set, which is what a restore chain reads.
+                self._note_in_pool([key])
+                continue
             if get_offload_group_idx(key) in self._state_group_ids:
                 self._note_state_stored(key)
+
+    def _note_tail_keys(
+        self, req_status: "RequestOffloadState", keys: Iterable[OffloadKey]
+    ) -> None:
+        """Record the keys a tail store wrote and the run that owns them.
+
+        A tail belongs to a run, not to a session: the run is named after the
+        request's last full-attention chunk key, and a tail leaves when that run
+        leaves. A request that has keyed no full-attention chunk yet names no
+        run, so the tail is recorded without one and counted: writing it under a
+        tag of its own would leave a run of nothing but tail rows, which restores
+        nothing and cannot become restorable on its own.
+        """
+        if not self.config.enable_partial_tail_offload:
+            return
+        by_group = [gs.offload_keys for gs in req_status.group_states]
+        tag = self._run_tag(by_group)
+        if tag is None:
+            self._tail_counts["tail_run_missing"] += 1
+        for key in keys:
+            if key in self._tail_run:
+                self._tail_run.move_to_end(key)
+                continue
+            self._tail_run[key] = tag
+            if tag is not None:
+                self._run_tails.setdefault(tag, []).append(key)
+        while len(self._tail_run) > _TAIL_KEYS_MAX:
+            self._forget_tail_key(next(iter(self._tail_run)))
+
+    def _forget_tail_key(self, key: OffloadKey) -> None:
+        """Drop a tail key from the band's view, and from its run's tail list."""
+        owned = self._tail_run.pop(key, None)
+        tails = self._run_tails.get(owned) if owned is not None else None
+        if tails is not None:
+            if key in tails:
+                tails.remove(key)
+            if not tails:
+                del self._run_tails[owned]
 
     def _restore_chain(
         self,
@@ -1527,8 +1597,8 @@ class OffloadingConnectorScheduler:
         else None."""
         group = int.from_bytes(bytes(key)[-4:], "big")
         config_idx = config_idx_by_group.get(group)
-        if config_idx is None:
-            return None
+        if config_idx is None or key in self._tail_run:
+            return None  # a tail row is not a chunk: the band has no source for it
         found = self._gpu_block_pool.get_cached_block(BlockHash(bytes(key)[:-4]), [group])
         if not found:
             return None
@@ -1571,6 +1641,11 @@ class OffloadingConnectorScheduler:
             if self._pool_has.pop(key, 0) is None:
                 self._state_sets.pop(bytes(key)[:-4], None)
                 n += 1
+            if key in self._tail_run:
+                # A tail has no GPU hash to be re-offered from, so the feed is
+                # the only way the band learns the arena dropped it.
+                self._tail_counts["tail_evicted"] += 1
+                self._forget_tail_key(key)
         return n
 
     def _prepare_store(self, keys: Any, req_context: Any) -> Any:
@@ -1835,7 +1910,15 @@ class OffloadingConnectorScheduler:
         if tag is None:
             return keys
         copying = set(keys)
-        return [k for k in self._run_keys.get(tag, ()) if k in copying or k in self._pool_has]
+        # A tail is never part of this offer. It has no whole-chunk source for
+        # the band to copy, and a whole-run store asks the pool to admit a run
+        # that restores nothing when the tail's own pseudo-boundary is what
+        # makes it look restorable. A tail joins its run through its own store.
+        return [
+            k
+            for k in self._run_keys.get(tag, ())
+            if k in copying or (k in self._pool_has and k not in self._tail_run)
+        ]
 
     def _drop_unwritten(self, store_output: Any, members: list) -> None:
         """Release the rows a store allocated for keys no member writes: chain
@@ -3180,6 +3263,11 @@ class OffloadingConnectorScheduler:
         if not store_output.keys_to_store:
             return None
 
+        # Record the tail before the job can complete: on completion the band
+        # must believe the pool holds these keys without reading them as the
+        # state of a chunk boundary.
+        self._note_tail_keys(req_status, store_output.keys_to_store)
+
         for group_config, key in zip(tail_configs, keys):
             if key in store_output.keys_to_store:
                 self._events_tracker.record_partial_store(
@@ -4147,6 +4235,8 @@ class OffloadingConnectorScheduler:
         self._flush_jobs.clear()
         self._pool_has.clear()
         self._state_sets.clear()
+        self._tail_run.clear()
+        self._run_tails.clear()
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
         self._finished_partial_tail_jobs.clear()

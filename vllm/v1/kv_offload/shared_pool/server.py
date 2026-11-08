@@ -94,6 +94,14 @@ _IO_ALIGN = 4096
 # A run that cannot restore anything is evicted before every other run once
 # its last store is this old; a younger one is still being written.
 DEAD_RUN_GRACE_SEC = 10.0
+# How long a run that holds recurrent state and restores nothing keeps the
+# protection that ordering gives it (see Run.holds_state_and_restores_nothing).
+# Such a run is the pool's only copy of a session's state while its attention
+# is still on a GPU, so it must leave last; without a bound that protection is
+# a leak, because the run can never become restorable on its own and its rows
+# are skipped by the spill path. The bound is measured from the run's last
+# store, so a session that keeps finishing turns keeps its state.
+STATE_STUB_MAX_AGE_SEC = 600.0
 # admit_fraction: how long a computed value is reused, and how many runs of the
 # global order one computation walks at most.
 ADMIT_CACHE_SEC = 0.5
@@ -254,6 +262,28 @@ class Run:
         """Recurrent state and nothing else: what a prompt hand-off leaves
         before the band copies the session's attention into the run."""
         return bool(self.cls.state_groups) and 0 < self.n_state == len(self.keys)
+
+    @property
+    def holds_state_and_restores_nothing(self) -> bool:
+        """Recurrent state with no boundary a restore could read.
+
+        Wider than ``state_only``, which ends the moment the band's first
+        attention row lands while the state still sits at the deepest
+        boundary. Both shapes are the pool's only copy of that state, so both
+        are the run the arena must not take first, and both need the age bound
+        below so the protection cannot become a leak.
+        """
+        return bool(self.cls.state_groups) and self.n_state > 0 and not self.restorable
+
+    def state_stub_protected(self, now: float) -> bool:
+        """Whether this run still earns the protection of leaving last: it
+        holds state, it restores nothing, and its last store is recent enough
+        that something may still be on its way to complete it.
+        """
+        return (
+            self.holds_state_and_restores_nothing
+            and now - self.stored_at < STATE_STUB_MAX_AGE_SEC
+        )
 
     def add(self, key: bytes) -> None:
         if key in self.keys:
