@@ -3295,11 +3295,20 @@ class OffloadingConnectorScheduler:
                 self._refuse_partial_tail("hand_off_incomplete", req_id, boundary)
                 continue
 
+            block_ids_by_group = {
+                idx: state.block_ids for idx, state in group_states.items()
+            }
+            if self._state_source_is_live(block_ids_by_group, cow_blocks, boundary):
+                # Step-only reason, and the one the functional-test-2 triage
+                # found: the manager re-keys the request's own state block at a
+                # sub-block boundary while the request keeps decoding into it, so
+                # the copy would hold the state at the request's running position
+                # under the key a restore reads as the state at the boundary.
+                self._refuse_partial_tail("live_state_source", req_id, boundary)
+                continue
+
             job = self._tail_store_job(
-                req_status,
-                boundary,
-                cow_blocks,
-                {idx: state.block_ids for idx, state in group_states.items()},
+                req_status, boundary, cow_blocks, block_ids_by_group
             )
             if isinstance(job, TailStoreRefusal):
                 self._refuse_partial_tail(job.reason, req_id, boundary)
@@ -3308,6 +3317,33 @@ class OffloadingConnectorScheduler:
             store_jobs[job_id] = store_job
 
         return store_jobs
+
+    def _state_source_is_live(
+        self,
+        block_ids_by_group: dict[int, list[int]],
+        cow_blocks: dict[int, int],
+        boundary: int,
+    ) -> bool:
+        """Whether a hand-off names a block the request is still writing.
+
+        A recurrent group's state at a sub-block boundary lives in the table row
+        that covers it, ``boundary // block_size``, and the next forward writes
+        the running state into that same row. A hand-off naming it is therefore
+        good for the boundary only until the next step, which is not durable
+        enough for a row another instance restores from after a restart. A copy
+        that left the request's table -- the copy-on-write block a producer's
+        tail waits for -- is durable at store time and passes, as is a hand-off
+        whose position the request's table does not reach, where there is no
+        live row for the block to be.
+        """
+        block_idx = boundary // self._partial_tail_block_size
+        for group_idx in self._cow_source_groups:
+            block_ids = block_ids_by_group.get(group_idx, ())
+            if block_idx >= len(block_ids):
+                continue
+            if block_ids[block_idx] == cow_blocks[group_idx]:
+                return True
+        return False
 
     def _hand_off_tail_count(
         self, handoffs: dict[str, list[tuple[int, int, int]]]
@@ -3516,6 +3552,11 @@ class OffloadingConnectorScheduler:
         blocks and the worker fences their reuse, while this connector's worker
         reports store completion through completed jobs rather than
         ``finished_sending``, so a True would hold the request's blocks forever.
+
+        No live-source check here, unlike the step path: the manager only hands
+        a finished request's state block when nothing is in flight and the
+        request computed exactly up to the boundary, so the block still holds
+        the state that boundary names and no further forward can rewrite it.
         """
         if not self.config.enable_partial_tail_offload or not partial_tail_offloads:
             return False

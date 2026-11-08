@@ -1,8 +1,8 @@
 # The answer-tail key and bookkeeping contract
 
 Phase 2 step A, branch `answer-tail`: one section per item of `spec-phase2-A.md`, at this
-branch's line numbers. Sections 1 to 5 predate the store hand-off; section 6 is the rows a
-tail costs.
+branch's line numbers. Sections 1 to 5 predate the store hand-off, section 6 is the rows a
+tail costs, and section 7 is the block a state row may be copied from.
 
 ## 1. Tail key naming, and who computes it on lookup
 
@@ -204,5 +204,48 @@ the wrong row count, because with the clause closed it stores no windowed tail a
 offer now carries the ordered list of blocks per group (`TailOffer.block_ids`), and the
 store allocates, pairs and pins that many rows, so the clause's commit inherits a store that
 counts correctly instead of one that has to be fixed alongside it.
+
+decided
+
+## 7. The block a state row may be copied from
+
+**The rule.** A state row for an align group is stored only from a block that is durable at
+store time. A block the request's own table still holds at the boundary's position is never
+durable at a sub-block boundary: in align mode the state for a position lives in the table row
+that covers it (`boundary // block_size`, the same index the non-recurrent groups read), and
+the next forward writes the running state into that row. The step path tests this before it
+asks the pool for anything (`_state_source_is_live`, `offloading/scheduler.py:3322`, called at
+`3301`) and refuses the tail whole with the counter `live_state_source`.
+
+**Why it is not a rule about positions.** The functional-test-2 triage read the poisoned rows
+as a state stored at a position that is not a checkpoint position, and that is wrong: every
+partial-tail store in arm A sits exactly on its producer's own reusable prompt boundary
+(`get_mamba_prefill_checkpoint_position(prompt, hash_block_size, drop_eagle)`, which is what
+the manager's `_cache_partial_tail_block` re-keys a block at). The positions were valid. What
+was wrong was the bytes: `single_type_kv_cache_manager.py:2113-2123` registers the producer's
+tail from the live state block and says so in its own comment ("the boundary state currently
+lives in `source_block` but the next step's forward overwrites it"), and because that branch
+also rewinds `num_cached_block` to the block's index, the next `cache_blocks` pass offers the
+same live block through `_pending_boundary_state_offloads`. The copy then lands the state at
+the request's running position under the boundary key with the state group's suffix, which is
+the key a later restore reads as the state at the boundary. Arm A restored exactly that: rows
+4, 5 and 6, key `80facefd82a3de48` with groups 0, 1 and 2, offered by the step path at
+boundary 23808 while the producer decoded 640 tokens past it.
+
+**What stays storable.** A copy-on-write block is not in the request's table at that position
+(the worker table of a running request is append-only, so the request stays on the source
+block and the cache entry moves), so a producer's tail is stored as soon as a later request's
+CoW makes it durable. The finish path needs no such test: `finalize_partial_tail_offload`
+(`single_type_kv_cache_manager.py:1931`) returns a block only when nothing is in flight and
+the request computed exactly up to the boundary, so no further forward can rewrite it.
+
+**What the refusal costs.** Nothing selectable. The probe in `_lookup` names the boundary key
+for every tail group and misses without the state row, so no partial restore is offered and no
+load asks for a row the store refused. The step route can no longer write that key shape at a
+sub-block boundary at all; the finish route still can, and only from a block the manager has
+made final, which is the case its own gate above is for. The pair of tests is
+`test_partial_tail_a_live_state_block_leaves_the_restore_no_state_row`
+and `test_partial_tail_a_durable_state_block_is_stored_and_the_restore_loads_it`
+(`test_scheduler.py`), which run store and restore against one pool.
 
 decided
