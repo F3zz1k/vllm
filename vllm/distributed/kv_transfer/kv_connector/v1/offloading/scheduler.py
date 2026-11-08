@@ -860,7 +860,7 @@ class OffloadingConnectorScheduler:
         self._wb_touching = False
         self._wb_counts: Counter = Counter()
         self._wb_counts_emitted: Counter = Counter()  # already on /metrics
-        # Refused partial tails by reason (see _refuse_finish_tail).
+        # Refused partial tails by reason (see _refuse_partial_tail).
         self._tail_counts: Counter = Counter()
         self._tail_counts_emitted: Counter = Counter()
         # Block id -> its free-queue predecessor when the band took it (None:
@@ -3149,11 +3149,10 @@ class OffloadingConnectorScheduler:
 
         store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
         # Same whole-tail policy as the finish path: a layout with a group
-        # outside the offload set cannot name every tail key, so no tail. The
-        # step path counts that refusal under the finish path's counter. A
-        # hand-off repeats every step and names no request, so it is counted
-        # rather than logged, and only under the flag: with the flag off an
-        # unsupported layout is the ordinary case, not a refusal.
+        # outside the offload set cannot name every tail key, so no tail. A
+        # hand-off repeats every step and names no request here, so the refusal
+        # is counted every step and announced once, and only under the flag:
+        # with the flag off an unsupported layout is the ordinary case.
         if self.config.tail_omitted_groups or not self.config.supports_partial_tail:
             if self.config.enable_partial_tail_offload:
                 reason = (
@@ -3161,7 +3160,7 @@ class OffloadingConnectorScheduler:
                     if self.config.tail_omitted_groups
                     else "layout_unsupported"
                 )
-                self._tail_counts[reason] += 1
+                self._refuse_partial_tail(reason, None, None)
             return store_jobs
 
         for req_id, entries in handoffs.items():
@@ -3172,11 +3171,15 @@ class OffloadingConnectorScheduler:
             ]
             if not entries:
                 continue
-            req_status = self._req_status.get(req_id)
-            assert req_status is not None
             boundaries = {boundary for _, _, boundary in entries}
-            assert len(boundaries) == 1
+            if len(boundaries) != 1:
+                self._refuse_partial_tail("mixed_boundaries", req_id, None)
+                continue
             boundary = boundaries.pop()
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                self._refuse_partial_tail("untracked_request", req_id, boundary)
+                continue
             req = req_status.req
             group_states = {
                 group.group_idx: state
@@ -3188,12 +3191,22 @@ class OffloadingConnectorScheduler:
                 req.num_prompt_tokens,
                 req_status.max_offload_tokens or req.num_prompt_tokens,
             )
-            assert boundary > 0
-            assert boundary % self.config.tokens_per_hash == 0
-            assert boundary <= max_boundary
+            # A hand-off that names tokens the request may not offload, e.g. a
+            # caller-set max_offload_tokens below the boundary, is a refusal:
+            # this runs inside build_connector_meta on the engine core, and the
+            # aligned path skips the same entry.
+            if (
+                boundary <= 0
+                or boundary % self.config.tokens_per_hash != 0
+                or boundary > max_boundary
+            ):
+                self._refuse_partial_tail("boundary_unusable", req_id, boundary)
+                continue
 
             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
-            assert self._cow_source_groups.issubset(cow_blocks)
+            if not self._cow_source_groups.issubset(cow_blocks):
+                self._refuse_partial_tail("state_source_missing", req_id, boundary)
+                continue
 
             job = self._tail_store_job(
                 req_status,
@@ -3202,6 +3215,7 @@ class OffloadingConnectorScheduler:
                 {idx: state.block_ids for idx, state in group_states.items()},
             )
             if job is None:
+                self._refuse_partial_tail("source_block_missing", req_id, boundary)
                 continue
             job_id, store_job = job
             store_jobs[job_id] = store_job
@@ -3322,20 +3336,29 @@ class OffloadingConnectorScheduler:
             dst_spec=store_output.store_spec,
         )
 
-    def _refuse_finish_tail(
-        self, reason: str, request: Request, boundary: int | None
+    def _refuse_partial_tail(
+        self, reason: str, request_id: str | None, boundary: int | None
     ) -> bool:
-        """Count and announce a finish-time tail that is dropped.
+        """Count a partial tail that is dropped, and say why once per reason.
 
-        A tail whose sources are gone, or whose layout has a group no tail key
-        can name, is refused whole: a partially restored tail is worse than no
-        tail, because a wrong recurrent state or ring is read silently.
+        The step path and the finish path refuse under one rule: a tail whose
+        sources are gone, or whose boundary the request cannot reach, is refused
+        whole and never raised, because a partially restored tail reads a wrong
+        recurrent state or ring silently. The counter carries every occurrence,
+        which a repeating hand-off inflates, so the reason is announced once and
+        the per-request detail stays at debug level. Returns False for the finish
+        path, which never accepts a tail.
         """
         self._tail_counts[reason] += 1
         logger.info_once(
-            "KV offloading: refused the finish-time partial tail of request %s "
-            "at %s tokens (%s); a tail is stored whole or not at all.",
-            request.request_id,
+            "KV offloading: refused a partial tail (%s); a tail is stored "
+            "whole or not at all.",
+            reason,
+        )
+        logger.debug(
+            "KV offloading: refused the partial tail of request %s at %s tokens "
+            "(%s)",
+            request_id,
             boundary,
             reason,
         )
@@ -3358,17 +3381,18 @@ class OffloadingConnectorScheduler:
         """
         if not self.config.enable_partial_tail_offload or not partial_tail_offloads:
             return False
+        req_id = request.request_id
         if self.config.tail_omitted_groups:
-            return self._refuse_finish_tail("groups_without_tail_keys", request, None)
+            return self._refuse_partial_tail("groups_without_tail_keys", req_id, None)
         if not self.config.supports_partial_tail:
-            return self._refuse_finish_tail("layout_unsupported", request, None)
+            return self._refuse_partial_tail("layout_unsupported", req_id, None)
         boundaries = {boundary for _, _, boundary in partial_tail_offloads}
         if len(boundaries) != 1:
-            return self._refuse_finish_tail("mixed_boundaries", request, None)
+            return self._refuse_partial_tail("mixed_boundaries", req_id, None)
         boundary = boundaries.pop()
-        req_status = self._req_status.get(request.request_id)
+        req_status = self._req_status.get(req_id)
         if req_status is None:
-            return self._refuse_finish_tail("untracked_request", request, boundary)
+            return self._refuse_partial_tail("untracked_request", req_id, boundary)
         max_boundary = min(
             request.num_prompt_tokens,
             req_status.max_offload_tokens or request.num_prompt_tokens,
@@ -3379,14 +3403,14 @@ class OffloadingConnectorScheduler:
             or boundary > max_boundary
             or boundary % self._partial_tail_block_size == 0
         ):
-            return self._refuse_finish_tail("boundary_unusable", request, boundary)
+            return self._refuse_partial_tail("boundary_unusable", req_id, boundary)
         cow_blocks = {
             group_idx: block_id for group_idx, block_id, _ in partial_tail_offloads
         }
         if not self._cow_source_groups.issubset(cow_blocks) or any(
             block_id == 0 for _, block_id, _ in partial_tail_offloads
         ):
-            return self._refuse_finish_tail("state_source_missing", request, boundary)
+            return self._refuse_partial_tail("state_source_missing", req_id, boundary)
 
         job = self._tail_store_job(
             req_status,
@@ -3395,7 +3419,7 @@ class OffloadingConnectorScheduler:
             {idx: list(ids) for idx, ids in enumerate(block_ids)},
         )
         if job is None:
-            return self._refuse_finish_tail("source_block_missing", request, boundary)
+            return self._refuse_partial_tail("source_block_missing", req_id, boundary)
         job_id, store_job = job
         self._finished_partial_tail_jobs[job_id] = store_job
         self._tail_counts["finish_tail_stored"] += 1
