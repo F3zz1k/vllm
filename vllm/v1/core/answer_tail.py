@@ -78,6 +78,12 @@ class AnswerTailRegistry:
         ] = {}
         # Registered tail lengths by the hash their key is chained on.
         self.lengths_by_parent: dict[BlockHash | None, Counter[int]] = {}
+        # Optional hook for the tier a tail was offered to, called with each
+        # tail key this registry drops. A queued store reads the block the key
+        # named, and a block that loses its hashes can be handed to a new owner
+        # and written, so the offer has to go with the key. ``AnswerTail``
+        # installs it, because that is where the store lives.
+        self.forget_hook: Callable[[BlockHashWithGroupId], None] | None = None
 
     def register(
         self,
@@ -108,19 +114,28 @@ class AnswerTailRegistry:
 
     def forget(self, block: KVCacheBlock) -> list[BlockHashWithGroupId]:
         """Drop a block's tail keys as it loses its hashes, and return them for
-        the caller to remove from the prefix cache."""
+        the caller to remove from the prefix cache.
+
+        Only a key registered as a tail's own reaches ``forget_hook``: the
+        boundary and in-window entries this registry also holds are not tails,
+        and no tier was offered one under those keys.
+        """
         tails = self.hashes_by_block.pop(block.block_id, None)
         if tails is None:
             return []
-        for tail in tails.values():
-            if tail is not None:
-                parent, length = tail
-                lengths = self.lengths_by_parent[parent]
-                lengths[length] -= 1
-                if not lengths[length]:
-                    del lengths[length]
-                    if not lengths:
-                        del self.lengths_by_parent[parent]
+        hook = self.forget_hook
+        for key, tail in tails.items():
+            if tail is None:
+                continue
+            parent, length = tail
+            lengths = self.lengths_by_parent[parent]
+            lengths[length] -= 1
+            if not lengths[length]:
+                del lengths[length]
+                if not lengths:
+                    del self.lengths_by_parent[parent]
+            if hook is not None:
+                hook(key)
         return list(tails)
 
     def has(self, block: KVCacheBlock) -> bool:
@@ -156,6 +171,15 @@ class AnswerTail:
             NullAnswerTailStore() if store is None else store
         )
         self.validate_groups(coordinator)
+        # A tail the GPU forgets has to leave the tier it was offered to, and
+        # this is the only object that knows both: the hook reads ``self.store``
+        # when it runs, so the connector installing its own store later is
+        # seen. The null store's ``forget_tail`` does nothing.
+        block_pool.answer_tail.forget_hook = self._forget_from_store
+
+    def _forget_from_store(self, tail_key: BlockHashWithGroupId) -> None:
+        """Tell the store that the GPU no longer holds a tail's key."""
+        self.store.forget_tail(tail_key)
 
     @staticmethod
     def validate_groups(coordinator: HybridKVCacheCoordinator) -> None:

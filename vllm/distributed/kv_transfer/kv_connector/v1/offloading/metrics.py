@@ -145,6 +145,7 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
                 "tail key, a layout the partial tail does not serve, a mixed or "
                 "unusable boundary, a boundary past the offload cap, a hand-off "
                 "missing a state group, a source block that is gone or null, a "
+                "tail the GPU forgot while its retry waited (stale_offer), a "
                 "store the pool refused, keys already resident). The answer-tail "
                 "store's own kinds: tail_offered, tail_retried and, on give-up, "
                 "the refusal that ended it; tail_pinned and tail_unpinned, whose "

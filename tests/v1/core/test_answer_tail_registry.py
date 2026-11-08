@@ -20,6 +20,7 @@ from vllm.utils.hashing import sha256
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
+    BlockHashWithGroupId,
     generate_block_hash_extra_keys,
     hash_block_tokens,
     init_none_hash,
@@ -33,6 +34,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.kv_offload.answer_tail_store import NullAnswerTailStore
 
 try:  # The extraction moves the tail-key marker to vllm.v1.core.answer_tail.
     from vllm.v1.core.answer_tail import FINISH_TAIL_EXTRA_KEY
@@ -288,3 +290,37 @@ def test_reset_prefix_cache_clears_the_tail_registry():
     assert not hashes and not lengths
     for group_id in range(len(held)):
         assert pool.get_cached_block(tail, [group_id]) is None
+
+
+class _RecordingTailStore(NullAnswerTailStore):
+    """The tier a finished turn's tails are offered to, keeping the keys it was
+    told the GPU forgot. The store side of the seam is tested with the store
+    that actually serves it; here only the reach of the registry's forget is."""
+
+    def __init__(self) -> None:
+        self.forgotten: list[BlockHashWithGroupId] = []
+
+    def forget_tail(self, tail_key: BlockHashWithGroupId) -> None:
+        self.forgotten.append(tail_key)
+
+
+def test_a_tail_the_gpu_forgot_reaches_the_store_it_was_offered_to():
+    """The store a tail was offered to reads the block the tail key named, and
+    that block goes back to the free queue with the request that finished. A
+    registry that forgot the key quietly would leave a queued store copying
+    whoever holds the block next, so the forget reaches the tier the tails were
+    offered to, and reaches it with tail keys only: the boundary and in-window
+    entries are not what any tier was offered."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    manager.answer_tail.store = store
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    held = _run_to_finish(manager, finished, OUTPUT)
+    pool = manager.block_pool
+    tail, _, _ = _tail_key(finished)
+    tail_block_idx = (finished.num_tokens - 2) // BLOCK
+
+    pool._maybe_evict_cached_block(held[MAMBA][tail_block_idx])  # get_new_blocks
+
+    assert pool.get_cached_block(tail, [MAMBA]) is None
+    assert store.forgotten == [make_block_hash_with_group_id(tail, MAMBA)]

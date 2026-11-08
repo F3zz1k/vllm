@@ -1245,6 +1245,73 @@ def test_a_tail_store_is_offered_again_until_its_retries_run_out():
     _assert_nothing_half_built(scheduler)
 
 
+def _tail_gpu_blocks(handoff, blocks: dict[int, int]) -> dict[int, KVCacheBlock]:
+    """The GPU as a retried offer sees it: one block per group, each cached
+    under that group's tail key, which is what the retry is checked against."""
+    tail_blocks = {
+        group_idx: KVCacheBlock(block_id) for group_idx, block_id in blocks.items()
+    }
+    for group_idx, block in tail_blocks.items():
+        block.set_block_hash(
+            make_block_hash_with_group_id(handoff.tail_hash, group_idx), 12
+        )
+    return tail_blocks
+
+
+def test_a_retry_of_a_tail_the_gpu_forgot_is_refused_as_stale():
+    # The reviewer's shape: the pool is full at N, so the tail waits for room,
+    # and the blocks it named went back to the free queue with the finished
+    # turn. A new owner takes one and writes it, and the store reads blocks and
+    # not keys, so the copy would land those bytes in the tail's rows and a
+    # resume would read them as the state at the tail. A retried offer is
+    # checked against the GPU before anything is reserved, and a tail the GPU
+    # has forgotten is given up on rather than offered a fourth time.
+    scheduler, handoff, blocks = _answer_tail_offer(pool_refused=True)
+    tail_blocks = _tail_gpu_blocks(handoff, blocks)
+    scheduler.bind_gpu_block_pool(FakeGPUPool(list(tail_blocks.values())))
+
+    # Step N: the pool is full, and the tail is queued for a retry.
+    assert not scheduler._build_answer_tail_store_jobs()
+    assert scheduler._tail_counts["tail_retried"] == 1
+
+    # The block is freed, reallocated and written: BlockPool forgets a reused
+    # block's hashes, and the tail key goes with them.
+    for group_idx, block in tail_blocks.items():
+        block.reset_hash()
+        block.set_block_hash(
+            make_block_hash_with_group_id(BlockHash(b"owner"), group_idx), 12
+        )
+
+    # Step N+2: the retry refuses, stores nothing, and asks the pool for
+    # nothing, because a retry cannot bring the tail's bytes back.
+    assert not scheduler._build_answer_tail_store_jobs()
+    assert scheduler._tail_counts["stale_offer"] == 1
+    assert scheduler._tail_counts["tail_stored"] == 0
+    assert scheduler._tail_counts["store_pool_refused"] == 0
+    assert scheduler.manager.prepare_store_run.call_count == 1
+    assert scheduler.answer_tail_store.pending == {}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_a_tail_the_gpu_forgot_is_not_offered_again():
+    # The fence proper: the core drops the offer the step the GPU forgets the
+    # tail's key, so the store route is never handed a tail whose blocks are
+    # gone. The re-check above is the second line, for a release that lands
+    # while the offer is already in the connector's hand.
+    scheduler, handoff, blocks = _answer_tail_offer()
+    assert scheduler.answer_tail_store.has_offer_for("req")
+
+    scheduler.answer_tail_store.forget_tail(
+        make_block_hash_with_group_id(handoff.tail_hash, min(blocks))
+    )
+
+    assert not scheduler.answer_tail_store.has_offer_for("req")
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert dict(scheduler._tail_counts) == {}
+    _assert_nothing_half_built(scheduler)
+
+
 def test_a_tail_whose_request_named_no_run_never_tags_a_run_of_its_own():
     # A request that keyed no full-attention chunk names no run. Storing its
     # tail under a tag of its own would leave a run of nothing but tail rows:

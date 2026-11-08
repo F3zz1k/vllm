@@ -1624,6 +1624,20 @@ class OffloadingConnectorScheduler:
         group = int.from_bytes(bytes(key)[-4:], "big")
         return bool(pool.get_cached_block(BlockHash(bytes(key)[:-4]), [group]))
 
+    def _tail_keys_on_gpu(self, keys: list[OffloadKey]) -> bool:
+        """Whether the GPU still caches the tail key of every group.
+
+        A tail key is lookup-only and lives as long as the block carrying it
+        keeps its hashes, so this says whether the blocks an offer named are
+        still the tail's. With no GPU pool bound the connector has nothing to
+        ask and a retried offer is taken as offered: the store route is
+        installed by the same bind that hands over the pool, so an engine that
+        can be offered a tail can always answer.
+        """
+        if self._gpu_block_pool is None:
+            return True
+        return all(self._gpu_has(key) for key in keys)
+
     def _storable_free_block(self, key: OffloadKey, config_idx_by_group: dict[int, int]):
         """(block, config_idx, num_tokens) for key if its GPU block is free (settled,
         the next eviction candidates, or held only by a pin) and chunk-aligned;
@@ -3601,6 +3615,10 @@ class OffloadingConnectorScheduler:
         from ``request.block_hashes`` reaches it. The source blocks are the ones
         the core offered with those keys, so the job reads exactly the blocks
         the finished turn left its state in.
+
+        A retry re-reads those blocks, and the turn that named them is long
+        gone from the GPU by then, so a retried offer is checked against the
+        pool before anything is reserved.
         """
         handoff = offer.handoff
         req_status = self._req_status.get(handoff.request_id)
@@ -3617,13 +3635,21 @@ class OffloadingConnectorScheduler:
         block_ids = [offer.block_ids[group.group_idx] for group in tail_configs]
         if any(block_id == 0 for block_id in block_ids):
             return TailStoreRefusal("null_source_block")
-        tag = self._run_tag([gs.offload_keys for gs in req_status.group_states])
-        if tag is None:
-            return TailStoreRefusal("tail_run_missing")
         keys = [
             make_offload_key(bytes(handoff.tail_hash), group.group_idx)
             for group in tail_configs
         ]
+        if offer.tries and not self._tail_keys_on_gpu(keys):
+            # The blocks an offer named are the finished turn's, and they went
+            # back to the free queue with it: while the retry waited one of
+            # them may have been given to a new owner and written. Its bytes
+            # would land in the tail's rows and a resume would read them as the
+            # state at the tail, so the tail is given up on rather than tried
+            # again: no further retry can bring those bytes back.
+            return TailStoreRefusal("stale_offer")
+        tag = self._run_tag([gs.offload_keys for gs in req_status.group_states])
+        if tag is None:
+            return TailStoreRefusal("tail_run_missing")
         # The run's other keys stay out of this call: a store takes a row for
         # every offered key the pool lacks, and this job writes only its tail's
         # rows. The tail joins its run because it is offered under the run's

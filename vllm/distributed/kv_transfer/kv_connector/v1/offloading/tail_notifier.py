@@ -101,10 +101,20 @@ class AnswerTailNotifier(AnswerTailStore):
         The queue key names the request as well as the hash, and the core's
         forget hook has only the key, so this walks the queue: it holds at most
         ``_MAX_OFFERS`` tails and the hook is rare, a block losing its hashes.
+        Every group of one tail shares the tail's hash, so one block losing it
+        drops the whole offer: a tail missing a group is never stored.
         """
         wanted = bytes(tail_key)[:-4]
         for key in [k for k in self.pending if k[1] == wanted]:
             del self.pending[key]
+
+    def has_offer_for(self, request_id: str) -> bool:
+        """Whether a tail of this request is still waiting to be stored.
+
+        The queue is the only index of what is waiting, so this walks it: at
+        most ``_MAX_OFFERS`` keys, and it drains every step.
+        """
+        return any(request_id == key[0] for key in self.pending)
 
     # --- the load side: refused, by name ---
 
