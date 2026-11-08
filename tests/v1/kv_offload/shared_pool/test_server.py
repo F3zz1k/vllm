@@ -495,6 +495,36 @@ def test_dead_runs_are_evicted_first_once_past_the_grace():
     assert cls.counters["unrestorable_runs_evicted"] == 1
 
 
+def test_a_live_sessions_state_only_stub_is_not_evicted_before_an_attention_run():
+    # A prompt hand-off saves a session's recurrent state while its attention
+    # is still only on the GPU. The stub restores nothing on its own, but it is
+    # the pool's only copy of that state: with the arena full it has to outlive
+    # an attention run, else the session recomputes whole once the GPU drops it
+    # (2026-11-06: run-dropped lines with missing=3 mamba, 1 of 48 sessions).
+    clock = Clock()
+    arena, cls, a = hybrid(rows=4, clock=clock)
+    store(arena, a, [key(1, ST1), key(1, ST2)], b"stub")        # state only
+    store(arena, a, [key(2, ATT), key(3, ATT)], b"conv")        # its attention
+    clock.t += S.DEAD_RUN_GRACE_SEC + 1
+    _, _, evicted = store(arena, a, [key(9, ATT)], b"new")
+    assert sorted(evicted) == [key(2, ATT), key(3, ATT)]
+    assert not cls.runs[b"stub"].restorable and len(cls.runs[b"stub"].keys) == 2
+    # The stub was worth keeping: the band's copy completes the boundary.
+    store(arena, a, [key(1, ATT)], b"stub")
+    assert cls.runs[b"stub"].restorable
+    check(arena)
+
+
+def test_a_state_only_stub_is_still_evicted_when_it_is_all_the_arena_has():
+    # Going last is not being unevictable: a session whose attention never
+    # arrives still leaves when the arena needs its rows.
+    arena, cls, a = hybrid(rows=4)
+    store(arena, a, [key(1, ST1), key(1, ST2)], b"stub")
+    _, _, evicted = store(arena, a, [key(9, ATT), key(9, ST1), key(9, ST2)], b"live")
+    assert sorted(evicted) == [key(1, ST1), key(1, ST2)]
+    check(arena)
+
+
 def test_whole_store_of_an_unrestorable_run_is_rejected():
     arena, cls, a = hybrid()
     assert arena.prepare_store(a, [key(1, ATT), key(2, ATT)], b"X", whole=True) is None

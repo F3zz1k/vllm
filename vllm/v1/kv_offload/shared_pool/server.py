@@ -26,11 +26,13 @@ while any run that contains it does. One list orders the runs of every class,
 oldest first. Eviction takes whole runs only, never one with a chunk held,
 loading, moving or being written, and takes first the runs that can restore
 nothing (on a hybrid model, a run with no boundary whose recurrent state keys
-are all present). A store is all or nothing: the walk is simulated across all
-classes first and committed only when it frees enough. A store makes its run
-newest; a completed load makes the loading run oldest (its engine's GPU holds
-it again) and a lookup changes nothing. When an engine goes away, the runs it
-loaded and nobody stored again become newest: its GPU copy is gone.
+are all present) and last a run of recurrent state and no attention, which is
+the state of a session whose attention is still on the GPU. A store is all or
+nothing: the walk is simulated across all classes first and committed only when
+it frees enough. A store makes its run newest; a completed load makes the
+loading run oldest (its engine's GPU holds it again) and a lookup changes
+nothing. When an engine goes away, the runs it loaded and nobody stored again
+become newest: its GPU copy is gone.
 
 Holds. A lookup HIT pins the chunk for the calling client until it ends its
 session, so another engine cannot evict it between the lookup and the
@@ -225,7 +227,8 @@ class Entry:
 class Run:
     """One run's chunks, evicted as a unit."""
 
-    __slots__ = ("cls", "tag", "keys", "_groups", "complete", "stored_at", "demoted_by", "tail_sp")
+    __slots__ = ("cls", "tag", "keys", "_groups", "n_state", "complete",
+                 "stored_at", "demoted_by", "tail_sp")
 
     def __init__(self, cls: "LayoutClass", tag: bytes, now: float) -> None:
         self.cls = cls
@@ -233,6 +236,7 @@ class Run:
         self.keys: dict[bytes, None] = {}
         # Block hash -> groups present, for classes with recurrent state.
         self._groups: dict[bytes, set[int]] = {}
+        self.n_state = 0  # keys of a recurrent-state group
         self.complete = 0  # boundaries with every state group present
         self.stored_at = now
         self.demoted_by: set = set()  # clients whose GPU holds it too (Arena.hold)
@@ -245,14 +249,23 @@ class Run:
     def restorable(self) -> bool:
         return not self.cls.state_groups or self.complete > 0
 
+    @property
+    def state_only(self) -> bool:
+        """Recurrent state and nothing else: what a prompt hand-off leaves
+        before the band copies the session's attention into the run."""
+        return bool(self.cls.state_groups) and 0 < self.n_state == len(self.keys)
+
     def add(self, key: bytes) -> None:
         if key in self.keys:
             return
         self.keys[key] = None
         if self.cls.state_groups:
+            group = _group(key)
             groups = self._groups.setdefault(key[:-4], set())
             was = self.cls.boundary_complete(groups)
-            groups.add(_group(key))
+            groups.add(group)
+            if group in self.cls.state_groups:
+                self.n_state += 1
             if not was and self.cls.boundary_complete(groups):
                 self.complete += 1
 
@@ -264,7 +277,10 @@ class Run:
             h = key[:-4]
             groups = self._groups[h]
             was = self.cls.boundary_complete(groups)
-            groups.discard(_group(key))
+            group = _group(key)
+            groups.discard(group)
+            if group in self.cls.state_groups:
+                self.n_state -= 1
             if was and not self.cls.boundary_complete(groups):
                 self.complete -= 1
             if not groups:
@@ -1102,13 +1118,24 @@ class Arena:
     def _candidates(self):
         """Runs that restore nothing first; then, while runs a GPU also holds
         take more than overlap_cap of the arena, those (oldest marked first);
-        then every run oldest first."""
+        then every run oldest first. Last, the runs of recurrent state and no
+        attention: a prompt hand-off leaves one while the session's attention
+        is still on the GPU, and it is that state's only copy, so losing it
+        costs the whole session when the GPU drops it (2026-11-06)."""
         cutoff = self.clock() - DEAD_RUN_GRACE_SEC
-        dead = [r for r in self.unrestorable if r.stored_at <= cutoff]
+        dead: list[Run] = []
+        stubs: dict[Run, None] = {}
+        for r in self.unrestorable:
+            if r.stored_at > cutoff:
+                continue
+            if r.state_only:
+                stubs[r] = None
+            else:
+                dead.append(r)
         held_bytes = sum(len(r.keys) * r.cls.stride for r in self.held)
-        if held_bytes > self.overlap_cap * self.size:
-            return itertools.chain(dead, list(self.held), self.order)
-        return itertools.chain(dead, self.order)
+        by_age = (itertools.chain(list(self.held), self.order)
+                  if held_bytes > self.overlap_cap * self.size else self.order)
+        return itertools.chain(dead, (r for r in by_age if r not in stubs), stubs)
 
     def plan(self, cls: LayoutClass, need: int, keep: set[bytes],
              protect: Run | None) -> list[Run] | None:
