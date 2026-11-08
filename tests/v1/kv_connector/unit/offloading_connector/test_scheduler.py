@@ -664,6 +664,7 @@ def test_finished_partial_tail_registers_a_fenced_store_job():
     assert {get_offload_group_idx(key) for key in offered_keys} == {0, 1}
     assert scheduler._block_id_to_pending_jobs == {32: {job_id}, 99: {job_id}}
     assert req_status.transfer_jobs == {job_id}
+    assert scheduler._tail_counts["finish_tail_stored"] == 1
 
 
 def test_finished_partial_tail_survives_the_finished_request_cleanup():

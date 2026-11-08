@@ -892,12 +892,14 @@ class OffloadingConnectorScheduler:
             slot_bytes = int(getattr(spec, "kv_bytes_per_chunk", 0) or 0)
             _b70.log(
                 "enabled scheduler trace: groups=%s retention_interval=%s "
-                "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f "
+                "alignment_tokens=%s partial_tail=%s tail_omitted=%s "
+                "slot_bytes=%d period_s=%.0f "
                 "junction=%s empty_advance_guard=%s",
                 dict(Counter(self._b70_kind_by_group.values())),
                 self.config.retention_interval,
                 self.config.alignment_tokens,
                 self.config.supports_partial_tail,
+                self.config.tail_omitted_groups,
                 slot_bytes,
                 _b70.trace_period_s(),
                 self._b70_junction,
@@ -3051,7 +3053,9 @@ class OffloadingConnectorScheduler:
             return {}
 
         store_jobs = self._build_aligned_boundary_store_jobs(handoffs)
-        if not self.config.supports_partial_tail:
+        # Same whole-tail policy as the finish path: a layout with a group
+        # outside the offload set cannot name every tail key, so no tail.
+        if not self.config.supports_partial_tail or self.config.tail_omitted_groups:
             return store_jobs
 
         for req_id, entries in handoffs.items():
@@ -3121,7 +3125,7 @@ class OffloadingConnectorScheduler:
         block_idx = boundary // self._partial_tail_block_size
         tail_configs = self.config.partial_tail_groups
         if any(
-            group.group_idx not in cow_blocks
+            group.group_idx not in self._cow_source_groups
             and block_idx >= len(block_ids_by_group.get(group.group_idx, ()))
             for group in tail_configs
         ):
@@ -3283,6 +3287,7 @@ class OffloadingConnectorScheduler:
             return self._refuse_finish_tail("source_block_missing", request, boundary)
         job_id, store_job = job
         self._finished_partial_tail_jobs[job_id] = store_job
+        self._tail_counts["finish_tail_stored"] += 1
         return False
 
     def _reachable_store_block_mask(
