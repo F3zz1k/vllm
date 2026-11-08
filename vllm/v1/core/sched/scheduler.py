@@ -2280,19 +2280,9 @@ class Scheduler(SchedulerInterface):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
-                    if (
-                        self.kv_cache_manager.mamba_finish_checkpoint
-                        and new_token_ids
-                        and status_before_stop == RequestStatus.RUNNING
-                        and not output_is_stale
-                        and not request.resumable
-                        and request.status
-                        in (
-                            RequestStatus.FINISHED_STOPPED,
-                            RequestStatus.FINISHED_LENGTH_CAPPED,
-                        )
+                    if self.kv_cache_manager.should_cache_finished_state(
+                        request, new_token_ids, status_before_stop, output_is_stale
                     ):
-                        # Only these stops are detected by the worker too.
                         self.kv_cache_manager.cache_finished_request(request)
                     kv_transfer_params, ec_transfer_params = self._free_request(request)
                     if (
