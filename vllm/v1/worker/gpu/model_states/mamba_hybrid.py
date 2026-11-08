@@ -18,7 +18,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     ShortConvAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
-from vllm.v1.core.kv_cache_utils import (
+from vllm.v1.core.answer_tail import (
     MAX_FINISH_STOP_TOKEN_IDS,
     finish_stop_token_ids,
 )

@@ -3087,57 +3087,11 @@ class VllmConfig:
             )
 
     def _validate_mamba_finish_checkpoint(self) -> None:
-        """Validate `enable_mamba_finish_checkpoint` against the rest of the config."""
-        if not self.cache_config.enable_mamba_finish_checkpoint:
-            return
+        # Imported here: answer_tail imports kv_cache_utils, which imports this
+        # module.
+        from vllm.v1.core.answer_tail import validate_mamba_finish_checkpoint
 
-        blockers: list[str] = []
-        if not (
-            self.cache_config.enable_prefix_caching
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            blockers.append("it needs prefix caching with mamba_cache_mode='align'")
-        if self.model_config is not None and not self.model_config.is_hybrid:
-            blockers.append("it needs a hybrid attention and Mamba model")
-        if self.parallel_config.pipeline_parallel_size > 1:
-            blockers.append("pipeline parallelism is not supported")
-        if (
-            self.parallel_config.decode_context_parallel_size > 1
-            or self.parallel_config.prefill_context_parallel_size > 1
-        ):
-            blockers.append("context parallelism is not supported")
-        if self.kv_transfer_config is not None and (
-            self.kv_transfer_config.kv_connector
-            not in (None, "OffloadingConnector", "SimpleCPUOffloadConnector")
-        ):
-            blockers.append("only the offloading KV connectors are supported")
-        spec = self.speculative_config
-        if (
-            spec is not None
-            and (spec.use_eagle() or spec.uses_draft_model())
-            and (
-                spec.draft_model_config.is_hybrid
-                or spec.draft_model_config.is_attention_free
-            )
-        ):
-            blockers.append("a draft model with Mamba layers is not supported")
-        if self.cache_config.use_replayssm:
-            blockers.append("ReplaySSM defers the Mamba state writes")
-        if self.num_prefill_lookahead_tokens > 1:
-            blockers.append(
-                "multi-module MTP draft KV depends on tokens past the last one"
-            )
-        if (
-            self.kv_events_config is not None
-            and self.kv_events_config.enable_kv_cache_events
-        ):
-            blockers.append("its cache entries are not published as KV events")
-
-        if blockers:
-            raise ValueError(
-                "--enable-mamba-finish-checkpoint is not supported in this "
-                f"configuration: {'; '.join(blockers)}."
-            )
+        validate_mamba_finish_checkpoint(self)
 
     def _get_dbo_unsupported_features(self) -> list[str]:
         """Collect what the V2 model runner cannot combine with DBO.
