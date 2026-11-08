@@ -542,6 +542,35 @@ def test_partial_tail_store_offers_no_key_for_the_drafter_group():
     assert src_spec.block_indices == [1, 1, 0]
 
 
+def test_partial_tail_step_path_refuses_a_group_with_no_tail_key():
+    """The mid-step hand-off carries the finish path's whole-tail policy: a
+    group outside the offloading set has no tail key, so the step path offers no
+    store at all rather than a tail that cannot be restored whole."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    scheduler.config = scheduler.config._replace(tail_omitted_groups=(7,))
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    # Sources a tail store would have used: without the clause the hand-off
+    # below builds a job, which is what this test is guarding.
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    req_status.group_states[1].block_ids[:] = [0, 21]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={"req": [(1, 99, 28)]},
+        )
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+
+
 def test_partial_tail_probe_ignores_a_missing_drafter_key():
     """The probe requires the tail's groups only, so the key that is never
     stored cannot miss the boundary for the groups that are stored."""
@@ -611,6 +640,88 @@ def test_partial_tail_load_asks_no_boundary_key_for_the_drafter_group(
     assert make_offload_key(BlockHash(b"h6"), mamba_group_idx) in job.keys
     # The invariant the transfer layer relies on: one source key per
     # destination block, in the same group order.
+    assert sum(dst_spec.group_sizes) == len(dst_spec.block_ids) == len(job.keys)
+
+
+def test_partial_tail_load_drops_nothing_for_an_exempt_group_with_nothing_loaded():
+    """An exempt group whose blocks are all cached has no pending block, so the
+    tail has no block to drop there and the group contributes zero. Dropping
+    unconditionally would report a group size of -1, which unbalances the
+    key-per-destination-block pairing just as a surplus block does."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    assert scheduler._lookup(req_status) == 28
+
+    # Every drafter block is already hashed, so no block of that group is a
+    # load destination at all.
+    drafter_blocks = [KVCacheBlock(51), KVCacheBlock(52)]
+    for idx, block in enumerate(drafter_blocks):
+        block.set_block_hash(
+            make_block_hash_with_group_id(BlockHash(f"d{idx}".encode()), 2),
+            (idx + 1) * 16,
+        )
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                drafter_blocks,
+            )
+        ),
+        num_external_tokens=28,
+    )
+
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    dst_spec = load_job.dst_spec
+    assert isinstance(dst_spec, GPULoadStoreSpec)
+    assert dst_spec.group_sizes == [2, 1, 0]
+    assert dst_spec.block_ids.tolist() == [31, 32, 41]
+    [job] = scheduler._jobs.values()
+    assert sum(dst_spec.group_sizes) == len(dst_spec.block_ids) == len(job.keys)
+
+
+def test_partial_tail_load_when_the_boundary_is_the_only_chunk():
+    """A resume that hits the tail and nothing else: the boundary block is each
+    group's only block, so an exempt group's whole destination *is* the tail
+    block and has to leave the spec together with its missing key.
+
+    Geometry: 12 tokens of tail at tokens_per_block 16, so one block per group
+    and one chunk that is entirely partial."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+
+    def lookup(key, req_context):
+        # Only the keys at the 12-token boundary are stored: no complete
+        # 16-token chunk is, so the tail is the whole hit.
+        if get_offload_block_hash(key) == BlockHash(b"h2"):
+            return LookupResult.HIT
+        return LookupResult.MISS
+
+    scheduler.manager.lookup.side_effect = lookup
+    assert scheduler._lookup(req_status) == 12
+    assert req_status.partial_tail_boundary == 12
+
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(([KVCacheBlock(31)], [KVCacheBlock(41)], [KVCacheBlock(51)])),
+        num_external_tokens=12,
+    )
+
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    dst_spec = load_job.dst_spec
+    assert isinstance(dst_spec, GPULoadStoreSpec)
+    assert dst_spec.group_sizes == [1, 1, 0]
+    assert dst_spec.block_ids.tolist() == [31, 41]
+    [job] = scheduler._jobs.values()
+    assert make_offload_key(BlockHash(b"h2"), 2) not in job.keys
     assert sum(dst_spec.group_sizes) == len(dst_spec.block_ids) == len(job.keys)
 
 
