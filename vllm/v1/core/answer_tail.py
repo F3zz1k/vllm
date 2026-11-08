@@ -151,7 +151,9 @@ class AnswerTail:
         self.num_kv_cache_groups = num_kv_cache_groups
         # The RAM tier the tails are offered to. Nothing reads it back until a
         # real store exists, so the null one keeps the feature GPU-only.
-        self.store: AnswerTailStore = store or NullAnswerTailStore()
+        self.store: AnswerTailStore = (
+            NullAnswerTailStore() if store is None else store
+        )
         self.validate_groups(coordinator)
 
     @staticmethod
