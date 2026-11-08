@@ -117,6 +117,15 @@ def check(arena):
             assert run in arena.order
             for k in run.keys:
                 assert run in cls.index[k].runs
+            assert 0 <= run.n_state <= len(run.keys)
+            if cls.state_groups:
+                # complete counts the boundaries the run's keys cover, so it is
+                # the group split of those keys and nothing else.
+                groups: dict[bytes, set[int]] = collections.defaultdict(set)
+                for k in run.keys:
+                    groups[k[:-4]].add(S._group(k))
+                assert run.complete == sum(1 for g in groups.values()
+                                           if cls.boundary_complete(g))
     for _, cls, row in arena._quarantine:
         used[(cls, row)] += 1
     for (cls, row), n in used.items():
@@ -515,13 +524,56 @@ def test_a_live_sessions_state_only_stub_is_not_evicted_before_an_attention_run(
     check(arena)
 
 
+def test_a_state_only_stub_outlives_a_restorable_run_once_past_the_grace():
+    # The stub is skipped by the age order, not merely pushed behind the dead
+    # runs: once the grace has passed, a run that restores is the one to go
+    # even though the stub restores nothing and is the older of the two.
+    clock = Clock()
+    arena, cls, a = hybrid(rows=5, clock=clock)
+    store(arena, a, [key(1, ST1), key(1, ST2)], b"stub")            # state only
+    store(arena, a, [key(2, ATT), key(2, ST1), key(2, ST2)], b"conv")  # restorable
+    assert cls.runs[b"conv"].restorable and cls.stats()["unrestorable_runs"] == 1
+    clock.t += S.DEAD_RUN_GRACE_SEC + 1
+    _, _, evicted = store(arena, a, [key(9, ATT)], b"new")
+    assert sorted(evicted) == [key(2, ATT), key(2, ST1), key(2, ST2)]
+    assert b"conv" not in cls.runs
+    assert arena.lookup(a, [key(1, ST1), key(1, ST2)]) == [P.HIT, P.HIT]
+    check(arena)
+
+
 def test_a_state_only_stub_is_still_evicted_when_it_is_all_the_arena_has():
     # Going last is not being unevictable: a session whose attention never
-    # arrives still leaves when the arena needs its rows.
-    arena, cls, a = hybrid(rows=4)
+    # arrives still leaves when the arena needs its rows. Past the grace the
+    # stub really is the run the arena would rather keep, so this is the walk
+    # that would refuse a store if a stub could never be evicted.
+    clock = Clock()
+    arena, cls, a = hybrid(rows=4, clock=clock)
     store(arena, a, [key(1, ST1), key(1, ST2)], b"stub")
+    clock.t += S.DEAD_RUN_GRACE_SEC + 1
     _, _, evicted = store(arena, a, [key(9, ATT), key(9, ST1), key(9, ST2)], b"live")
     assert sorted(evicted) == [key(1, ST1), key(1, ST2)]
+    check(arena)
+
+
+def test_a_held_state_only_stub_survives_an_over_cap_held_list():
+    # While the runs a GPU also holds take more than overlap_cap of the arena,
+    # eviction walks that list before the age order. A stub on it is protected
+    # by the same filter: held bytes are not a reason to lose the only copy of
+    # a waiting session's state.
+    clock = Clock()
+    arena, cls, a = hybrid(rows=6, clock=clock)
+    res = arena.prepare_store(a, [key(1, ST1), key(1, ST2)], b"stub", held=True)
+    assert res is not None
+    arena.complete_store(a, res[0], True)
+    store(arena, a, [key(2, ATT), key(2, ST1), key(2, ST2)], b"conv")
+    stub = cls.runs[b"stub"]
+    assert stub in arena.held
+    clock.t += S.DEAD_RUN_GRACE_SEC + 1
+    held_bytes = sum(len(r.keys) * r.cls.stride for r in arena.held)
+    assert held_bytes > arena.overlap_cap * arena.size  # the held list is walked
+    _, _, evicted = store(arena, a, [key(9, ATT), key(10, ATT)], b"new")
+    assert sorted(evicted) == [key(2, ATT), key(2, ST1), key(2, ST2)]
+    assert stub in arena.held and arena.lookup(a, [key(1, ST1)]) == [P.HIT]
     check(arena)
 
 
