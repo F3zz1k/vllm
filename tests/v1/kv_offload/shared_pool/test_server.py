@@ -591,6 +591,47 @@ def test_a_held_state_only_stub_survives_an_over_cap_held_list():
     check(arena)
 
 
+def test_admission_does_not_count_rows_the_eviction_order_defers():
+    # The stub is the pool's only copy of a waiting session's state, so
+    # _candidates leaves it to the end of the eviction order. admit_rows that
+    # counts its rows anyway prices space a store cannot take from it, and the
+    # admission number then justifies the store whose walk, reaching the stubs,
+    # evicts exactly that state (D4 review P1, 2026-11-08).
+    clock = Clock()
+    arena, cls, a = hybrid(rows=6, clock=clock)
+    store(arena, a, [key(1, ST1), key(1, ST2)], b"stub")  # a waiting session's state
+    store(arena, a, [key(2, ATT), key(2, ST1), key(2, ST2)], b"conv")  # its attention
+    clock.t += S.DEAD_RUN_GRACE_SEC + 1
+    assert cls.runs[b"stub"].state_only
+    assert [r.tag for r in arena._candidates()][-1] == b"stub"  # the order defers it
+    # So the stub's 2 rows are not space: a new session has the one free row to
+    # be admitted on, which does not cover the 2 rows its first store wants.
+    assert cls.available() == 1
+    assert arena.admit_rows(cls) == 1
+    assert cls.admit_fraction() == pytest.approx(1 / cls.num_rows)
+    assert cls.counters["admit_deferred_rows"] == 2
+    check(arena)
+
+
+def test_admission_does_not_count_another_class_deferred_stub():
+    # The same rule on the cross-class half of admit_rows: another class's run
+    # idle past cross_class_idle_sec is space this class may take, unless the
+    # eviction order defers it, which it does for a stub of any class.
+    clock = Clock()
+    arena = make_arena(superpages=4, clock=clock)
+    waiter_cls = make_class(arena, "waiter", state_groups=(ST1,))
+    waiter = client(waiter_cls, 1)
+    store(arena, waiter, [key(1, ST1), key(2, ST1)], b"stub")  # awaiting the band
+    cls = make_class(arena, "other", state_groups=(ST1,))
+    client(cls, 2)
+    cls.cross_class_idle_sec = 60.0
+    clock.t += 61.0
+    assert [r.tag for r in arena._candidates()][-1] == b"stub"
+    assert cls.admit_fraction() == pytest.approx(cls.available() / cls.num_rows)
+    assert cls.counters["admit_deferred_rows"] == 2
+    check(arena)
+
+
 def test_whole_store_of_an_unrestorable_run_is_rejected():
     arena, cls, a = hybrid()
     assert arena.prepare_store(a, [key(1, ATT), key(2, ATT)], b"X", whole=True) is None

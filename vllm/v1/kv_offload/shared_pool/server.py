@@ -1124,16 +1124,32 @@ class Arena:
             n += 1
         return n
 
+    def _deferred(self, run: Run, now: float) -> bool:
+        """Whether _candidates leaves run to the end of the eviction order:
+        recurrent state and nothing else, past the grace. A store takes it only
+        when the walk has nothing else, so its rows are not space an admission
+        decision may spend; both walks ask this one question so the two cannot
+        disagree about a waiting session's only saved state (2026-11-08)."""
+        return run.state_only and run.stored_at <= now - DEAD_RUN_GRACE_SEC
+
     def admit_rows(self, cls: LayoutClass) -> int:
         """Rows of cls a store can have without evicting a live run of cls:
         free and claimable rows, rows of its dead (unrestorable) runs past the
         grace, and rows of other classes' runs idle for cls.cross_class_idle_sec
-        (converted by row size; at most ADMIT_WALK_RUNS runs are walked)."""
+        (converted by row size; at most ADMIT_WALK_RUNS runs are walked). Rows
+        of a run the eviction order defers (_deferred) are not space, and the
+        rows refused for that reason are the last value of
+        cls.counters["admit_deferred_rows"], as admit_rows is recomputed."""
         now = self.clock()
         rows = cls.available()
         dead_cut = now - DEAD_RUN_GRACE_SEC
+        deferred_bytes = 0
         for run in self.unrestorable:
-            if run.cls is cls and run.stored_at <= dead_cut:
+            if run.cls is not cls or run.stored_at > dead_cut:
+                continue
+            if self._deferred(run, now):
+                deferred_bytes += self._freeable(run) * run.cls.stride
+            else:
                 rows += self._freeable(run)
         idle_cut = now - cls.cross_class_idle_sec
         other_bytes = 0
@@ -1142,7 +1158,11 @@ class Arena:
                 break
             if run.cls is cls or run.stored_at > idle_cut:
                 continue
+            if self._deferred(run, now):
+                deferred_bytes += self._freeable(run) * run.cls.stride
+                continue
             other_bytes += self._freeable(run) * run.cls.stride
+        cls.counters["admit_deferred_rows"] = deferred_bytes // cls.stride
         return rows + other_bytes // cls.stride
 
     def _candidates(self):
@@ -1152,13 +1172,14 @@ class Arena:
         attention: a prompt hand-off leaves one while the session's attention
         is still on the GPU, and it is that state's only copy, so losing it
         costs the whole session when the GPU drops it (2026-11-06)."""
-        cutoff = self.clock() - DEAD_RUN_GRACE_SEC
+        now = self.clock()
+        cutoff = now - DEAD_RUN_GRACE_SEC
         dead: list[Run] = []
         stubs: dict[Run, None] = {}
         for r in self.unrestorable:
             if r.stored_at > cutoff:
                 continue
-            if r.state_only:
+            if self._deferred(r, now):
                 stubs[r] = None
             else:
                 dead.append(r)
