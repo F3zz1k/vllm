@@ -37,6 +37,7 @@ class _ConnectorMetricName:
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
     WRITE_BACK_EVENTS = "vllm:kv_offload_write_back_events"
+    PARTIAL_TAIL_EVENTS = "vllm:kv_partial_tail_events"
 
 
 class _TransferType:
@@ -132,6 +133,14 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
                 "Write-back band events (VLLM_KV_WRITE_BACK=1) by kind: runs "
                 "pinned, offered, refused, blocks copied, blocks the GPU reused "
                 "before they were copied (evict_uncopied), and so on."
+            ),
+            labelnames=("event",),
+        ),
+        _ConnectorMetricName.PARTIAL_TAIL_EVENTS: OffloadingCounterMetadata(
+            documentation=(
+                "Partial-tail events by kind: finish-time tail hand-offs "
+                "refused, and why (a group with no tail key, a layout the "
+                "partial tail does not serve, a source block that is gone)."
             ),
             labelnames=("event",),
         ),

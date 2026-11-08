@@ -3157,6 +3157,50 @@ def test_validate_mamba_align_subblock_prefill():
 
 
 @pytest.mark.parametrize(
+    ("enabled", "prefix_caching", "mamba_mode", "connector", "dcp", "blocker"),
+    [
+        (False, False, "none", "NixlConnector", 2, None),
+        (True, True, "align", "OffloadingConnector", 1, None),
+        (True, True, "align", None, 1, None),
+        (True, True, "align", "SimpleCPUOffloadConnector", 1, None),
+        (True, False, "align", "OffloadingConnector", 1, "prefix caching"),
+        (True, True, "none", "OffloadingConnector", 1, "mamba_cache_mode"),
+        (True, True, "align", "NixlConnector", 1, "offloading KV connectors"),
+        (True, True, "align", "OffloadingConnector", 2, "context parallelism"),
+    ],
+)
+def test_partial_tail_offload_validation_matrix(
+    enabled: bool,
+    prefix_caching: bool,
+    mamba_mode: str,
+    connector: str | None,
+    dcp: int,
+    blocker: str | None,
+):
+    """Every blocker of `--enable-partial-tail-offload` on its own, and the
+    combinations that stay silent: the flag off, prefix caching with the align
+    cache mode the tail state comes from, an offloading connector or none, and
+    decode context parallelism 1."""
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_partial_tail_offload=enabled,
+            enable_prefix_caching=prefix_caching,
+            mamba_cache_mode=mamba_mode,
+        ),
+        kv_transfer_config=(
+            None if connector is None else SimpleNamespace(kv_connector=connector)
+        ),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp),
+    )
+
+    if blocker is None:
+        VllmConfig._validate_partial_tail_offload(config)
+    else:
+        with pytest.raises(ValueError, match=blocker):
+            VllmConfig._validate_partial_tail_offload(config)
+
+
+@pytest.mark.parametrize(
     ("model_id", "compilation_config", "optimization_level"),
     [
         (

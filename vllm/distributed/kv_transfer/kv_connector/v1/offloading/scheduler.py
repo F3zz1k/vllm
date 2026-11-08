@@ -271,6 +271,10 @@ class SchedulerOffloadConfig(NamedTuple):
     # for the rest. Positions in a transfer spec stay dense over
     # `kv_group_configs`, so an excluded group contributes zero blocks.
     partial_tail_groups: tuple[GroupOffloadConfig, ...]
+    # Groups the model has that no tail key can name, because they are outside
+    # the offloading group set (a circular buffer's ring, a HiSparse host tier).
+    # A tail that omits one of them restores a partial state, so it is refused.
+    tail_omitted_groups: tuple[int, ...]
     blocks_per_chunk: int
     tokens_per_hash: int
     num_workers: int
@@ -404,6 +408,11 @@ class SchedulerOffloadConfig(NamedTuple):
             if partial_tail_offload
             else kv_group_configs
         )
+        tail_omitted_groups = tuple(
+            group_id
+            for group_id in range(len(kv_cache_config.kv_cache_groups))
+            if group_id not in {config.group_idx for config in kv_group_configs}
+        )
         # Partial tails currently require one physical block per offload chunk
         # and uniform, non-windowed groups so one boundary identifies every
         # group's source. DCP needs additional hand-off semantics, and a
@@ -445,6 +454,7 @@ class SchedulerOffloadConfig(NamedTuple):
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
             partial_tail_groups=partial_tail_groups,
+            tail_omitted_groups=tail_omitted_groups,
             blocks_per_chunk=spec.blocks_per_chunk,
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
@@ -735,6 +745,9 @@ class OffloadingConnectorScheduler:
         self._partial_tail_group_ids = frozenset(
             config.group_idx for config in self.config.partial_tail_groups
         )
+        self._enable_partial_tail_offload = (
+            vllm_config.cache_config.enable_partial_tail_offload
+        )
         self._cow_source_groups = frozenset(
             config.group_idx
             for config in self.config.kv_group_configs
@@ -742,6 +755,9 @@ class OffloadingConnectorScheduler:
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # Finish-time tail store jobs. The hand-off arrives between steps, so a
+        # job waits here until the next build_connector_meta hands it over.
+        self._finished_partial_tail_jobs: dict[int, TransferJob] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -829,6 +845,9 @@ class OffloadingConnectorScheduler:
         self._wb_touching = False
         self._wb_counts: Counter = Counter()
         self._wb_counts_emitted: Counter = Counter()  # already on /metrics
+        # Refused partial tails by reason (see _refuse_finish_tail).
+        self._tail_counts: Counter = Counter()
+        self._tail_counts_emitted: Counter = Counter()
         # Block id -> its free-queue predecessor when the band took it (None:
         # it was not in the queue), so its release puts it back where it was.
         self._wb_prev: dict[int, Any] = {}
@@ -3052,97 +3071,205 @@ class OffloadingConnectorScheduler:
             cow_blocks = {group_idx: block_id for group_idx, block_id, _ in entries}
             assert self._cow_source_groups.issubset(cow_blocks)
 
-            assert boundary % self._partial_tail_block_size != 0
-            block_idx = boundary // self._partial_tail_block_size
-            tail_configs = self.config.partial_tail_groups
-            if any(
-                group.group_idx not in self._cow_source_groups
-                and block_idx >= len(group_states[group.group_idx].block_ids)
-                for group in tail_configs
-            ):
-                continue
-            keys = [
-                self._make_boundary_key(
-                    req, group.group_idx, boundary, req_status.req_context
-                )
-                for group in tail_configs
-            ]
-            block_ids = [
-                cow_blocks[group.group_idx]
-                if group.group_idx in self._cow_source_groups
-                else group_states[group.group_idx].block_ids[block_idx]
-                for group in tail_configs
-            ]
-            assert all(block_id != 0 for block_id in block_ids)
-
-            # No write-through gate here: a partial-tail state exists only in
-            # this hand-off (its key names a sub-block hash, which the band,
-            # keyed by GPU block hashes, never offers), so it is stored now or
-            # never; it costs one chunk per group.
-            store_output = self._prepare_store(keys, req_status.req_context)
-            if store_output is None:
-                self._connector_stats.increase_counter(
-                    _ConnectorMetricName.ALLOCATION_FAILURE
-                )
-                continue
-            if not store_output.keys_to_store:
-                continue
-
-            for group_config, key in zip(tail_configs, keys):
-                if key in store_output.keys_to_store:
-                    self._events_tracker.record_partial_store(
-                        req, group_config, boundary, key
-                    )
-
-            # The keys run over the tail's groups, the transfer spec over every
-            # group, so a key's position is not its config index.
-            config_idx_by_key = {
-                key: self._config_idx_by_group[group.group_idx]
-                for group, key in zip(tail_configs, keys)
-            }
-            block_id_by_key = dict(zip(keys, block_ids))
-            accepted = [
-                (config_idx_by_key[key], block_id_by_key[key])
-                for key in store_output.keys_to_store
-            ]
-            group_sizes = [0] * len(self.config.kv_group_configs)
-            block_indices = [0] * len(self.config.kv_group_configs)
-            for config_idx, _ in accepted:
-                group_sizes[config_idx] = 1
-                block_indices[config_idx] = block_idx
-            source_blocks = [block_id for _, block_id in accepted]
-
-            job_id = self._generate_job_id()
-            req_status.transfer_jobs.add(job_id)
-            for block_id in source_blocks:
-                self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
-            self._jobs[job_id] = TransferJobStatus(
-                req_id=req_id,
-                pending_count=self.config.num_workers,
-                keys=set(store_output.keys_to_store),
-                is_store=True,
-                fenced_block_ids=source_blocks,
+            job = self._tail_store_job(
+                req_status,
+                boundary,
+                cow_blocks,
+                {idx: state.block_ids for idx, state in group_states.items()},
             )
-            if self._b70_trace:
-                self._b70_job_submitted(req_id, True)
-                _b70.log(
-                    "partial-tail-store req=%s boundary=%d keys=%d job=%d",
-                    req_id,
-                    boundary,
-                    len(store_output.keys_to_store),
-                    job_id,
-                )
-            store_jobs[job_id] = TransferJob(
-                req_id=req_id,
-                src_spec=GPULoadStoreSpec(
-                    source_blocks,
-                    group_sizes=group_sizes,
-                    block_indices=block_indices,
-                ),
-                dst_spec=store_output.store_spec,
-            )
+            if job is None:
+                continue
+            job_id, store_job = job
+            store_jobs[job_id] = store_job
 
         return store_jobs
+
+    def _tail_store_job(
+        self,
+        req_status: RequestOffloadState,
+        boundary: int,
+        cow_blocks: dict[int, int],
+        block_ids_by_group: dict[int, list[int]],
+    ) -> tuple[int, TransferJob] | None:
+        """Build the one store job a partial tail at ``boundary`` needs.
+
+        A recurrent group takes its source from the scheduler's CoW hand-off
+        (``cow_blocks``); every other group from position
+        ``boundary // block_size`` of its own block table, read out of
+        ``block_ids_by_group``. The step path feeds that from the request's
+        running block ids, the finish path from the hand-off the scheduler got
+        before the blocks were freed. Returns the job id with the job, or None
+        when a group has no source block at that position.
+        """
+        assert self._cow_source_groups.issubset(cow_blocks)
+        assert boundary % self._partial_tail_block_size != 0
+        req = req_status.req
+        block_idx = boundary // self._partial_tail_block_size
+        tail_configs = self.config.partial_tail_groups
+        if any(
+            group.group_idx not in cow_blocks
+            and block_idx >= len(block_ids_by_group.get(group.group_idx, ()))
+            for group in tail_configs
+        ):
+            return None
+        keys = [
+            self._make_boundary_key(
+                req, group.group_idx, boundary, req_status.req_context
+            )
+            for group in tail_configs
+        ]
+        block_ids = [
+            cow_blocks[group.group_idx]
+            if group.group_idx in self._cow_source_groups
+            else block_ids_by_group[group.group_idx][block_idx]
+            for group in tail_configs
+        ]
+        assert all(block_id != 0 for block_id in block_ids)
+
+        # No write-through gate here: a partial-tail state exists only in this
+        # hand-off (its key names a sub-block hash, which the band, keyed by GPU
+        # block hashes, never offers), so it is stored now or never; it costs
+        # one chunk per group.
+        store_output = self._prepare_store(keys, req_status.req_context)
+        if store_output is None:
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.ALLOCATION_FAILURE
+            )
+            return None
+        if not store_output.keys_to_store:
+            return None
+
+        for group_config, key in zip(tail_configs, keys):
+            if key in store_output.keys_to_store:
+                self._events_tracker.record_partial_store(
+                    req, group_config, boundary, key
+                )
+
+        # The keys run over the tail's groups, the transfer spec over every
+        # group, so a key's position is not its config index.
+        config_idx_by_key = {
+            key: self._config_idx_by_group[group.group_idx]
+            for group, key in zip(tail_configs, keys)
+        }
+        block_id_by_key = dict(zip(keys, block_ids))
+        accepted = [
+            (config_idx_by_key[key], block_id_by_key[key])
+            for key in store_output.keys_to_store
+        ]
+        group_sizes = [0] * len(self.config.kv_group_configs)
+        block_indices = [0] * len(self.config.kv_group_configs)
+        for config_idx, _ in accepted:
+            group_sizes[config_idx] = 1
+            block_indices[config_idx] = block_idx
+        source_blocks = [block_id for _, block_id in accepted]
+
+        job_id = self._generate_job_id()
+        req_status.transfer_jobs.add(job_id)
+        for block_id in source_blocks:
+            self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=req.request_id,
+            pending_count=self.config.num_workers,
+            keys=set(store_output.keys_to_store),
+            is_store=True,
+            fenced_block_ids=source_blocks,
+        )
+        if self._b70_trace:
+            self._b70_job_submitted(req.request_id, True)
+            _b70.log(
+                "partial-tail-store req=%s boundary=%d keys=%d job=%d",
+                req.request_id,
+                boundary,
+                len(store_output.keys_to_store),
+                job_id,
+            )
+        return job_id, TransferJob(
+            req_id=req.request_id,
+            src_spec=GPULoadStoreSpec(
+                source_blocks,
+                group_sizes=group_sizes,
+                block_indices=block_indices,
+            ),
+            dst_spec=store_output.store_spec,
+        )
+
+    def _refuse_finish_tail(
+        self, reason: str, request: Request, boundary: int | None
+    ) -> bool:
+        """Count and announce a finish-time tail that is dropped.
+
+        A tail whose sources are gone, or whose layout has a group no tail key
+        can name, is refused whole: a partially restored tail is worse than no
+        tail, because a wrong recurrent state or ring is read silently.
+        """
+        self._tail_counts[reason] += 1
+        logger.info_once(
+            "KV offloading: refused the finish-time partial tail of request %s "
+            "at %s tokens (%s); a tail is stored whole or not at all.",
+            request.request_id,
+            boundary,
+            reason,
+        )
+        return False
+
+    def register_finished_partial_tail(
+        self,
+        request: Request,
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Queue the partial tail of a producer request that just finished.
+
+        The hand-off carries the recurrent table block per group and the
+        request's own block tables, read before its blocks were freed. The
+        answer is False and never True: the job owns references to its source
+        blocks and the worker fences their reuse, while this connector's worker
+        reports store completion through completed jobs rather than
+        ``finished_sending``, so a True would hold the request's blocks forever.
+        """
+        if not self._enable_partial_tail_offload or not partial_tail_offloads:
+            return False
+        if self.config.tail_omitted_groups:
+            return self._refuse_finish_tail("groups_without_tail_keys", request, None)
+        if not self.config.supports_partial_tail:
+            return self._refuse_finish_tail("layout_unsupported", request, None)
+        boundaries = {boundary for _, _, boundary in partial_tail_offloads}
+        if len(boundaries) != 1:
+            return self._refuse_finish_tail("mixed_boundaries", request, None)
+        boundary = boundaries.pop()
+        req_status = self._req_status.get(request.request_id)
+        if req_status is None:
+            return self._refuse_finish_tail("untracked_request", request, boundary)
+        max_boundary = min(
+            request.num_prompt_tokens,
+            req_status.max_offload_tokens or request.num_prompt_tokens,
+        )
+        if (
+            boundary <= 0
+            or boundary % self.config.tokens_per_hash != 0
+            or boundary > max_boundary
+            or boundary % self._partial_tail_block_size == 0
+        ):
+            return self._refuse_finish_tail("boundary_unusable", request, boundary)
+        cow_blocks = {
+            group_idx: block_id for group_idx, block_id, _ in partial_tail_offloads
+        }
+        if not self._cow_source_groups.issubset(cow_blocks) or any(
+            block_id == 0 for _, block_id, _ in partial_tail_offloads
+        ):
+            return self._refuse_finish_tail("state_source_missing", request, boundary)
+
+        job = self._tail_store_job(
+            req_status,
+            boundary,
+            cow_blocks,
+            {idx: list(ids) for idx, ids in enumerate(block_ids)},
+        )
+        if job is None:
+            return self._refuse_finish_tail("source_block_missing", request, boundary)
+        job_id, store_job = job
+        self._finished_partial_tail_jobs[job_id] = store_job
+        return False
 
     def _reachable_store_block_mask(
         self,
@@ -3552,9 +3679,15 @@ class OffloadingConnectorScheduler:
             write_back_jobs = {}
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
-            store_jobs=partial_store_jobs | normal_store_jobs | write_back_jobs,
+            store_jobs=(
+                partial_store_jobs
+                | normal_store_jobs
+                | write_back_jobs
+                | self._finished_partial_tail_jobs
+            ),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
+        self._finished_partial_tail_jobs = {}
 
         # All prepare_store calls for finished requests have been issued.
         # Signal on_request_finished and clean up state where possible.
@@ -3855,6 +3988,12 @@ class OffloadingConnectorScheduler:
                         _ConnectorMetricName.WRITE_BACK_EVENTS, delta, (event,)
                     )
             self._wb_counts_emitted = Counter(self._wb_counts)
+        for event, n in self._tail_counts.items():
+            if delta := n - self._tail_counts_emitted[event]:
+                self._connector_stats.increase_counter(
+                    _ConnectorMetricName.PARTIAL_TAIL_EVENTS, delta, (event,)
+                )
+        self._tail_counts_emitted = Counter(self._tail_counts)
         if not self._connector_stats.is_empty():
             stats = self._connector_stats
             self._connector_stats = OffloadingConnectorStats()
@@ -3968,6 +4107,7 @@ class OffloadingConnectorScheduler:
         self._state_sets.clear()
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
+        self._finished_partial_tail_jobs.clear()
 
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.

@@ -262,6 +262,23 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request)
 
+    def register_finished_partial_tail(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+        partial_tail_offloads: list[tuple[int, int, int]],
+    ) -> bool:
+        """Queue the finished request's partial tail for the next step.
+
+        Returns False: the store job fences its own source blocks, and this
+        connector's worker never reports ``finished_sending``, so delaying the
+        request's blocks would leak them.
+        """
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.register_finished_partial_tail(
+            request, block_ids, partial_tail_offloads
+        )
+
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
