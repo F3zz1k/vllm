@@ -648,7 +648,11 @@ class LayoutClass:
         self.n_refd = 0     # held by a reader, a pin or a disk write
         self.n_pinned = 0
         # Another class's run unused for this long is space this class may
-        # take for a compute-time store (it yields to an active class).
+        # take for a compute-time store (it yields to an active class). Keep it
+        # at or above DEAD_RUN_GRACE_SEC: Arena.admit_rows gates its own class's
+        # runs by the grace and other classes' by this cut, and the deferral
+        # rule does not carry the grace, so a younger cut would price a run
+        # still inside the grace as space to one walk and not to the other.
         self.cross_class_idle_sec = float(cfg.get("cross_class_idle_sec", 120.0))
         self._admit_cache: tuple[float, float] | None = None
 
@@ -1125,12 +1129,13 @@ class Arena:
         return n
 
     def _deferred(self, run: Run, now: float) -> bool:
-        """Whether _candidates leaves run to the end of the eviction order:
-        recurrent state and nothing else, past the grace. A store takes it only
-        when the walk has nothing else, so its rows are not space an admission
-        decision may spend; both walks ask this one question so the two cannot
-        disagree about a waiting session's only saved state (2026-11-08)."""
-        return run.state_only and run.stored_at <= now - DEAD_RUN_GRACE_SEC
+        """Whether the eviction order leaves run to the end, so its rows are not
+        space an admission decision may spend. Run.state_stub_protected is the
+        one predicate for the rule, and its age bound is what stops a run that
+        never completes from holding rows hostage for ever. The grace is not in
+        it: each walk applies its own age cut, so cross_class_idle_sec must not
+        be younger than DEAD_RUN_GRACE_SEC (2026-11-08)."""
+        return run.state_stub_protected(now)
 
     def admit_rows(self, cls: LayoutClass) -> int:
         """Rows of cls a store can have without evicting a live run of cls:
@@ -1168,10 +1173,11 @@ class Arena:
     def _candidates(self):
         """Runs that restore nothing first; then, while runs a GPU also holds
         take more than overlap_cap of the arena, those (oldest marked first);
-        then every run oldest first. Last, the runs of recurrent state and no
-        attention: a prompt hand-off leaves one while the session's attention
-        is still on the GPU, and it is that state's only copy, so losing it
-        costs the whole session when the GPU drops it (2026-11-06)."""
+        then every run oldest first. Last, the runs that hold recurrent state
+        and restore nothing (_deferred): a prompt hand-off leaves one while the
+        session's attention is still on the GPU, and it is that state's only
+        copy, so losing it costs the whole session when the GPU drops it
+        (2026-11-06)."""
         now = self.clock()
         cutoff = now - DEAD_RUN_GRACE_SEC
         dead: list[Run] = []
@@ -2641,6 +2647,9 @@ class PoolServer:
                     "rows_used": len(cls.index),
                     "free_fraction": cls.available() / cls.num_rows,
                     "admit_fraction": cls.admit_fraction(),
+                    # The rows admit_fraction refused as deferred, the level the
+                    # last computation saw rather than a running total.
+                    "admit_deferred_rows": cls.counters["admit_deferred_rows"],
                     "pinned": cls.n_pinned,
                     "runs": len(cls.runs),
                     "unrestorable_runs": cls.unrestorable_runs(),

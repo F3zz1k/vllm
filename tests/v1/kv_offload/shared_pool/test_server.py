@@ -632,6 +632,26 @@ def test_admission_does_not_count_another_class_deferred_stub():
     check(arena)
 
 
+def test_a_refused_stub_row_does_not_refuse_the_store_and_the_stub_survives():
+    # The consequence the pair above does not pin: they read the admission
+    # number, and a rule that deferred every run would pass them. With the stub
+    # rows refused, a store of the arena's last free rows must still land, and
+    # the walk must take the restorable conversation rather than the state a
+    # waiting session is still going to need.
+    clock = Clock()
+    arena, cls, a = hybrid(rows=6, clock=clock)
+    store(arena, a, [key(1, ST1), key(1, ST2)], b"stub")  # the only copy
+    store(arena, a, [key(2, ATT), key(2, ST1), key(2, ST2)], b"conv")  # freeable
+    clock.t += S.DEAD_RUN_GRACE_SEC + 1
+    assert arena.admit_rows(cls) == 1
+    assert cls.counters["admit_deferred_rows"] == 2
+    _, _, evicted = store(arena, a, [key(9, ATT), key(9, ST1), key(9, ST2)], b"new")
+    assert sorted(evicted) == [key(2, ATT), key(2, ST1), key(2, ST2)]
+    assert b"stub" in cls.runs
+    assert arena.lookup(a, [key(1, ST1), key(1, ST2)]) == [P.HIT, P.HIT]
+    check(arena)
+
+
 def test_whole_store_of_an_unrestorable_run_is_rejected():
     arena, cls, a = hybrid()
     assert arena.prepare_store(a, [key(1, ATT), key(2, ATT)], b"X", whole=True) is None

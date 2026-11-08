@@ -119,21 +119,20 @@ while the state still sits at a deeper boundary than that row reaches.
 run's last store, so a session that keeps finishing turns keeps its state and a stalled one
 gives its rows back.
 
-**What is wired, and what is not.** The predicate and the bound are implemented and tested.
-Neither is read by `_candidates`: that is the D4 eviction code this step must not touch, and
-a guard nobody consults is not a guard. Step 3 wires it, and the counter it needs is
-`state_stub_expired`, incremented where `_candidates` passes an expired stub into the
-reclaimable list. The band's live counters for this shape are `tail_run_missing` (a tail
-with no run to belong to) and `tail_evicted` (a tail the arena dropped).
+**What is wired, and what is not.** The predicate and the bound are implemented and tested,
+and P1b wired them: `Arena._deferred` (`server.py:1131`) is `Run.state_stub_protected`, and
+`_candidates` (`server.py:1173`) and both walks of `admit_rows` (`server.py:1140`) ask it, so
+a protected run leaves the arena last and its rows are not space a store may have. What step
+3 still owes is the counter `state_stub_expired`, incremented where `_candidates` passes an
+expired stub back into the reclaimable list. The band's live counters for this shape are
+`tail_run_missing` (a tail with no run to belong to) and `tail_evicted` (a tail the arena
+dropped).
 
 **What the predicate cannot see.** A tail carrying an attention row as well as the state
 rows completes a boundary at the tail's own hash, so the run reads as restorable and the
 predicate is False. Tested, because it is why the guard cannot be this predicate alone: the
 guard is that a tail never stands up a run of its own, which is section 2's offer rule and
 section 3's `tail_run_missing`.
-
-open, because the wiring belongs in the D4 eviction path, which this step is forbidden to
-change; the predicate and its bound are implemented and tested here.
 
 ## 5. The invariant, in every new test
 
