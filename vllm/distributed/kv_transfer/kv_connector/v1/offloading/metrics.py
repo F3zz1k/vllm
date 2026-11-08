@@ -144,7 +144,7 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
                 "group with no tail key, a layout the partial tail does not "
                 "serve, a mixed or unusable boundary, a boundary past the "
                 "offload cap, a hand-off missing a state group, a source block "
-                "that is gone, a store the pool refused, keys already "
+                "that is gone or null, a store the pool refused, keys already "
                 "resident). A layout refusal counts the tails the hand-off "
                 "carried, every other reason one."
             ),

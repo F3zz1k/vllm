@@ -3299,7 +3299,11 @@ class OffloadingConnectorScheduler:
             else block_ids_by_group[group.group_idx][block_idx]
             for group in tail_configs
         ]
-        assert all(block_id != 0 for block_id in block_ids)
+        # A null block carries no bytes. The finish path's hand-off is checked
+        # here as well as the step path's table read, so both refuse a tail
+        # whose source is the null block instead of storing residue.
+        if any(block_id == 0 for block_id in block_ids):
+            return TailStoreRefusal("null_source_block")
 
         # No write-through gate here: a partial-tail state exists only in this
         # hand-off (its key names a sub-block hash, which the band, keyed by GPU
@@ -3458,9 +3462,9 @@ class OffloadingConnectorScheduler:
         cow_blocks = {
             group_idx: block_id for group_idx, block_id, _ in partial_tail_offloads
         }
-        if not self._cow_source_groups.issubset(cow_blocks) or any(
-            block_id == 0 for _, block_id, _ in partial_tail_offloads
-        ):
+        # A null source block is refused by the shared check in
+        # _tail_store_job, which sees every group the tail is built from.
+        if not self._cow_source_groups.issubset(cow_blocks):
             return self._refuse_partial_tail("state_source_missing", req_id, boundary)
 
         job = self._tail_store_job(

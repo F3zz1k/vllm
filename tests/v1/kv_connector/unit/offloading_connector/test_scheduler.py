@@ -14,6 +14,7 @@ from tests.v1.kv_connector.unit.offloading_connector.test_config import (
     _make_vllm_config,
 )
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
+    MockLoadStoreSpec,
     MockOffloadingSpec,
     generate_store_output,
     to_keys,
@@ -73,6 +74,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadKey,
     OffloadPolicy,
+    PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
@@ -671,18 +673,185 @@ def _assert_nothing_half_built(scheduler: OffloadingConnectorScheduler) -> None:
         assert not req_status.transfer_jobs
 
 
+def test_partial_tail_step_path_refuses_a_hand_off_with_two_boundaries():
+    """One tail is named by one boundary. A hand-off that carries two cannot
+    say which position the state belongs to, so it is refused whole."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"req": [(1, 99, 28), (1, 98, 44)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"mixed_boundaries": 1}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_step_path_refuses_a_hand_off_for_an_untracked_request():
+    """A hand-off for a request the connector never saw has no block tables,
+    no offload cap and no context to key with: it is refused, not guessed."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"ghost": [(1, 99, 28)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"untracked_request": 1}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_step_path_names_a_missing_state_source_its_own_reason():
+    """A hand-off that names no state block for a recurrent group is routine
+    mid-step, once per step, while the same shape at finish means the tail is
+    gone for good. Two signals, so two reasons: the step path's is
+    hand_off_incomplete and the finish path keeps state_source_missing."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"req": [(0, 12, 28)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"hand_off_incomplete": 1}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_step_path_refuses_a_null_source_block():
+    """The step path reads its block table blind, so the check the finish path
+    had on its hand-off sits where both paths meet it: a null block carries no
+    bytes, and storing one writes residue under a key that reads back as the
+    state at the tail."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"req": [(1, 0, 28)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"null_source_block": 1}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_step_path_refuses_a_group_whose_block_table_is_short():
+    """A non-recurrent group reads its source from position
+    ``boundary // block_size`` of its own table. A table that stops short has
+    no source, and that is the one thing the reason source_block_missing should
+    ever mean."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+    # The tail reads position 28 // 16 = 1 of every non-recurrent group.
+    scheduler._req_status["req"].group_states[0].block_ids[:] = [11]
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"req": [(1, 99, 28)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"source_block_missing": 1}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_step_path_counts_a_store_the_pool_refused():
+    """A full pool is not a vanished source block: the refusal the aligned path
+    already reports as an allocation failure gets its own tail reason, so an
+    operator reading a climbing counter knows to look at the arena, not at the
+    block tables."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+    scheduler.manager.prepare_store.side_effect = None
+    scheduler.manager.prepare_store.return_value = None
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"req": [(1, 99, 28)]})
+    )
+
+    assert not jobs
+    assert scheduler._tail_counts == {"store_pool_refused": 1}
+    assert (
+        scheduler._connector_stats.data["data"][_ConnectorMetricName.ALLOCATION_FAILURE]
+        == {(): 1}
+    )
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_step_path_reports_keys_that_are_already_resident():
+    """When the pool holds every tail key there is nothing to write and nothing
+    is lost. That is counted apart from a source that is gone, because the two
+    answer different questions about the same tail."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    _make_partial_tail_request(scheduler)
+    _arm_step_tail_store(scheduler)
+
+    def already_resident(keys, req_context):
+        return PrepareStoreOutput(
+            keys_to_store=[], store_spec=MockLoadStoreSpec([]), evicted_keys=[]
+        )
+
+    scheduler.manager.prepare_store.side_effect = already_resident
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"req": [(1, 99, 28)]})
+    )
+
+    assert not jobs
+    offered = scheduler.manager.prepare_store.call_args.args[0]
+    # One key per tail group, exactly the rows a store would have paired with
+    # the two source blocks the fixtures armed.
+    assert len(offered) == len(scheduler.config.partial_tail_groups) == 2
+    assert scheduler._tail_counts == {"keys_already_resident": 1}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_partial_tail_layout_refusal_counts_the_tails_it_drops():
+    """A layout the partial tail does not serve is handed a tail every step, so
+    counting the step would leave a gauge and no answer to how many tails were
+    lost. The refusal counts the hand-off: two here, because the third
+    request's boundary is block-aligned and belongs to the aligned path."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    scheduler.config = scheduler.config._replace(tail_omitted_groups=(7,))
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    jobs = scheduler._build_partial_tail_store_jobs(
+        _step_hand_off({"a": [(1, 99, 28)], "b": [(1, 98, 44)], "c": [(1, 97, 16)]})
+    )
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"groups_without_tail_keys": 2}
+
+
 @pytest.mark.parametrize(
     "hand_off,omitted_groups",
     [
         ({"req": [(1, 99, 28), (1, 98, 44)]}, ()),
         ({"ghost": [(1, 99, 28)]}, ()),
         ({"req": [(0, 12, 28)]}, ()),
+        ({"req": [(1, 0, 28)]}, ()),
         ({"req": [(1, 99, 28)]}, (7,)),
     ],
     ids=[
         "mixed_boundaries",
         "untracked_request",
         "hand_off_incomplete",
+        "null_source_block",
         "layout",
     ],
 )
@@ -722,7 +891,6 @@ def test_partial_tail_refusals_are_observably_inert_without_the_flag(
     assert _ConnectorMetricName.PARTIAL_TAIL_EVENTS not in series
     log.info_once.assert_not_called()
     log.debug.assert_not_called()
-    _assert_nothing_half_built(scheduler)
 
 
 def test_partial_tail_probe_ignores_a_missing_drafter_key():
