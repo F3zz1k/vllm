@@ -223,18 +223,35 @@ def _make_partial_tail_scheduler(
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
 
+# Two keyed chunks at the fixtures' 16-token chunk. A drafter group pops its
+# last complete chunk on a lookup, which zeroes the whole hit when it holds
+# only one (test_full_attn_lookup_single_block_returns_zero), so a test that
+# needs a complete hit out of a drafter group has to key two. The tail is
+# unchanged: the probe reaches at most one block past the complete hit, so
+# the boundary stays 28.
+_TWO_CHUNK_PROMPT_TOKENS = 32
+
+
 def _make_partial_tail_request(
     scheduler: OffloadingConnectorScheduler,
     kv_transfer_params: dict[str, Any] | None = None,
+    *,
+    num_prompt_tokens: int = 30,
 ) -> MagicMock:
+    """A prompt of `num_prompt_tokens` and the block hashes the engine builds
+    for it, one per `tokens_per_hash`, so the request keys exactly the
+    complete chunks that length holds."""
+    tokens_per_hash = scheduler.config.tokens_per_hash
     request = MagicMock()
     request.request_id = "req"
     request.kv_transfer_params = kv_transfer_params
     request.kv_hints = None
-    request.num_prompt_tokens = 30
-    request.num_tokens = 30
-    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(7)]
-    request.all_token_ids = list(range(30))
+    request.num_prompt_tokens = num_prompt_tokens
+    request.num_tokens = num_prompt_tokens
+    request.block_hashes = [
+        BlockHash(f"h{i}".encode()) for i in range(num_prompt_tokens // tokens_per_hash)
+    ]
+    request.all_token_ids = list(range(num_prompt_tokens))
     request.lora_request = None
     request.skip_reading_prefix_cache = False
     request.is_finished.return_value = False
@@ -587,7 +604,7 @@ def test_partial_tail_probe_ignores_a_missing_drafter_key():
     """The probe requires the tail's groups only, so the key that is never
     stored cannot miss the boundary for the groups that are stored."""
     scheduler = _make_drafter_partial_tail_scheduler(True)
-    _make_partial_tail_request(scheduler)
+    _make_partial_tail_request(scheduler, num_prompt_tokens=_TWO_CHUNK_PROMPT_TOKENS)
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
@@ -617,7 +634,9 @@ def test_partial_tail_load_asks_no_boundary_key_for_the_drafter_group(
     with one block. The exempt group sits last and in the middle: a middle
     position is where a mismatched count shifts every later group's blocks."""
     scheduler = _make_drafter_partial_tail_scheduler(True, drafter_group_idx)
-    request = _make_partial_tail_request(scheduler)
+    request = _make_partial_tail_request(
+        scheduler, num_prompt_tokens=_TWO_CHUNK_PROMPT_TOKENS
+    )
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
@@ -661,7 +680,9 @@ def test_partial_tail_load_drops_nothing_for_an_exempt_group_with_nothing_loaded
     unconditionally would report a group size of -1, which unbalances the
     key-per-destination-block pairing just as a surplus block does."""
     scheduler = _make_drafter_partial_tail_scheduler(True)
-    request = _make_partial_tail_request(scheduler)
+    request = _make_partial_tail_request(
+        scheduler, num_prompt_tokens=_TWO_CHUNK_PROMPT_TOKENS
+    )
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
