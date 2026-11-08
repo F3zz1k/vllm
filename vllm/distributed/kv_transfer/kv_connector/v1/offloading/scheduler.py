@@ -890,6 +890,9 @@ class OffloadingConnectorScheduler:
         # and bytes move only in a worker's transfer job, so the core cannot
         # store a tail and the notifier is all the seam it gets.
         self.answer_tail_store = AnswerTailNotifier(self._tail_counts)
+        # Requests an answer-tail offer is keeping in _req_status after their
+        # release, so the state goes the step the offer leaves the queue.
+        self._tail_offer_holds: set[ReqId] = set()
         # job id -> the rows its tail store pinned. The pin is short: it is
         # held for the copy and released on every path that ends the job.
         self._tail_pinned: dict[int, list[OffloadKey]] = {}
@@ -3561,6 +3564,9 @@ class OffloadingConnectorScheduler:
             # Nothing here can serve them, and no counter may be emitted.
             self.answer_tail_store.reset()
             return store_jobs
+        # Before this step's offers: a request an earlier offer was holding is
+        # released the step its offer stops being queued, for any reason.
+        self._release_held_requests()
         offers = self.answer_tail_store.take_offers()
         if not offers:
             return store_jobs
@@ -3591,7 +3597,45 @@ class OffloadingConnectorScheduler:
             self._refuse_partial_tail(
                 job.reason, offer.handoff.request_id, offer.handoff.resume_token
             )
+            # The offer is gone, so a request kept alive for it is kept for
+            # nothing: the give-up releases it where the request's own release
+            # would have, one step at the earliest.
+            self._release_finished_request(offer.handoff.request_id)
         return store_jobs
+
+    def _release_finished_request(self, req_id: ReqId) -> None:
+        """Drop a finished request's offload state once nothing needs it.
+
+        Two things outlive the request itself: a store still in flight, and an
+        answer tail still queued for it, whose retry builds its store into the
+        run this state names. A request held that way is remembered, because
+        the step that drops its offer need not name its request again: the
+        budget can end on a retry, or the GPU can forget the tail.
+        """
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            self._tail_offer_holds.discard(req_id)
+            return
+        if not req_status.finished_signaled or req_status.transfer_jobs:
+            return
+        if self.answer_tail_store.has_offer_for(req_id):
+            self._tail_offer_holds.add(req_id)
+            return
+        self._tail_offer_holds.discard(req_id)
+        del self._req_status[req_id]
+        if self._b70_trace:
+            self._b70_req_done(req_id)
+
+    def _release_held_requests(self) -> None:
+        """Revisit the requests an answer-tail offer was holding back.
+
+        An offer leaves the queue on a store, on a give-up, or on the GPU
+        forgetting the tail, and only the first two name their request at a
+        step that could release it. This runs every step the store route is
+        open, over the handful of requests a retry is holding.
+        """
+        for req_id in list(self._tail_offer_holds):
+            self._release_finished_request(req_id)
 
     def _retry_tail_offer(self, offer: TailOffer) -> bool:
         """Queue a refused tail for the next step, until its retries run out or
@@ -4216,10 +4260,7 @@ class OffloadingConnectorScheduler:
             req_status.finished_signaled = True
             self._record_run(req_status)
             self.manager.on_request_finished(req_status.req_context)
-            if not req_status.transfer_jobs:
-                del self._req_status[req_id]
-                if self._b70_trace:
-                    self._b70_req_done(req_id)
+            self._release_finished_request(req_id)
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
@@ -4497,10 +4538,7 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if req_status.finished_signaled and not req_status.transfer_jobs:
-                del self._req_status[job_status.req_id]
-                if self._b70_trace:
-                    self._b70_req_done(job_status.req_id)
+            self._release_finished_request(job_status.req_id)
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -4607,6 +4645,7 @@ class OffloadingConnectorScheduler:
         # Reset offloading manager cache
         self._release_tail_pins()
         self.answer_tail_store.reset()
+        self._tail_offer_holds.clear()
         self.manager.reset_cache()
 
         # Reset store progress so active requests re-offload from chunk 0.

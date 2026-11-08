@@ -30,6 +30,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     make_block_hash_with_group_id,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.kv_offload.base import (
     LookupResult,
@@ -1309,6 +1310,71 @@ def test_a_tail_the_gpu_forgot_is_not_offered_again():
     assert not scheduler._build_answer_tail_store_jobs()
     scheduler.manager.prepare_store_run.assert_not_called()
     assert dict(scheduler._tail_counts) == {}
+    _assert_nothing_half_built(scheduler)
+
+
+def _finished_step(req_ids: set[str]) -> SchedulerOutput:
+    """The step that reports these requests finished, with nothing else
+    scheduled: the shape the answer-tail store route is built inside, which is
+    also the step that releases the request's offload state."""
+    output = SchedulerOutput.make_empty()
+    output.finished_req_ids = set(req_ids)
+    return output
+
+
+def _quiet_whole_chunk_store(req_status) -> None:
+    """Cap a request's offloadable tokens at none, so the whole-chunk store
+    path has nothing to do and this test sees only the tail's own store."""
+    req_status.req.is_finished.return_value = True
+    req_status.max_offload_tokens = 0
+
+
+def test_a_queued_tail_keeps_its_request_alive_until_the_pool_makes_room():
+    # A finished request with no store in flight has its offload state dropped
+    # the step it finishes, which is the production case: the band stores under
+    # a tag of its own and write-through is off. A tail the pool refused needs
+    # that state for its retry, because the retry stores into the run the state
+    # names, so releasing it anyway leaves every retry answering that it does
+    # not know the request and no tail ever stored.
+    scheduler, _, _ = _answer_tail_offer(pool_refused=True)
+    req_status = scheduler._req_status["req"]
+    _quiet_whole_chunk_store(req_status)
+    assert not req_status.transfer_jobs
+
+    assert not scheduler.build_connector_meta(_finished_step({"req"})).store_jobs
+    assert "req" in scheduler._req_status
+    assert scheduler._tail_counts["tail_retried"] == 1
+    assert scheduler._tail_counts["untracked_request"] == 0
+
+    # Step N+1: the pool has room, and the tail's own retry stores into it.
+    scheduler.manager.prepare_store_run.side_effect = (
+        lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
+    )
+    meta = scheduler.build_connector_meta(_finished_step(set()))
+    _assert_one_row_per_key(scheduler, meta.store_jobs)
+    assert len(meta.store_jobs) == 1
+    assert scheduler._tail_counts["tail_stored"] == 1
+    assert scheduler._tail_counts["store_pool_refused"] == 0
+
+
+def test_a_tail_the_pool_never_made_room_for_is_counted_once_and_released():
+    # The retry budget is the tail's whole patience: when it ends the store is
+    # given up on and counted, and the request state the retry was holding goes
+    # with it. The request finished at the first of these steps, so nothing
+    # else would ever have taken that state back.
+    scheduler, _, _ = _answer_tail_offer(pool_refused=True)
+    _quiet_whole_chunk_store(scheduler._req_status["req"])
+
+    for step in range(1 + sched_mod._TAIL_STORE_RETRIES):
+        meta = scheduler.build_connector_meta(
+            _finished_step({"req"} if step == 0 else set())
+        )
+        assert not meta.store_jobs
+
+    assert scheduler._tail_counts["store_pool_refused"] == 1
+    assert scheduler._tail_counts["tail_retried"] == sched_mod._TAIL_STORE_RETRIES
+    assert "req" not in scheduler._req_status
+    assert scheduler._tail_offer_holds == set()
     _assert_nothing_half_built(scheduler)
 
 

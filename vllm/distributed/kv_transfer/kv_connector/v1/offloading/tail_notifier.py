@@ -111,8 +111,10 @@ class AnswerTailNotifier(AnswerTailStore):
     def has_offer_for(self, request_id: str) -> bool:
         """Whether a tail of this request is still waiting to be stored.
 
-        The queue is the only index of what is waiting, so this walks it: at
-        most ``_MAX_OFFERS`` keys, and it drains every step.
+        The connector holds a finished request's offload state while one of its
+        offers is queued, because the retry builds its store into the run that
+        state names. The queue is the only index of what is waiting, so this
+        walks it: at most ``_MAX_OFFERS`` keys, and it drains every step.
         """
         return any(request_id == key[0] for key in self.pending)
 
