@@ -32,6 +32,10 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_offload.answer_tail_store import (
+    AnswerTailStore,
+    NullAnswerTailStore,
+)
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
@@ -139,11 +143,15 @@ class AnswerTail:
         block_pool: "BlockPool",
         caching_hash_fn: Callable[[Any], bytes],
         num_kv_cache_groups: int,
+        store: AnswerTailStore | None = None,
     ) -> None:
         self.coordinator = coordinator
         self.block_pool = block_pool
         self.caching_hash_fn = caching_hash_fn
         self.num_kv_cache_groups = num_kv_cache_groups
+        # The RAM tier the tails are offered to. Nothing reads it back until a
+        # real store exists, so the null one keeps the feature GPU-only.
+        self.store: AnswerTailStore = store or NullAnswerTailStore()
         self.validate_groups(coordinator)
 
     @staticmethod
@@ -260,12 +268,13 @@ class AnswerTail:
         tail = (self._finish_tail_parent(request, start), num_tokens - start)
         for manager, blocks in tail_blocks:
             if isinstance(manager, CircularBufferManager):
-                registry.register(
-                    pool,
-                    make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id),
-                    blocks[0],
-                    tail,
+                key = make_block_hash_with_group_id(
+                    tail_hash, manager.kv_cache_group_id
                 )
+                registry.register(pool, key, blocks[0], tail)
+                # The GPU-side registration stands on its own: a tier that
+                # refuses the tail costs nothing here.
+                self.store.store_tail(key, tail[0], tail[1], blocks[0].block_id)
                 continue
             if isinstance(manager, SlidingWindowManager):
                 block_idx = (num_tokens - 2) // manager.block_size
@@ -289,12 +298,10 @@ class AnswerTail:
                     ),
                     blocks[(start - 1) // manager.block_size],
                 )
-            registry.register(
-                pool,
-                make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id),
-                blocks[(num_tokens - 2) // manager.block_size],
-                tail,
-            )
+            key = make_block_hash_with_group_id(tail_hash, manager.kv_cache_group_id)
+            tail_block = blocks[(num_tokens - 2) // manager.block_size]
+            registry.register(pool, key, tail_block, tail)
+            self.store.store_tail(key, tail[0], tail[1], tail_block.block_id)
         logger.debug(
             "Registered the final state of request %s at %d tokens.",
             request.request_id,
