@@ -2730,9 +2730,13 @@ class OffloadingConnectorScheduler:
                         )
                         req_status.load_key_ranges.append((range_start, range_end, key))
 
-            # A group outside the tail's set gets no boundary key, so its
-            # partial tail block must leave the destination spec too: the
-            # transfer layer pairs one source key with one destination block.
+            # A group outside the tail's set gets no boundary key, so the
+            # blocks that key would have filled must leave the destination
+            # spec too: the transfer layer pairs one source key with one
+            # destination block. The tail fills the blocks of the last chunk,
+            # which starts at (num_chunks - 1) * blocks_per_chunk; naming that
+            # boundary instead of dropping a fixed 1 block removes the
+            # dependence on the gate's blocks_per_chunk == 1 invariant.
             num_dst_blocks = num_pending_gpu_blocks
             dst_end_gpu_block_idx = num_gpu_blocks
             if (
@@ -2740,8 +2744,11 @@ class OffloadingConnectorScheduler:
                 and partial_tail_boundary is not None
                 and group_config.group_idx not in self._partial_tail_group_ids
             ):
-                num_dst_blocks -= 1
-                dst_end_gpu_block_idx -= 1
+                dst_end_gpu_block_idx = min(
+                    num_gpu_blocks - 1,
+                    (num_chunks - 1) * self.config.blocks_per_chunk,
+                )
+                num_dst_blocks = dst_end_gpu_block_idx - load_start_gpu_block_idx
             dst_block_ids.extend(
                 block.block_id
                 for block in group_blocks[
