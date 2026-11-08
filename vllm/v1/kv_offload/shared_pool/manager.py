@@ -309,6 +309,38 @@ class SharedPoolOffloadingManager(OffloadingManager):
                 OffloadingEvent(keys=keys, medium=self.medium, removed=False)
             )
 
+    # --- pins ---
+
+    def pin(self, keys: Collection[OffloadKey]) -> int:
+        """Hold these rows against eviction, by the pool's own pin.
+
+        The pin names the class this client is attached to rather than the
+        client, and it outlives the client: the server releases a detached
+        client's loads, writes and holds, never its pins. So every caller that
+        pins has to unpin on each path that ends the hold, and a pin taken for
+        rows the pool refused to allocate is not released by anyone but the
+        caller. Returns how many rows are pinned or moving into the pin zone.
+        """
+        if not keys:
+            return 0
+        args = {"pool": self._pool, "keys": [bytes(k) for k in keys]}
+        try:
+            return int(self._call_soft(P.OP_PIN, args))
+        except ConnectionError:
+            return 0
+
+    def unpin(self, keys: Collection[OffloadKey]) -> int:
+        """Undo ``pin``: an entry left pinned is skipped by the eviction order
+        for ever, and a cold tier writes it to disk and reads it back after a
+        restart."""
+        if not keys:
+            return 0
+        args = {"pool": self._pool, "keys": [bytes(k) for k in keys]}
+        try:
+            return int(self._call_soft(P.OP_UNPIN, args))
+        except ConnectionError:
+            return 0
+
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
         return None

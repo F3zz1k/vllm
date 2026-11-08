@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -52,6 +52,9 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+if TYPE_CHECKING:
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
 
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
@@ -151,6 +154,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_worker is not None:
             return self.connector_worker.build_connector_worker_meta()
         return None
+
+    def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
+        super().bind_kv_cache_manager(kv_cache_manager)
+        # The answer tail lives in the core's cache manager; the store route is
+        # here, because only the connector can allocate arena rows and take
+        # lane time for the bytes.
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.bind_answer_tail_store(kv_cache_manager)
 
     def bind_gpu_block_pool(self, gpu_block_pool) -> None:
         if self.connector_scheduler is not None:

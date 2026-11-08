@@ -57,10 +57,10 @@ reasons. The band has no whole-chunk source for a tail, so it could offer only r
 cannot write. And a whole-run store asks the pool to admit a run on the strength of the
 keys offered with it (`prepare_store_run(whole=True)` and `Run.restorable_with`), where a
 tail's pseudo-boundary completes a boundary the conversation's own keys do not, admitting a
-run of nothing but tail rows. So a tail joins its run through its own store, alongside that
-run's other keys in the same call, never as part of a whole-run offer. That is what "a tail
-must not be offerable as if it were a whole run's state" means for this band, and a test
-pins it by seeding a tail key into a run's chain.
+run of nothing but tail rows. So a tail joins its run through its own store, never as part
+of a whole-run offer, and its own store offers only the tail's keys (section 3). That is what
+"a tail must not be offerable as if it were a whole run's state" means for this band, and a
+test pins it by seeding a tail key into a run's chain.
 
 **The eviction feed.** `_forget_in_pool` (`scheduler.py:1625`) drops the tail key from
 `_tail_run` and from its run's list, and counts `tail_evicted`. A tail has no GPU hash to be
@@ -89,8 +89,10 @@ over: the band cannot write one, and a tail left behind by a dropped run is unre
 **A tail with no run.** A request that has keyed no full-attention chunk names no run, so
 its tail is recorded without an owner and counted as `tail_run_missing`. Storing it under a
 tag of its own would stand up a run of nothing but tail rows, the shape section 4 is about.
-The counter is live now; refusing such a store is step 3's call, since it changes what the
-phase-1 finish hand-off accepts.
+Step 3 decided the refusal: the store route turns such an offer down before it asks the pool
+for anything, so the counter now counts a tail that was not stored as well as one that was.
+The phase-1 finish hand-off keeps its own record, because it stores the tail under a
+hash-boundary key rather than the tail's own.
 
 **Arena accounting.** `Arena.refresh` (`shared_pool/server.py:1061`), reached from
 `complete_store`, moves the whole run to the newest end of `Arena.order` and drops it from
@@ -100,10 +102,27 @@ marking are what `_candidates` (`server.py:1148`) reads for the D4 fix, so one t
 can move a state-only stub out of the eviction path for a whole conversation. Tested
 against `Arena` directly: the D4 tests own the eviction side.
 
-open, because the arena's run for a tail store is still the request's own (`prepare_store`
-tags by `_request_tag`, `manager.py:228` and `manager.py:150`), so a tail reaches the
-conversation run only through `merge_tag` at finish. Making the arena agree with the
-band's tag at store time needs the widened hand-off, which is step 3.
+**The store route names the run at store time.** The widened hand-off (step 3) stores a
+tail through `prepare_store_run(keys, tag)` with the same tag `_note_tail_keys` records, so
+the arena's run and the band's record agree the moment the rows are taken rather than
+waiting for `merge_tag` at the request's release. The tail's keys are the only ones the call
+offers: a store takes a row for every offered key the pool lacks, and a tail job writes
+only its tail's rows, so the run's other members join through their own stores. The tail
+still reaches the conversation's run because it is offered under the run's tag.
+
+**The pin is short, and the pool does not release it for us.** The arena's only pin a
+client can reach is `OP_PIN`/`OP_UNPIN` naming the class (`protocol.py:63`,
+`server.py:2756`); `held=True` on a store is the opposite, it tells the arena the GPU has a
+copy so the run may go first. A pin is class state, not client state: `release_client`
+(`server.py:1553`), reached from `_drop` on a detach and from `OP_RELEASE_ALL`, drops a
+client's loads, writes and holds and never touches `cls.pins`, so the "released N
+references" in the detach log counts none of them. A pin therefore outlives the client that
+took it, which is why the tail store pins for its copy only and unpins on every path that
+ends the job (completion, cache reset, shutdown), counted as `tail_pinned` and
+`tail_unpinned` with `tail_pin_leaked` for a release with nothing held. A pin held for a
+tail's whole life would be safe only if the pool released pins on detach, which it does not.
+
+decided
 
 ## 4. The D9 leak guard
 

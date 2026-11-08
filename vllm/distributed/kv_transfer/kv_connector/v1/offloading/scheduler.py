@@ -32,6 +32,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
     _TransferMetricName,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.tail_notifier import (
+    AnswerTailNotifier,
+    TailOffer,
+)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -122,6 +126,10 @@ _POOL_HAS_MAX = 1 << 18
 # Tail keys remembered as tails (see _note_tail_keys). One per group per
 # stored tail, so this is far more than the number of sessions.
 _TAIL_KEYS_MAX = 1 << 14
+# Steps an answer-tail store the pool refused is offered again. The tail's
+# state exists only in the hand-off that named it, so unlike a chunk it cannot
+# be re-offered later: after this the rows are given up on and counted.
+_TAIL_STORE_RETRIES = 3
 # Conversations ("runs") remembered for whole-run write-back.
 WRITE_BACK_MAX_RUNS = 4096
 # Older restore points a hybrid run keeps besides its deepest one (state keys,
@@ -161,6 +169,9 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # The store is an answer tail: its rows hold a short pin that ends with the
+    # job, so completion has to release them.
+    is_tail_store: bool = False
     # Store source blocks fenced after the request finishes.
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
@@ -874,6 +885,17 @@ class OffloadingConnectorScheduler:
         # Refused partial tails by reason (see _refuse_partial_tail).
         self._tail_counts: Counter = Counter()
         self._tail_counts_emitted: Counter = Counter()
+        # The engine core offers a finished turn's answer tail here. The store
+        # route is this connector: arena rows come from the offloading manager
+        # and bytes move only in a worker's transfer job, so the core cannot
+        # store a tail and the notifier is all the seam it gets.
+        self.answer_tail_store = AnswerTailNotifier(self._tail_counts)
+        # job id -> the rows its tail store pinned. The pin is short: it is
+        # held for the copy and released on every path that ends the job.
+        self._tail_pinned: dict[int, list[OffloadKey]] = {}
+        # Tail jobs listed in this step's jobs_to_flush, to tell a step that
+        # waited only for tails from one that waited for other stores too.
+        self._tail_flush_jobs: set[int] = set()
         # Block id -> its free-queue predecessor when the band took it (None:
         # it was not in the queue), so its release puts it back where it was.
         self._wb_prev: dict[int, Any] = {}
@@ -3492,6 +3514,240 @@ class OffloadingConnectorScheduler:
         self._tail_counts["finish_tail_stored"] += 1
         return False
 
+    def bind_answer_tail_store(self, kv_cache_manager: Any) -> None:
+        """Give the engine core's answer tail the connector's notifier.
+
+        The core registers a finished turn's tail and offers it to whatever
+        store that tail holds, so this is where the RAM tier is chosen. With
+        the flag off the core keeps the null store it was built with: a
+        flag-off engine never brings a tail to the connector at all.
+        """
+        answer_tail = getattr(kv_cache_manager, "answer_tail", None)
+        if answer_tail is None or not self.config.enable_partial_tail_offload:
+            return
+        answer_tail.store = self.answer_tail_store
+
+    def _build_answer_tail_store_jobs(self) -> dict[int, TransferJob]:
+        """Turn the answer tails the core offered into arena stores.
+
+        One store per tail, in the run its request names, so the pool's run and
+        the band's record agree at store time instead of waiting for merge_tag
+        at the request's release. A tail whose request keyed no full-attention
+        chunk names no run and is refused: storing it under a tag of its own
+        would stand up a run of nothing but tail rows, which restores nothing
+        and cannot become restorable from inside.
+
+        A store the pool refused is offered again for ``_TAIL_STORE_RETRIES``
+        steps and then given up on. A tail is not a chunk the band could copy
+        later: the hand-off that named its blocks is the only source it will
+        ever have, so a retry waits for room in the pool and nothing else.
+        """
+        store_jobs: dict[int, TransferJob] = {}
+        if not self.config.enable_partial_tail_offload:
+            # Nothing here can serve them, and no counter may be emitted.
+            self.answer_tail_store.reset()
+            return store_jobs
+        offers = self.answer_tail_store.take_offers()
+        if not offers:
+            return store_jobs
+        # One per tail the core offered, not per drain: an offer the pool
+        # refused comes back with a try on it, and that is a retry, not a tail.
+        self._tail_counts["tail_offered"] += sum(
+            1 for offer in offers if offer.tries == 0
+        )
+        if self.config.tail_omitted_groups or not self.config.supports_partial_tail:
+            # The whole-tail policy the other two paths hold: a group outside
+            # the offload set has no tail key, so the tail cannot be stored
+            # whole and is not stored at all.
+            reason = (
+                "groups_without_tail_keys"
+                if self.config.tail_omitted_groups
+                else "layout_unsupported"
+            )
+            self._refuse_partial_tail(reason, None, None, count=len(offers))
+            return store_jobs
+        for offer in offers:
+            job = self._answer_tail_store_job(offer)
+            if not isinstance(job, TailStoreRefusal):
+                job_id, store_job = job
+                store_jobs[job_id] = store_job
+                continue
+            if job.reason == "store_pool_refused" and self._retry_tail_offer(offer):
+                continue
+            self._refuse_partial_tail(
+                job.reason, offer.handoff.request_id, offer.handoff.resume_token
+            )
+        return store_jobs
+
+    def _retry_tail_offer(self, offer: TailOffer) -> bool:
+        """Queue a refused tail for the next step, until its retries run out or
+        the queue has no room left for it."""
+        if offer.tries >= _TAIL_STORE_RETRIES:
+            return False
+        if not self.answer_tail_store.requeue(offer):
+            return False
+        offer.tries += 1
+        self._tail_counts["tail_retried"] += 1
+        return True
+
+    def _answer_tail_store_job(
+        self, offer: TailOffer
+    ) -> tuple[int, TransferJob] | TailStoreRefusal:
+        """Build the one store job an answer tail needs, or a refusal naming
+        why nothing was reserved.
+
+        The keys are the tail's own, made from the hash the core computed: a
+        tail sits between two hash boundaries, so no key the connector can name
+        from ``request.block_hashes`` reaches it. The source blocks are the ones
+        the core offered with those keys, so the job reads exactly the blocks
+        the finished turn left its state in.
+        """
+        handoff = offer.handoff
+        req_status = self._req_status.get(handoff.request_id)
+        if req_status is None:
+            # No offload state: no run to store into, no context to key with,
+            # and no request left to fence the source blocks for.
+            return TailStoreRefusal("untracked_request")
+        tail_configs = self.config.partial_tail_groups
+        if any(group.group_idx not in offer.block_ids for group in tail_configs):
+            # A group the tail must carry and did not name. Storing half a
+            # tail is the one outcome to avoid: a restore missing a recurrent
+            # state group reads a wrong state and reports nothing.
+            return TailStoreRefusal("hand_off_incomplete")
+        block_ids = [offer.block_ids[group.group_idx] for group in tail_configs]
+        if any(block_id == 0 for block_id in block_ids):
+            return TailStoreRefusal("null_source_block")
+        tag = self._run_tag([gs.offload_keys for gs in req_status.group_states])
+        if tag is None:
+            return TailStoreRefusal("tail_run_missing")
+        keys = [
+            make_offload_key(bytes(handoff.tail_hash), group.group_idx)
+            for group in tail_configs
+        ]
+        # The run's other keys stay out of this call: a store takes a row for
+        # every offered key the pool lacks, and this job writes only its tail's
+        # rows. The tail joins its run because it is offered under the run's
+        # tag, not because the tag's other members come along.
+        store_output = (
+            self._prepare_store_run(keys, tag)
+            if hasattr(self.manager, "prepare_store_run")
+            else self._prepare_store(keys, req_status.req_context)
+        )
+        if store_output is None:
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.ALLOCATION_FAILURE
+            )
+            return TailStoreRefusal("store_pool_refused")
+        accepted = [
+            (group, key, block_id)
+            for group, key, block_id in zip(tail_configs, keys, block_ids)
+            if key in store_output.keys_to_store
+        ]
+        if not accepted:
+            # The pool holds every tail row already: nothing was written and
+            # nothing was lost, but there is no job to hand over.
+            return TailStoreRefusal("keys_already_resident")
+
+        # Record the tail before the job can complete: on completion the band
+        # must believe the pool holds these keys without reading them as the
+        # state of a chunk boundary.
+        self._note_tail_keys(req_status, [key for _, key, _ in accepted])
+        # No KV event here, unlike the aligned tail stores: a self-describing
+        # event describes the hash-aligned prefix of one physical block, and an
+        # answer tail is neither aligned nor a prefix of anything. A tail key is
+        # lookup-only, so publishing one would advertise a key no lookup can
+        # name to a consumer that would then never find it.
+
+        # A tail is one block per group, and the layout that gets here at all
+        # agrees on one block size (see supports_partial_tail).
+        req = req_status.req
+        block_idx = handoff.resume_token // self._partial_tail_block_size
+        group_sizes = [0] * len(self.config.kv_group_configs)
+        block_indices = [0] * len(self.config.kv_group_configs)
+        source_blocks: list[int] = []
+        for group, _, block_id in accepted:
+            config_idx = self._config_idx_by_group[group.group_idx]
+            group_sizes[config_idx] = 1
+            block_indices[config_idx] = block_idx
+            source_blocks.append(block_id)
+
+        pinned = self._pin_tail_rows([key for _, key, _ in accepted])
+        job_id = self._generate_job_id()
+        req_status.transfer_jobs.add(job_id)
+        for block_id in source_blocks:
+            self._block_id_to_pending_jobs.setdefault(block_id, set()).add(job_id)
+        self._jobs[job_id] = TransferJobStatus(
+            req_id=req.request_id,
+            pending_count=self.config.num_workers,
+            keys=set(key for _, key, _ in accepted),
+            is_store=True,
+            is_tail_store=True,
+            fenced_block_ids=source_blocks,
+        )
+        self._tail_pinned[job_id] = pinned
+        # The finished request's blocks are back in the free queue by now, so
+        # list the job ahead of the deferred stores and wait for it: that is
+        # what orders this copy before the block's new owner writes it.
+        # ``settled`` stays False, so the copy still waits for the writes of
+        # the step that last owned the block.
+        self._current_batch_jobs_to_flush.add(job_id)
+        self._tail_flush_jobs.add(job_id)
+        self._tail_counts["tail_stored"] += 1
+        if self._b70_trace:
+            self._b70_job_submitted(req.request_id, True)
+            _b70.log(
+                "answer-tail-store req=%s resume=%d keys=%d job=%d",
+                req.request_id,
+                handoff.resume_token,
+                len(accepted),
+                job_id,
+            )
+        return job_id, TransferJob(
+            req_id=req.request_id,
+            src_spec=GPULoadStoreSpec(
+                source_blocks,
+                group_sizes=group_sizes,
+                block_indices=block_indices,
+            ),
+            dst_spec=store_output.store_spec,
+        )
+
+    def _pin_tail_rows(self, keys: list[OffloadKey]) -> list[OffloadKey]:
+        """The short pin: hold the rows a tail store just took for its copy.
+
+        The pool's pin is the only hold it offers a client, and it outlives the
+        client, so it is taken here for one copy and released by
+        ``_unpin_tail_rows`` on every path that ends the job. The rows this
+        pins are the tail's own, so the count is a level read as
+        ``tail_pinned - tail_unpinned``.
+        """
+        pin = getattr(self.manager, "pin", None)
+        if pin is None or not keys:
+            return []
+        pin(keys)
+        self._tail_counts["tail_pinned"] += len(keys)
+        return keys
+
+    def _unpin_tail_rows(self, job_id: int) -> None:
+        """Release the pin a tail store's job holds, and count it."""
+        keys = self._tail_pinned.pop(job_id, None)
+        if keys is None:
+            # A release with nothing held is the bookkeeping slipping: a row
+            # left pinned is skipped by the eviction order for ever, and a cold
+            # tier writes it to disk and reads it back after a restart.
+            self._tail_counts["tail_pin_leaked"] += 1
+            return
+        unpin = getattr(self.manager, "unpin", None)
+        if unpin is not None:
+            unpin(keys)
+        self._tail_counts["tail_unpinned"] += len(keys)
+
+    def _release_tail_pins(self) -> None:
+        """Drop every pin still held: the jobs they fence are gone with the
+        cache they were stored into, and no completion will name them."""
+        for job_id in list(self._tail_pinned):
+            self._unpin_tail_rows(job_id)
+
     def _reachable_store_block_mask(
         self,
         group_config: GroupOffloadConfig,
@@ -3890,6 +4146,11 @@ class OffloadingConnectorScheduler:
             )
 
         self._write_through = self._write_through_enabled()
+        # The answer-tail stores are built first: a tail's source blocks belong
+        # to a request that has already finished, and the job that copies them
+        # has to be in this step's jobs_to_flush before anything else can put
+        # those blocks in front of it.
+        answer_tail_jobs = self._build_answer_tail_store_jobs()
         partial_store_jobs = self._build_partial_tail_store_jobs(scheduler_output)
         normal_store_jobs = self._build_store_jobs(scheduler_output)
         if self._flush_state == "ready":
@@ -3901,13 +4162,23 @@ class OffloadingConnectorScheduler:
         meta = OffloadingConnectorMetadata(
             load_jobs=self._current_batch_load_jobs,
             store_jobs=(
-                partial_store_jobs
+                answer_tail_jobs
+                | partial_store_jobs
                 | normal_store_jobs
                 | write_back_jobs
                 | self._finished_partial_tail_jobs
             ),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
+        # A step that flushed nothing but tails paid that wait for no other
+        # store. Worth counting: the wait is what a tail store buys with its
+        # place in jobs_to_flush, and no CPU run can say whether it was ever
+        # paid for nothing.
+        if self._tail_flush_jobs and self._tail_flush_jobs == (
+            self._current_batch_jobs_to_flush
+        ):
+            self._tail_counts["tail_flush_only_step"] += 1
+        self._tail_flush_jobs = set()
         self._finished_partial_tail_jobs = {}
 
         # All prepare_store calls for finished requests have been issued.
@@ -4171,6 +4442,11 @@ class OffloadingConnectorScheduler:
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
+                if job_status.is_tail_store:
+                    # The tail's short pin ends with its copy: the rows are the
+                    # pool's now, and their run's place in the eviction order
+                    # decides when they leave.
+                    self._unpin_tail_rows(job_id)
                 if WRITE_BACK:
                     self._note_in_pool(job_status.keys)
                     self._note_states(job_status.keys)
@@ -4303,6 +4579,8 @@ class OffloadingConnectorScheduler:
                 del self._req_status[req_id]
 
         # Reset offloading manager cache
+        self._release_tail_pins()
+        self.answer_tail_store.reset()
         self.manager.reset_cache()
 
         # Reset store progress so active requests re-offload from chunk 0.
@@ -4328,6 +4606,7 @@ class OffloadingConnectorScheduler:
         self._state_sets.clear()
         self._tail_run.clear()
         self._run_tails.clear()
+        self._tail_pinned.clear()
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
         self._finished_partial_tail_jobs.clear()
@@ -4344,4 +4623,8 @@ class OffloadingConnectorScheduler:
     def shutdown(self) -> None:
         if self._b70_state_logger is not None:
             self._b70_state_logger.stop()
+        # A pin outlives the client that took it, so releasing before the pool
+        # is the last chance to leave no row the eviction order must skip.
+        self._release_tail_pins()
+        self.answer_tail_store.shutdown()
         self.manager.shutdown()

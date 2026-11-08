@@ -13,6 +13,7 @@ import pytest
 
 import vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler as sched_mod
 from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
+    _assert_nothing_half_built,
     _make_drafter_partial_tail_scheduler,
     _make_partial_tail_request,
     _make_partial_tail_scheduler,
@@ -36,6 +37,11 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     get_offload_group_idx,
+    make_offload_key,
+)
+from vllm.v1.kv_offload.answer_tail_store import (
+    AnswerTailHandoff,
+    AnswerTailHit,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.outputs import KVConnectorOutput
@@ -1124,3 +1130,244 @@ def test_a_tail_of_a_request_that_keyed_no_chunk_has_no_run_and_is_counted():
     assert scheduler._run_tails == {}
     assert all(scheduler._tail_run[key] is None for key in keys)
     assert scheduler._tail_counts["tail_run_missing"] == 1
+
+
+# --- the answer tail's store route: the core offers, the connector stores ---
+
+
+def _answer_tail_offer(
+    keyed_chunk: bool = True,
+    pool_refused: bool = False,
+    groups: tuple[int, ...] | None = None,
+    null_group: int | None = None,
+):
+    """A finished turn's tail as the engine core offers it, and the connector
+    that could store it: the scheduler, the hand-off and the GPU block the
+    offer named per group. Nothing is stored here; the test drains.
+    """
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    if keyed_chunk:
+        req_status.update_offload_keys()       # the conversation keyed a chunk
+    tail_configs = scheduler.config.partial_tail_groups
+    wanted = tuple(g.group_idx for g in tail_configs) if groups is None else groups
+    handoff = AnswerTailHandoff(
+        request_id="req",
+        tail_hash=BlockHash(b"tail"),
+        parent=None,
+        length=12,
+        resume_token=request.num_tokens - 1,
+    )
+    blocks = {
+        group_idx: (0 if group_idx == null_group else 100 + group_idx)
+        for group_idx in wanted
+    }
+    for group_idx, block_id in blocks.items():
+        assert scheduler.answer_tail_store.store_tail(handoff, group_idx, block_id)
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
+    )
+    if pool_refused:
+        # No side effect: a mock's side effect wins over its return value, and
+        # the refusal this test is about is the pool answering None.
+        scheduler.manager.prepare_store_run = MagicMock(return_value=None)
+    scheduler.manager.pin = MagicMock(return_value=1)
+    scheduler.manager.unpin = MagicMock(return_value=1)
+    return scheduler, handoff, blocks
+
+
+def _tail_keys(handoff, groups) -> list[OffloadKey]:
+    return [make_offload_key(bytes(handoff.tail_hash), group) for group in groups]
+
+
+def _tail_run_tag(scheduler) -> OffloadKey:
+    """The run the request names: its last full-attention chunk key."""
+    req_status = scheduler._req_status["req"]
+    return scheduler._run_tag([gs.offload_keys for gs in req_status.group_states])
+
+
+def test_an_offered_answer_tail_becomes_one_store_in_its_run():
+    # The core can name the tail's key but can allocate no row and take no lane
+    # time, so the offer becomes the connector's store: one job over the tail's
+    # groups, in the run its request names, so the pool's run and the band's
+    # record agree at store time rather than at the request's release.
+    scheduler, handoff, blocks = _answer_tail_offer()
+    jobs = scheduler._build_answer_tail_store_jobs()
+
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
+    tail_keys = _tail_keys(handoff, sorted(blocks))
+    assert scheduler._jobs[job_id].keys == set(tail_keys)
+    (offered, tag), kwargs = scheduler.manager.prepare_store_run.call_args
+    assert list(offered) == tail_keys
+    assert tag == _tail_run_tag(scheduler)
+    assert not kwargs["whole"]
+    assert jobs[job_id].src_spec.block_ids.tolist() == [
+        blocks[group] for group in sorted(blocks)
+    ]
+    assert scheduler._tail_counts["tail_offered"] == 1
+    assert scheduler._tail_counts["tail_stored"] == 1
+    assert all(scheduler._tail_run[key] == tag for key in tail_keys)
+
+
+def test_a_tail_store_waits_for_the_step_that_may_still_own_its_blocks():
+    # The finished request's blocks are back in the free queue by now, so the
+    # job is listed ahead of the deferred stores and waited on: that is what
+    # orders the copy before the block's new owner writes it. The band's second
+    # lane stays out of it, because settled would also drop the wait for the
+    # writes of the step that last held the block.
+    scheduler, _, _ = _answer_tail_offer()
+    jobs = scheduler._build_answer_tail_store_jobs()
+
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
+    assert scheduler._current_batch_jobs_to_flush == {job_id}
+    assert jobs[job_id].src_spec.settled is False
+
+
+def test_a_tail_store_is_offered_again_until_its_retries_run_out():
+    # A full pool is not a lost tail: the state exists only in the hand-off
+    # that named it, so a retry can wait for room and nothing else. After the
+    # budget the rows are given up on and counted, because a tail nobody stored
+    # is invisible to every other counter.
+    scheduler, _, _ = _answer_tail_offer(pool_refused=True)
+    steps = 1 + sched_mod._TAIL_STORE_RETRIES
+
+    for _ in range(steps):
+        assert not scheduler._build_answer_tail_store_jobs()
+
+    assert scheduler.manager.prepare_store_run.call_count == steps
+    assert scheduler._tail_counts["tail_offered"] == 1
+    assert scheduler._tail_counts["tail_retried"] == sched_mod._TAIL_STORE_RETRIES
+    assert scheduler._tail_counts["store_pool_refused"] == 1
+    assert scheduler._tail_counts["tail_stored"] == 0
+    _assert_nothing_half_built(scheduler)
+
+
+def test_a_tail_whose_request_named_no_run_never_tags_a_run_of_its_own():
+    # A request that keyed no full-attention chunk names no run. Storing its
+    # tail under a tag of its own would leave a run of nothing but tail rows:
+    # unrestorable, so the arena takes it first, and immortal, because nothing
+    # can complete a tail's pseudo-boundary from inside.
+    scheduler, _, _ = _answer_tail_offer(keyed_chunk=False)
+
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert scheduler._tail_counts == {"tail_offered": 1, "tail_run_missing": 1}
+    assert scheduler._tail_run == {}
+    _assert_nothing_half_built(scheduler)
+
+
+def test_an_answer_tail_missing_a_group_is_refused_whole():
+    # A tail that names no block for one of its groups cannot be restored, and
+    # a restore missing a recurrent state is read silently rather than
+    # reported, so half a tail is never stored.
+    scheduler, _, _ = _answer_tail_offer(groups=(1,))
+
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert scheduler._tail_counts["hand_off_incomplete"] == 1
+    _assert_nothing_half_built(scheduler)
+
+
+def test_an_answer_tail_with_a_null_source_block_is_refused():
+    # A null block carries no bytes: storing one writes residue under a key a
+    # resume will read back as the state at the tail.
+    scheduler, _, _ = _answer_tail_offer(null_group=1)
+
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert scheduler._tail_counts["null_source_block"] == 1
+    _assert_nothing_half_built(scheduler)
+
+
+def test_a_tail_store_holds_its_rows_only_for_the_copy():
+    # The pool's pin is the only hold it offers a client and it outlives the
+    # client, so a tail pins its rows for one copy and releases them when the
+    # job ends. A row left pinned is skipped by the eviction order for ever.
+    scheduler, handoff, blocks = _answer_tail_offer()
+    jobs = scheduler._build_answer_tail_store_jobs()
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
+    pinned = _tail_keys(handoff, sorted(blocks))
+    scheduler.manager.pin.assert_called_once_with(pinned)
+    assert scheduler._tail_counts["tail_pinned"] == len(pinned)
+
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    scheduler.manager.unpin.assert_called_once_with(pinned)
+    assert scheduler._tail_counts["tail_unpinned"] == len(pinned)
+    assert "tail_pin_leaked" not in scheduler._tail_counts
+
+
+def test_a_tail_pin_left_by_a_shutdown_is_released():
+    # No completion arrives for a job the engine never finished, and the pool
+    # does not release a client's pins when the client goes away: releasing here
+    # is the last chance to leave no row the eviction order has to skip.
+    scheduler, handoff, blocks = _answer_tail_offer()
+    jobs = scheduler._build_answer_tail_store_jobs()
+    _assert_one_row_per_key(scheduler, jobs)
+
+    scheduler.shutdown()
+
+    scheduler.manager.unpin.assert_called_once_with(_tail_keys(handoff, sorted(blocks)))
+    assert scheduler._tail_pinned == {}
+    assert scheduler._tail_counts["tail_unpinned"] == len(blocks)
+    assert scheduler._tail_counts.get("tail_pin_leaked", 0) == 0
+
+
+def test_the_restore_of_a_tail_is_refused_by_name():
+    # A tail that comes back missing a group, or carrying a state that is not
+    # the one the resume position needs, is read silently. So the load side
+    # refuses by name and copies nothing, which leaves no half tail to reach a
+    # request: the byte-level gate is what opens it.
+    scheduler, handoff, _ = _answer_tail_offer()
+    hit = AnswerTailHit(
+        tail_key=handoff.tail_hash,
+        resume_token=handoff.resume_token,
+        group_block_ids={},
+        num_tokens=30,
+    )
+
+    assert scheduler.answer_tail_store.lookup_tail(handoff.tail_hash, [0, 1]) is None
+    assert scheduler.answer_tail_store.start_load(hit, {}) is False
+    assert scheduler.answer_tail_store.wait(hit) is False
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+
+
+def test_the_answer_tail_store_is_installed_only_with_the_flag():
+    # The core offers a tail to whatever store its answer tail holds, so the
+    # install is the seam a flag-off deployment must not cross.
+    for enabled in (False, True):
+        scheduler = _make_drafter_partial_tail_scheduler(enabled)
+        answer_tail = SimpleNamespace(store=None)
+        scheduler.bind_answer_tail_store(SimpleNamespace(answer_tail=answer_tail))
+        assert (answer_tail.store is scheduler.answer_tail_store) is enabled
+
+
+def test_an_offered_answer_tail_is_inert_without_the_flag():
+    # Flag off, no core brings a tail here; should one arrive anyway, nothing is
+    # stored, nothing is counted and nothing is left queued for a later step to
+    # act on.
+    scheduler = _make_drafter_partial_tail_scheduler(False)
+    scheduler.manager.prepare_store_run = MagicMock()
+    handoff = AnswerTailHandoff(
+        request_id="req",
+        tail_hash=BlockHash(b"tail"),
+        parent=None,
+        length=12,
+        resume_token=29,
+    )
+    scheduler.answer_tail_store.store_tail(handoff, 0, 100)
+
+    assert not scheduler._build_answer_tail_store_jobs()
+    scheduler.manager.prepare_store_run.assert_not_called()
+    assert dict(scheduler._tail_counts) == {}
+    assert scheduler.answer_tail_store.pending == {}
