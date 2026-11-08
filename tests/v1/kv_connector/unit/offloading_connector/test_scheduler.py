@@ -600,6 +600,38 @@ def test_partial_tail_step_path_refuses_a_group_with_no_tail_key(
     assert dict(scheduler._tail_counts) == expected
 
 
+def test_partial_tail_step_path_refuses_a_boundary_over_the_offload_cap():
+    """A caller-set max_offload_tokens below the hand-off boundary is a refusal,
+    not an assertion. The step path runs inside build_connector_meta on the
+    engine core, so raising here takes every session down with it; the aligned
+    path skips the same entry and the finish path refuses it."""
+    scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
+    # The fixtures' hand-off boundary is 28 tokens; the cap stops this request
+    # offloading at 20, so the tail names tokens the request may not offload.
+    _make_partial_tail_request(scheduler, {"max_offload_tokens": 20})
+    req_status = scheduler._req_status["req"]
+    # Sources a tail store would have used: without the cap the hand-off below
+    # builds a job, which is what this test is guarding.
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    req_status.group_states[1].block_ids[:] = [0, 21]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={"req": [(1, 99, 28)]},
+        )
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    assert not jobs
+    scheduler.manager.prepare_store.assert_not_called()
+    assert scheduler._tail_counts == {"boundary_unusable": 1}
+
+
 def test_partial_tail_probe_ignores_a_missing_drafter_key():
     """The probe requires the tail's groups only, so the key that is never
     stored cannot miss the boundary for the groups that are stored."""
