@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _full_attention_spec,
     _make_mamba_hybrid_kv_cache_config,
     _make_vllm_config,
 )
@@ -232,6 +233,26 @@ def _make_partial_tail_request(
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
     return request
+
+
+def _make_drafter_partial_tail_scheduler(
+    enable_partial_tail_offload: bool,
+) -> OffloadingConnectorScheduler:
+    """The partial-tail layout plus an EAGLE/MTP drafter attention group, the
+    shape `enable_partial_tail_offload` decides on."""
+    vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
+    vllm_config.cache_config.prefix_match_unit = 4
+    vllm_config.cache_config.enable_partial_tail_offload = enable_partial_tail_offload
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config.kv_cache_groups.append(
+        KVCacheGroupSpec(["drafter_layer"], _full_attention_spec(), is_eagle_group=True)
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
 
 def test_create_req_context_preserves_kv_hints():
@@ -461,6 +482,114 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
     assert dst_spec.group_sizes == [2, 1]
     assert dst_spec.block_indices == [0, 1]
     assert req_status.partial_tail_boundary is None
+
+
+@pytest.mark.parametrize("tail_offload", [False, True])
+def test_partial_tail_gate_exempts_a_drafter_group_only_with_the_flag(
+    tail_offload: bool,
+):
+    """A drafter group closes the gate unless the flag exempts it, and the
+    exemption is what shrinks the groups a tail must carry."""
+    scheduler = _make_drafter_partial_tail_scheduler(tail_offload)
+    config = scheduler.config
+
+    assert [c.group_idx for c in config.kv_group_configs] == [0, 1, 2]
+    if tail_offload:
+        assert config.supports_partial_tail
+        assert [c.group_idx for c in config.partial_tail_groups] == [0, 1]
+    else:
+        assert not config.supports_partial_tail
+        assert config.partial_tail_groups == config.kv_group_configs
+
+
+def test_partial_tail_store_offers_no_key_for_the_drafter_group():
+    """A drafter group contributes no tail key and no source block, and the
+    transfer spec keeps one slot per KV cache group."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    req_status.group_states[1].block_ids[:] = [0, 21]
+    # The drafter group is left without blocks: were it still required, the
+    # hand-off would be skipped and no job created.
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={"req": [(1, 99, 28)]},
+        )
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    [job_id] = jobs
+    offered_keys = scheduler.manager.prepare_store.call_args.args[0]
+    assert {get_offload_group_idx(key) for key in offered_keys} == {0, 1}
+    src_spec = jobs[job_id].src_spec
+    assert isinstance(src_spec, GPULoadStoreSpec)
+    assert src_spec.block_ids.tolist() == [12, 99]
+    assert src_spec.group_sizes == [1, 1, 0]
+    assert src_spec.block_indices == [1, 1, 0]
+
+
+def test_partial_tail_probe_ignores_a_missing_drafter_key():
+    """The probe requires the tail's groups only, so the key that is never
+    stored cannot miss the boundary for the groups that are stored."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    boundary_hash = BlockHash(b"h6")
+
+    def lookup(key, req_context):
+        if (
+            get_offload_group_idx(key) == 2
+            and get_offload_block_hash(key) == boundary_hash
+        ):
+            return LookupResult.MISS
+        return LookupResult.HIT
+
+    scheduler.manager.lookup.side_effect = lookup
+
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.partial_tail_boundary == 28
+
+
+def test_partial_tail_load_asks_no_boundary_key_for_the_drafter_group():
+    """The load walks every group for destination blocks but asks for the
+    boundary key only where the tail could have stored one."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    assert scheduler._lookup(req_status) == 28
+
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                [KVCacheBlock(51), KVCacheBlock(52)],
+            )
+        ),
+        num_external_tokens=28,
+    )
+
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    dst_spec = load_job.dst_spec
+    assert isinstance(dst_spec, GPULoadStoreSpec)
+    assert dst_spec.group_sizes == [2, 1, 2]
+    [job] = scheduler._jobs.values()
+    assert make_offload_key(BlockHash(b"h6"), 0) in job.keys
+    assert make_offload_key(BlockHash(b"h6"), 1) in job.keys
+    assert make_offload_key(BlockHash(b"h6"), 2) not in job.keys
 
 
 def test_lookup_cap_stops_at_authoritative_prefix_boundary():

@@ -185,6 +185,17 @@ class GroupOffloadConfig(NamedTuple):
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
 
+    @property
+    def tail_optional(self) -> bool:
+        """Whether a partial tail can omit this group.
+
+        A drafter group's KV is already served one chunk stale by the volatile
+        tail rule, so a tail it never stored costs speculative acceptance, not
+        correctness. A recurrent group never qualifies: a tail missing a state
+        group cannot be restored at all.
+        """
+        return self.is_eagle_group and not isinstance(self.kv_cache_spec, MambaSpec)
+
     def load_window_size_in_chunks(self, num_tokens: int) -> int | None:
         window = self.sliding_window_size_in_chunks
         if isinstance(self.kv_cache_spec, SlidingWindowSpec):
@@ -383,9 +394,20 @@ class SchedulerOffloadConfig(NamedTuple):
             and config.tokens_per_block > spec.tokens_per_hash
             for config in kv_group_configs
         )
+        # `enable_partial_tail_offload` lets a tail carry fewer than every
+        # group: the drafter groups that `tail_optional` names leave the set,
+        # the rest must all be there. Without the flag every group is required
+        # and a drafter group closes the gate, as it always did.
+        partial_tail_offload = vllm_config.cache_config.enable_partial_tail_offload
+        partial_tail_groups = (
+            tuple(c for c in kv_group_configs if not c.tail_optional)
+            if partial_tail_offload
+            else kv_group_configs
+        )
         # Partial tails currently require one physical block per offload chunk
         # and uniform, non-windowed groups so one boundary identifies every
-        # group's source. EAGLE and DCP need additional hand-off semantics.
+        # group's source. DCP needs additional hand-off semantics, and a
+        # drafter group needs one unless the flag exempts it.
         supports_partial_tail = (
             spec.blocks_per_chunk == 1
             and len(group_block_sizes) == 1
@@ -395,7 +417,10 @@ class SchedulerOffloadConfig(NamedTuple):
                 or config.requires_cow_source
                 for config in kv_group_configs
             )
-            and not any(config.is_eagle_group for config in kv_group_configs)
+            and (
+                not any(config.is_eagle_group for config in kv_group_configs)
+                or partial_tail_offload
+            )
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
 
@@ -419,7 +444,7 @@ class SchedulerOffloadConfig(NamedTuple):
         return cls(
             num_workers=vllm_config.parallel_config.world_size,
             kv_group_configs=kv_group_configs,
-            partial_tail_groups=kv_group_configs,
+            partial_tail_groups=partial_tail_groups,
             blocks_per_chunk=spec.blocks_per_chunk,
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
@@ -704,6 +729,11 @@ class OffloadingConnectorScheduler:
             self.config.kv_group_configs[0].tokens_per_block
             if self.config.supports_partial_tail
             else 0
+        )
+        # Groups a tail key exists for. The load walks every group, so the
+        # boundary key is appended only where the store could have written one.
+        self._partial_tail_group_ids = frozenset(
+            config.group_idx for config in self.config.partial_tail_groups
         )
         self._cow_source_groups = frozenset(
             config.group_idx
@@ -2378,11 +2408,12 @@ class OffloadingConnectorScheduler:
             return complete_hit
 
         pending = False
+        tail_configs = self.config.partial_tail_groups
         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
             boundary_pending = False
             boundary_missed = False
             boundary_keys = []
-            for group_config in self.config.kv_group_configs:
+            for group_config in tail_configs:
                 key = self._make_boundary_key(
                     req_status.req,
                     group_config.group_idx,
@@ -2399,9 +2430,7 @@ class OffloadingConnectorScheduler:
 
             pending |= boundary_pending
             if not boundary_missed and not boundary_pending:
-                for group_config, key in zip(
-                    self.config.kv_group_configs, boundary_keys
-                ):
+                for group_config, key in zip(tail_configs, boundary_keys):
                     self._events_tracker.record_partial_lookup(
                         req_status.req, group_config, boundary, key
                     )
@@ -2649,7 +2678,10 @@ class OffloadingConnectorScheduler:
                 end_chunk_idx = num_chunks - (partial_tail_boundary is not None)
                 assert len(offload_keys) >= end_chunk_idx
                 group_keys_to_load = offload_keys[start_chunk_idx:end_chunk_idx]
-                if partial_tail_boundary is not None:
+                if (
+                    partial_tail_boundary is not None
+                    and group_config.group_idx in self._partial_tail_group_ids
+                ):
                     group_keys_to_load.append(
                         self._make_boundary_key(
                             request,
@@ -3022,23 +3054,24 @@ class OffloadingConnectorScheduler:
 
             assert boundary % self._partial_tail_block_size != 0
             block_idx = boundary // self._partial_tail_block_size
+            tail_configs = self.config.partial_tail_groups
             if any(
                 group.group_idx not in self._cow_source_groups
                 and block_idx >= len(group_states[group.group_idx].block_ids)
-                for group in self.config.kv_group_configs
+                for group in tail_configs
             ):
                 continue
             keys = [
                 self._make_boundary_key(
                     req, group.group_idx, boundary, req_status.req_context
                 )
-                for group in self.config.kv_group_configs
+                for group in tail_configs
             ]
             block_ids = [
                 cow_blocks[group.group_idx]
                 if group.group_idx in self._cow_source_groups
                 else group_states[group.group_idx].block_ids[block_idx]
-                for group in self.config.kv_group_configs
+                for group in tail_configs
             ]
             assert all(block_id != 0 for block_id in block_ids)
 
@@ -3055,20 +3088,29 @@ class OffloadingConnectorScheduler:
             if not store_output.keys_to_store:
                 continue
 
-            for group_config, key in zip(self.config.kv_group_configs, keys):
+            for group_config, key in zip(tail_configs, keys):
                 if key in store_output.keys_to_store:
                     self._events_tracker.record_partial_store(
                         req, group_config, boundary, key
                     )
 
-            group_by_key = {key: idx for idx, key in enumerate(keys)}
-            accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
+            # The keys run over the tail's groups, the transfer spec over every
+            # group, so a key's position is not its config index.
+            config_idx_by_key = {
+                key: self._config_idx_by_group[group.group_idx]
+                for group, key in zip(tail_configs, keys)
+            }
+            block_id_by_key = dict(zip(keys, block_ids))
+            accepted = [
+                (config_idx_by_key[key], block_id_by_key[key])
+                for key in store_output.keys_to_store
+            ]
             group_sizes = [0] * len(self.config.kv_group_configs)
             block_indices = [0] * len(self.config.kv_group_configs)
-            for group_idx in accepted_groups:
-                group_sizes[group_idx] = 1
-                block_indices[group_idx] = block_idx
-            source_blocks = [block_ids[group_idx] for group_idx in accepted_groups]
+            for config_idx, _ in accepted:
+                group_sizes[config_idx] = 1
+                block_indices[config_idx] = block_idx
+            source_blocks = [block_id for _, block_id in accepted]
 
             job_id = self._generate_job_id()
             req_status.transfer_jobs.add(job_id)

@@ -56,6 +56,8 @@ def _make_vllm_config(
     config.cache_config.prefix_match_unit = None
     config.cache_config.cache_dtype = torch.float16
     config.cache_config.prefix_cache_retention_interval = None
+    # A MagicMock attribute is truthy, so an unset flag would read as enabled.
+    config.cache_config.enable_partial_tail_offload = False
     config.model_config.model = "test-model"
     config.model_config.use_mla = False
     # _full_attention_spec's heads at tp=1: the parallelism-agnostic gate
