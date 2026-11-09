@@ -2763,16 +2763,23 @@ class OffloadingConnectorScheduler:
         """Ask the arena for every row of a tail, and name what came back, or
         None when it holds the lot.
 
-        The band's mirror of the pool is a step behind by construction: the
-        eviction feed is drained once per step, inside the band builder, which
-        runs after this lookup. A row the mirror still believes in that the
-        arena has dropped would reach ``prepare_load``, and that ends the engine
-        on a key that is not ready. So the arena is asked here, at the decision,
-        the same call the band's store route makes of it. A HIT also holds that
-        row for the rest of the session, which is the span between this grant
-        and the ``prepare_load`` that reserves the rows; the load's own
-        references then carry them to completion. Anything other than HIT for
-        any row refuses the resume, and a refusal claims nothing.
+        The point is the hold a HIT takes, which is what the aligned route pays
+        for and the tail route never did. The pool's own rule is that a HIT holds
+        the row for the calling client until that session ends, so that another
+        engine cannot take it between the lookup and the ``prepare_load`` that
+        pins it; a row nobody looked up carries no references, which is precisely
+        what the eviction order and the mover are allowed to take. The band's
+        mirror cannot supply that, and it is a step behind besides: the eviction
+        feed is drained once per step, inside the band builder, which runs after
+        this lookup, and a row it still believes in that the arena has dropped
+        would reach ``prepare_load``, which ends the engine on a key that is not
+        ready.
+
+        So the arena is asked here, at the decision, with the one call the band's
+        store route already makes of it. The hold spans this grant to the
+        ``prepare_load`` that reserves the rows, and the load's own references
+        carry them from there to completion. Anything other than HIT for any row
+        refuses the resume, and a refusal claims nothing.
         """
         for _, result in self._lookup_results(rows, req_context, False):
             if result is not LookupResult.HIT:
