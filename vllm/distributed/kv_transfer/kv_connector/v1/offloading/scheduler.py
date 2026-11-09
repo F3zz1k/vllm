@@ -2705,6 +2705,13 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
     ) -> int | None:
+        """The tokens this load can bring for the request, or None to defer it.
+
+        The core adds the answer to its own local hit and reports both as the
+        request's cached tokens, so for a tail resume the count is the span the
+        schedule committed and ``_fence_tail_resume`` row-confirmed, not the
+        rows a completed load measured.
+        """
         complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
         req_status.partial_tail_boundary = None
         if complete_hit is None or not self.config.supports_partial_tail:
@@ -2713,8 +2720,10 @@ class OffloadingConnectorScheduler:
         local_tokens = req_status.num_locally_computed_tokens
         complete_boundary = local_tokens + complete_hit
         tokens_per_hash = self.config.tokens_per_hash
-        block_end = complete_boundary + self._partial_tail_block_size
-        ceiling = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
+        # The bounds no answer from the arena can pass: the last token of the
+        # prompt, which has to be recomputed for its logprobs, and what this
+        # step is allowed to load.
+        ceiling = req_status.req.num_prompt_tokens - 1
         if max_num_new_tokens is not None:
             ceiling = min(ceiling, local_tokens + max_num_new_tokens)
         if req_status.max_load_tokens is not None:
@@ -2727,7 +2736,14 @@ class OffloadingConnectorScheduler:
         # deeper than the last boundary the request's own chunks prove.
         resume = self._fence_tail_resume(req_status, complete_boundary, ceiling)
 
-        max_boundary = round_down(ceiling, tokens_per_hash)
+        # The aligned route confirms one row per group at the boundary it picks
+        # and nothing between that and the chunks the request proved, so it
+        # reaches one block past them. The tail route confirms what is between
+        # by name, so it is not held to the same reach.
+        max_boundary = round_down(
+            min(ceiling, complete_boundary + self._partial_tail_block_size - 1),
+            tokens_per_hash,
+        )
         aligned_boundary: int | None = None
         if max_boundary > complete_boundary:
             pending = False
@@ -2785,7 +2801,11 @@ class OffloadingConnectorScheduler:
         anything, because a resume that later comes up short reads a wrong
         recurrent state and reports nothing. So every row the tail was stored as
         has to be in the arena, the record has to name the cache that is still
-        here, and the position has to be one this load can reach.
+        here, and the position has to be one this load can back: the whole
+        chunks between the boundary the request proved and the resume position
+        are loaded under the request's own keys, so the reach is the deepest
+        boundary whose chunks the arena answers for, not a fixed distance from
+        the hit.
 
         The band's own view of the pool is not consulted. It mirrors the arena
         one step late, and only where a deployment keeps such a mirror at all:
@@ -2846,6 +2866,11 @@ class OffloadingConnectorScheduler:
         detail = self._confirm_tail_rows(rows, req_status.req_context)
         if detail is not None:
             return self._refuse_tail_resume(req_status, record.resume_token, detail)
+        detail = self._confirm_intervening_rows(
+            req_status, complete_boundary, record.resume_token
+        )
+        if detail is not None:
+            return self._refuse_tail_resume(req_status, record.resume_token, detail)
         if bytes(record.tail_key) not in self._tail_row_keys:
             # The arena holds them, so which rows they are is now known here as
             # well as there, and the record is taken on the way a store takes
@@ -2890,6 +2915,49 @@ class OffloadingConnectorScheduler:
         for _, result in self._lookup_results(rows, req_context, False):
             if result is not LookupResult.HIT:
                 return f"the arena answered {result.name} for a row of the tail"
+        return None
+
+    def _confirm_intervening_rows(
+        self,
+        req_status: RequestOffloadState,
+        complete_boundary: int,
+        resume_token: int,
+    ) -> str | None:
+        """Ask the arena for the whole chunks between the boundary a request's
+        own lookup proved and a resume deeper than it, or None when it holds
+        the lot.
+
+        A tail row is the state at a position, not the KV below it: everything
+        from the proved boundary to the resume position is loaded as ordinary
+        chunks under the keys the request already owns. A chunk the arena will
+        not answer for reaches ``prepare_load`` as a key that is not ready,
+        which ends the engine, so a resume reaches as deep as the chunks it
+        needs are held and no deeper. Asking every group is deliberate: the
+        destination blocks are not allocated yet, so which of those rows the
+        load reads is not known here, and a resume granted on half a check is a
+        wrong state that nothing reports.
+        """
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            tokens_per_chunk = group_config.tokens_per_chunk
+            first_chunk = complete_boundary // tokens_per_chunk
+            # The tail fills the chunk the resume position sits in, so that
+            # chunk is the last one the load reads a row for.
+            last_chunk = cdiv(resume_token, tokens_per_chunk) - 1
+            for offset, (_, result) in enumerate(
+                self._lookup_results(
+                    group_state.offload_keys[first_chunk:last_chunk],
+                    req_status.req_context,
+                    False,
+                )
+            ):
+                if result is not LookupResult.HIT:
+                    return (
+                        f"the arena answered {result.name} for the chunk at "
+                        f"{(first_chunk + offset) * tokens_per_chunk} of group "
+                        f"{group_config.group_idx}"
+                    )
         return None
 
     def _maybe_register_shared_prefix_junction(

@@ -1782,6 +1782,7 @@ def _tail_resume_layout(
     rows: tuple[OffloadKey, ...] | None = None,
     generation: int | None = None,
     scheduler: OffloadingConnectorScheduler | None = None,
+    prompt_tokens: int = 32,
 ):
     """A request whose own chunks stop at the last proved boundary, and the tail
     the tier answered for the token beyond it: the scheduler, its request state,
@@ -1793,7 +1794,7 @@ def _tail_resume_layout(
     """
     if scheduler is None:
         scheduler = _make_drafter_partial_tail_scheduler(True)
-    request = _make_partial_tail_request(scheduler, num_prompt_tokens=32)
+    request = _make_partial_tail_request(scheduler, num_prompt_tokens=prompt_tokens)
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
     req_status.update_offload_keys()
@@ -2025,12 +2026,49 @@ def test_a_resume_record_of_a_cache_that_is_gone_is_refused():
 
 def test_a_resume_past_what_the_load_can_reach_is_refused():
     # A resume the chunks below cannot reach leaves a hole the request believes
-    # computed. The reach is the one the aligned boundary shares, so a tail that
-    # resumes past the last token the request can be given is not this load's.
+    # computed. The last token of the prompt has to be recomputed for the
+    # logprobs, so no answer from the arena can put a resume there.
     scheduler, req_status, _ = _tail_resume_layout(resume_token=32)
 
     assert scheduler._lookup(req_status) == 28
     assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.tail_resume is None
+
+
+def test_a_fresh_engine_grants_the_resume_the_chunks_between_confirm():
+    """A tail learned from another engine resumes where the finished turn ended,
+    not one block past the chunks this request's own lookup proved. What lies
+    between is whole chunks the arena answers for under the keys the request
+    already owns, so the reach is what those rows confirm: a fresh engine that
+    relearned a conversation its predecessor saved was bounded out by a rule
+    that only fits a tail this process finished itself.
+    """
+    # Six chunks keyed, the drafter group pops its last one, and the tail
+    # resumes three chunks past what that leaves proved.
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=99, prompt_tokens=100
+    )
+
+    assert scheduler._lookup(req_status) == record.resume_token
+    assert req_status.partial_tail_boundary == record.resume_token
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+
+
+def test_a_resume_is_refused_unless_the_arena_holds_every_chunk_below_it():
+    # The tail row is the state at the position, not the KV under it, so a
+    # resume deeper than the proved boundary reads the chunks between as well.
+    # One of them absent reaches prepare_load as a key that is not ready, which
+    # ends the engine, so the whole resume is refused rather than the part of it
+    # above the hole.
+    scheduler, req_status, _ = _tail_resume_layout(resume_token=99, prompt_tokens=100)
+    missing = req_status.group_states[1].offload_keys[5]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.MISS if key == missing else LookupResult.HIT
+    )
+
+    assert scheduler._lookup(req_status) == 92
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
     assert req_status.tail_resume is None
 
 
