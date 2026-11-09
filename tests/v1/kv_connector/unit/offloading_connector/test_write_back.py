@@ -19,9 +19,6 @@ from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
     _make_partial_tail_scheduler,
     _make_windowed_tail_scheduler,
 )
-from tests.v1.kv_connector.unit.offloading_connector.utils import (
-    generate_store_output,
-)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingWorkerMetadata,
 )
@@ -988,33 +985,19 @@ def _assert_one_row_per_key(scheduler, jobs):
         assert sum(job.src_spec.group_sizes) == len(job.src_spec.block_ids) == len(keys)
 
 
-def _finish_tail_store(keyed_chunk: bool = True):
-    """A finished request's tail stored for real, and the band's state after
-    it: the scheduler, the request's bookkeeping, the tail's keys in group
-    order, and the run the tail was recorded against (None when the request
-    keyed no full-attention chunk)."""
-    scheduler = _make_drafter_partial_tail_scheduler(True)
-    tokens = 30 if keyed_chunk else 12
-    request = _make_partial_tail_request(scheduler, num_prompt_tokens=tokens)
-    req_status = scheduler._req_status["req"]
-    if keyed_chunk:
-        req_status.update_offload_keys()       # the conversation keyed a chunk
-    req_status.group_states[0].block_ids[:] = [11, 12] if keyed_chunk else [11]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, ctx: generate_store_output(keys)
-    )
-    tables = ([31, 32], [41], [51, 52]) if keyed_chunk else ([31], [41], [51])
-    boundary = 28 if keyed_chunk else 12
-    assert (
-        scheduler.register_finished_partial_tail(request, tables, [(1, 99, boundary)])
-        is False
-    )
-    [job_id] = scheduler._finished_partial_tail_jobs
-    _assert_one_row_per_key(
-        scheduler, {job_id: scheduler._finished_partial_tail_jobs[job_id]}
-    )
+def _stored_tail():
+    """A finished turn's tail stored for real, through the route that stores
+    tails, and the band's state after it: the scheduler, the request's
+    bookkeeping, the tail's keys in group order, and the run the tail was
+    recorded against."""
+    scheduler, handoff, blocks = _answer_tail_offer()
+    jobs = scheduler._build_answer_tail_store_jobs()
+    [job_id] = jobs
+    _assert_one_row_per_key(scheduler, jobs)
     keys = sorted(scheduler._jobs[job_id].keys)
+    req_status = scheduler._req_status["req"]
     run = scheduler._run_tag([gs.offload_keys for gs in req_status.group_states])
+    assert run is not None and keys == sorted(_tail_keys(handoff, blocks))
     return scheduler, req_status, keys, run
 
 
@@ -1060,7 +1043,7 @@ def test_a_tail_key_is_never_offered_as_a_whole_run_state(band):
 def test_a_tail_leaves_when_its_run_leaves():
     # A tail belongs to a run, not to a session: the band forgets it the step
     # the run is dropped, so no later run picks up a tail it cannot write.
-    scheduler, _, keys, run = _finish_tail_store()
+    scheduler, _, keys, run = _stored_tail()
     assert run is not None and scheduler._run_tails[run] == keys
     scheduler._drop_run(run)
     assert run not in scheduler._run_tails
@@ -1086,7 +1069,7 @@ def test_a_tail_the_pool_evicted_is_counted_and_forgotten(band):
 def test_a_tail_key_never_marks_a_chunk_boundary_state():
     # The pool holds a tail's rows, so they belong in the pool view; they are
     # not the state of a chunk boundary, which is what a restore chain reads.
-    scheduler, _, keys, run = _finish_tail_store()
+    scheduler, _, keys, run = _stored_tail()
     state_key = next(
         k for k in keys if get_offload_group_idx(k) in scheduler._state_group_ids
     )
@@ -1101,7 +1084,7 @@ def test_a_tail_moves_to_the_run_its_request_last_named(monkeypatch):
     # rows there, so the band's record moves with them: otherwise the tail is
     # forgotten while the pool still holds it, and read as a chunk key again.
     # Only the band keeps run records, so only the band re-tags.
-    scheduler, req_status, keys, early = _finish_tail_store()
+    scheduler, req_status, keys, early = _stored_tail()
     assert scheduler._tail_run[keys[0]] == early
     req_status.req.block_hashes.append(BlockHash(b"h7"))
     req_status.update_offload_keys()           # the next step keyed a deeper chunk
@@ -1114,27 +1097,15 @@ def test_a_tail_moves_to_the_run_its_request_last_named(monkeypatch):
     assert early not in scheduler._run_tails
 
 
-def test_a_finish_tail_is_recorded_against_the_run_that_owns_it():
+def test_a_tail_is_recorded_against_the_run_that_owns_it():
     # A tail belongs to a run, not to a session: the run named after the
     # request's last attention key is what the tail leaves with, and the run a
     # later store of the conversation takes it along into.
-    scheduler, _, keys, run = _finish_tail_store()
+    scheduler, _, keys, run = _stored_tail()
     assert run is not None
     assert scheduler._run_tails[run] == keys
     assert all(scheduler._tail_run[key] == run for key in keys)
     assert scheduler._tail_counts["tail_run_missing"] == 0
-
-
-def test_a_tail_of_a_request_that_keyed_no_chunk_has_no_run_and_is_counted():
-    # A request that keyed no full-attention chunk names no run. Writing its
-    # tail under a tag of its own would leave a run of nothing but tail rows,
-    # which restores nothing and cannot become restorable on its own, so the
-    # band records the tail without a run and counts it.
-    scheduler, _, keys, run = _finish_tail_store(keyed_chunk=False)
-    assert run is None
-    assert scheduler._run_tails == {}
-    assert all(scheduler._tail_run[key] is None for key in keys)
-    assert scheduler._tail_counts["tail_run_missing"] == 1
 
 
 # --- the answer tail's store route: the core offers, the connector stores ---
