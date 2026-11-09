@@ -82,6 +82,10 @@ class SharedPoolOffloadingManager(OffloadingManager):
         # Called while degraded; returns an attached client or None.
         self.reconnect = reconnect
         self._reconnect_at = time.monotonic()
+        # Cleared once the server turns the tail record down, which is what a
+        # server that predates it answers. A reattach asks again: the pool can
+        # be replaced under an engine that is still running.
+        self._tails_supported = True
 
     # --- transport ---
 
@@ -112,6 +116,7 @@ class SharedPoolOffloadingManager(OffloadingManager):
         self._holds_open = False
         self._free_fraction = None
         self._reconnect_at = time.monotonic()
+        self._tails_supported = True
 
     def _call_soft(self, op: str, args: object = None) -> object:
         """A call whose failure must not end the engine: a rejection by the
@@ -145,6 +150,7 @@ class SharedPoolOffloadingManager(OffloadingManager):
         if client is not None:
             self._client = client
             self._state_at = 0.0
+            self._tails_supported = True
             logger.info("Reattached to shared KV pool %s", self._pool)
 
     def _request_tag(self, req_context: ReqContext) -> str:
@@ -251,6 +257,39 @@ class SharedPoolOffloadingManager(OffloadingManager):
         except ConnectionError:
             return [], False
         return [OffloadKey(k) for k in keys], bool(overflow)
+
+    def tail_index(self) -> dict[bytes, tuple[tuple[int, bytes], ...]] | None:
+        """Every tail this class holds, as ``{parent: ((length, tail), ...)}``.
+
+        The pool is the one thing that outlives an engine, and a tail key hashes
+        the finished turn's tokens, so which parent and length a row was stored
+        under is a fact the store was asked to record and nothing else can
+        recover. None is the answer of a server that predates the record, and
+        the caller then keeps to the tails it stored itself.
+
+        The whole record rather than the parents asked for: an engine asks on
+        every probe of every waiting request and caches what it is told, so one
+        reply per refresh is what keeps the question off the critical path.
+        """
+        if self._client is None or not self._tails_supported:
+            return None
+        try:
+            reply = self._call(P.OP_TAILS)
+        except PoolServerError as exc:
+            logger.info(
+                "Shared KV pool %s keeps no tail record (%s): this engine can "
+                "only resume over the tails it stored itself",
+                self._pool,
+                exc,
+            )
+            self._tails_supported = False
+            return None
+        except ConnectionError:
+            return None
+        return {
+            bytes(parent): tuple((int(length), bytes(tail)) for length, tail in tails)
+            for parent, tails in reply.items()  # type: ignore[union-attr]
+        }
 
     def _prepare_store(
         self, keys: Collection[OffloadKey], tag: str | bytes, whole: bool = False,

@@ -2011,6 +2011,108 @@ def test_a_resume_is_refused_for_a_request_that_is_gone():
     assert req_status.tail_resume is None
 
 
+def test_a_tail_another_engine_stored_is_granted_over_the_rows_its_key_names():
+    """The rows a tail was written as were recorded by the store that wrote
+    them, so a brand-new engine has no record of them and refused every resume
+    for a conversation its predecessor saved. The tail key names one row per
+    group wherever they were written, so the fence derives them and asks the
+    arena, which is the same proof the store's own record would have given."""
+    scheduler, req_status, record = _tail_resume_layout()
+    scheduler._tail_row_keys.clear()
+    scheduler._pool_has.clear()
+    scheduler._pool_tail_keys = {b"tail"}
+    rows = tuple(
+        make_offload_key(b"tail", group.group_idx)
+        for group in scheduler.config.partial_tail_groups
+    )
+
+    assert scheduler._lookup(req_status) == record.resume_token
+
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+    # The arena was asked, not assumed, and what it confirmed is now on file.
+    looked_up = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
+    assert all(row in looked_up for row in rows)
+    assert scheduler._tail_row_keys[b"tail"] == rows
+
+
+def test_a_tail_another_engine_named_is_refused_when_the_arena_lacks_a_row():
+    """Deriving the rows is a guess about the layout, not a claim about the
+    pool: one row the arena will not confirm and the resume is refused whole,
+    because a tail that comes back missing a group reads a wrong state and
+    reports nothing. Nothing is adopted from a refused confirmation either."""
+    scheduler, req_status, record = _tail_resume_layout()
+    scheduler._tail_row_keys.clear()
+    scheduler._pool_has.clear()
+    scheduler._pool_tail_keys = {b"tail"}
+    lost = make_offload_key(
+        b"tail", scheduler.config.partial_tail_groups[-1].group_idx
+    )
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.MISS if key == lost else LookupResult.HIT
+    )
+
+    assert scheduler._lookup(req_status) < record.resume_token
+
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
+    assert b"tail" not in scheduler._tail_row_keys
+
+
+def test_the_tier_answers_for_a_tail_this_process_never_stored():
+    """The core asks whether the rows are here before it leaves a resume on the
+    request, and a fresh connector has never stored them: the pool's own record
+    of its tails is all there is to answer from, and a probe that leaves out a
+    group the tail carries is still no."""
+    scheduler, _, record = _tail_resume_layout()
+    scheduler._tail_row_keys.clear()
+    groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
+
+    assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups) is None
+
+    scheduler._pool_tail_keys = {b"tail"}
+    hit = scheduler.answer_tail_store.lookup_tail(record.tail_key, groups)
+    assert hit is not None
+    assert hit.generation == scheduler._cache_generation
+    assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups[:1]) is None
+
+
+def test_the_tail_candidates_come_from_the_pool_and_are_asked_for_once_a_refresh():
+    """A probe runs on every lookup of every waiting request, so the pool is
+    asked at most once per refresh and every probe in between reads the copy:
+    the round trip is what must not sit on the scheduler's critical path. The
+    empty parent is the wire form of a tail that starts the conversation."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    parent = BlockHash(b"parent")
+    scheduler.manager.tail_index = MagicMock(
+        return_value={b"parent": ((12, b"tail"),), b"": ((7, b"root"),)}
+    )
+
+    found = scheduler._pool_tail_lengths([None, parent, BlockHash(b"other")])
+
+    assert found == {None: (7,), parent: (12,)}
+    assert scheduler._pool_tail_keys == {b"tail", b"root"}
+    assert scheduler.manager.tail_index.call_count == 1
+    assert scheduler._pool_tail_lengths([parent]) == {parent: (12,)}
+    assert scheduler.manager.tail_index.call_count == 1
+    assert scheduler._tail_counts["tail_index_unsupported"] == 0
+
+
+def test_a_pool_that_keeps_no_tail_record_leaves_the_route_as_it_was():
+    """Production keeps the server that predates the record until the roll, so
+    the new question has to be answered by a pool that never heard of it. The
+    connector then knows only the tails it stored itself, exactly as before, and
+    says so once rather than once per probe."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    scheduler.manager.tail_index = MagicMock(return_value=None)
+
+    assert scheduler._pool_tail_lengths([BlockHash(b"parent")]) == {}
+    assert scheduler._pool_tail_lengths([BlockHash(b"parent")]) == {}
+
+    assert scheduler._tail_counts["tail_index_unsupported"] == 1
+    assert scheduler._pool_tail_keys == set()
+
+
 def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     """The bench's own sequence, end to end: store a tail, a bare
     ``/reset_prefix_cache``, the turn replayed and its tail offered again, then

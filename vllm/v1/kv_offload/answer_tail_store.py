@@ -109,6 +109,30 @@ class AnswerTailStore(ABC):
     """The tier that keeps finished requests' tail blocks after the GPU drops
     them. One key per (tail, group): a tail is offered once per group."""
 
+    def answers_lookups(self) -> bool:
+        """Whether a lookup could ever be answered here.
+
+        The probe that walks the tails of a turn finished in another process
+        costs a per-group cache-hit search on every request, so it runs only
+        where a tier exists to ask. The null store says no, which is what keeps
+        a tierless deployment, and every deployment before any tail finishes,
+        off that path.
+        """
+        return False
+
+    @abstractmethod
+    def tail_lengths(
+        self, parents: Sequence[BlockHash | None]
+    ) -> Mapping[BlockHash | None, Sequence[int]]:
+        """The length of every tail held under each of ``parents``, or nothing.
+
+        A tail key hashes the tokens between its parent and the end of the turn
+        that made it, so a side that did not finish that turn cannot enumerate
+        the keys to look up: it names the parents it repeats and the tier says
+        which of them it holds a tail, and how long. The probe recomputes the
+        key of every answer it is given and looks that up.
+        """
+
     @abstractmethod
     def store_tail(
         self,
@@ -168,6 +192,11 @@ class AnswerTailStore(ABC):
 class NullAnswerTailStore(AnswerTailStore):
     """The default: no RAM tier, so every offer is refused, every lookup misses
     and every other call does nothing."""
+
+    def tail_lengths(
+        self, parents: Sequence[BlockHash | None]
+    ) -> Mapping[BlockHash | None, Sequence[int]]:
+        return {}
 
     def store_tail(
         self,

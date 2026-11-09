@@ -62,6 +62,9 @@ class AnswerTailNotifier(AnswerTailStore):
         on_reset: Callable[[], None],
         holds: Callable[[BlockHash, Sequence[int]], bool],
         generation: Callable[[], int],
+        tails: Callable[
+            [Sequence[BlockHash | None]], Mapping[BlockHash | None, tuple[int, ...]]
+        ],
         max_offers: int = _MAX_OFFERS,
     ) -> None:
         """``report`` is the connector's tail reporter: the refusals this object
@@ -82,11 +85,18 @@ class AnswerTailNotifier(AnswerTailStore):
         ``generation`` is the connector's prefix-cache counter. A hit is a
         promise about rows in a particular cache, and a reset can happen without
         this object being asked, so the number travels on the answer and the
-        connector that reads it is the one that turns down a stale record."""
+        connector that reads it is the one that turns down a stale record.
+
+        ``tails`` answers which lengths the tier holds under each parent the
+        probe names. A tail key cannot be enumerated by the side that did not
+        finish the turn, so this is the only way a brand-new engine finds a tail
+        its own registry never saw.
+        """
         self.report = report
         self.on_reset = on_reset
         self.holds = holds
         self.generation = generation
+        self.tails = tails
         self.pending: OrderedDict[tuple[str, bytes], TailOffer] = OrderedDict()
         self._restored: OrderedDict[tuple[bytes, tuple[tuple[int, ...], ...]], bool] = (
             OrderedDict()
@@ -163,6 +173,22 @@ class AnswerTailNotifier(AnswerTailStore):
         return any(request_id == key[0] for key in self.pending)
 
     # --- the load side: the tier answers, the connector fences ---
+
+    def answers_lookups(self) -> bool:
+        """The connector can put a probe to the arena, so the core walks the
+        candidates a turn finished elsewhere would have left behind."""
+        return True
+
+    def tail_lengths(
+        self, parents: Sequence[BlockHash | None]
+    ) -> Mapping[BlockHash | None, tuple[int, ...]]:
+        """Which of these parents the tier holds a tail under, and how long.
+
+        The record is the pool's, and this object only forwards: a tail is
+        stored under a key the finished turn's tokens made, so the lengths have
+        to come from the side that kept the rows.
+        """
+        return self.tails(parents)
 
     def lookup_tail(
         self, tail_key: BlockHash, group_ids: Sequence[int]

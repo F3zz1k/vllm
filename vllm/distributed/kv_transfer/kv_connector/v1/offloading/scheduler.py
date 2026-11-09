@@ -3,7 +3,7 @@
 import os
 import time
 from collections import Counter, OrderedDict
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
 from types import SimpleNamespace
@@ -134,6 +134,10 @@ _TAIL_KEYS_MAX = 1 << 14
 # state exists only in the hand-off that named it, so unlike a chunk it cannot
 # be re-offered later: after this the rows are given up on and counted.
 _TAIL_STORE_RETRIES = 3
+# How often the pool's record of the tails it holds is re-read (see
+# _pool_tail_lengths). A tail finished by another engine is invisible until the
+# next read, which costs that conversation one resume.
+_POOL_TAILS_REFRESH_SEC = 1.0
 # Conversations ("runs") remembered for whole-run write-back.
 WRITE_BACK_MAX_RUNS = 4096
 # Older restore points a hybrid run keeps besides its deepest one (state keys,
@@ -924,6 +928,7 @@ class OffloadingConnectorScheduler:
             self._forget_local_cache,
             self._tail_is_held,
             lambda: self._cache_generation,
+            tails=self._pool_tail_lengths,
         )
         # The rows each stored tail was written as, by tail key. A restore is
         # granted over every row of a tail or none of them, and a windowed
@@ -936,6 +941,15 @@ class OffloadingConnectorScheduler:
         # the one honest test of such a record is whether it names the cache
         # that is here now.
         self._cache_generation = 0
+        # The pool's record of the tails it holds, by the parent hash their keys
+        # are chained on. Nothing in this process knows a turn another engine
+        # finished, and the arena is the only thing that outlives one, so the
+        # candidates a resuming request has to be given come from there. This is
+        # the copy the probes read: the question costs a round trip and a probe
+        # runs on every lookup of every waiting request.
+        self._pool_tails: Mapping[BlockHash | None, tuple[int, ...]] | None = None
+        self._pool_tail_keys: set[bytes] = set()
+        self._pool_tails_at = 0.0
         # Requests an answer-tail offer is keeping in _req_status after their
         # release, so the state goes the step the offer leaves the queue.
         self._tail_offer_holds: set[ReqId] = set()
@@ -2739,12 +2753,17 @@ class OffloadingConnectorScheduler:
                 req_status, record.resume_token, "the request is gone"
             )
         rows = self._tail_row_keys.get(bytes(record.tail_key))
-        if rows is None:
-            return self._refuse_tail_resume(
-                req_status,
-                record.resume_token,
-                "the band never recorded the rows this tail was stored as",
-            )
+        if not rows:
+            # A tail this process never stored, which is the normal case for a
+            # turn finished before a restart: the key names its rows wherever
+            # they were written, and the arena is asked below, not believed.
+            rows = self._derived_tail_rows(record.tail_key)
+            if rows is None:
+                return self._refuse_tail_resume(
+                    req_status,
+                    record.resume_token,
+                    "the band never recorded the rows this tail was stored as",
+                )
         if len({get_offload_group_idx(key) for key in rows}) != len(rows):
             return self._refuse_tail_resume(
                 req_status,
@@ -2761,6 +2780,12 @@ class OffloadingConnectorScheduler:
         detail = self._confirm_tail_rows(rows, req_status.req_context)
         if detail is not None:
             return self._refuse_tail_resume(req_status, record.resume_token, detail)
+        if bytes(record.tail_key) not in self._tail_row_keys:
+            # The arena holds them, so which rows they are is now known here as
+            # well as there, and the eviction feed drops the record if one of
+            # them leaves. A grant was never going to be made on a belief
+            # nobody confirmed: this is the confirmation.
+            self._tail_row_keys[bytes(record.tail_key)] = rows
         return record
 
     def _confirm_tail_rows(
@@ -4810,6 +4835,61 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
+    def _pool_tail_lengths(
+        self, parents: Sequence[BlockHash | None]
+    ) -> Mapping[BlockHash | None, tuple[int, ...]]:
+        """Which of these parents the pool holds a tail under, and how long.
+
+        The record is the pool's, so it is re-read at most once per
+        ``_POOL_TAILS_REFRESH_SEC`` and read from the copy in between: a probe
+        runs on every lookup of every waiting request, and a round trip there
+        would price the feature on the scheduler's critical path. What the
+        staleness costs is a tail finished since the last read, which the next
+        probe finds.
+
+        A pool that keeps no such record is answered with nothing and counted
+        once: the route stays as it was, over the tails this process stored.
+        """
+        now = time.monotonic()
+        if now - self._pool_tails_at >= _POOL_TAILS_REFRESH_SEC:
+            self._pool_tails_at = now
+            index = (
+                self.manager.tail_index()
+                if hasattr(self.manager, "tail_index")
+                else None
+            )
+            if index is not None:
+                by_parent: dict[BlockHash | None, tuple[int, ...]] = {}
+                tail_keys: set[bytes] = set()
+                for parent, rows in index.items():
+                    key = None if not parent else BlockHash(parent)
+                    by_parent[key] = tuple(sorted({n for n, _ in rows}))
+                    tail_keys |= {tail for _, tail in rows}
+                self._pool_tails = by_parent
+                self._pool_tail_keys = tail_keys
+            elif self._pool_tails is None:
+                self._count_tail_event("tail_index_unsupported")
+                self._pool_tails = {}
+        found = self._pool_tails or {}
+        return {parent: found[parent] for parent in parents if parent in found}
+
+    def _derived_tail_rows(self, tail_key: BlockHash) -> tuple[OffloadKey, ...] | None:
+        """Every row a tail was stored as, from the tail's own key alone.
+
+        A group whose state at the tail is one block stores that row under the
+        tail key, so where every tail group costs one row the key names the
+        whole tail, and a tail this process never stored can still be read.
+        A windowed group's earlier rows are keyed by the blocks they came from,
+        which no key the tail owns names: those stay refused rather than being
+        granted over half a window.
+        """
+        rows: list[OffloadKey] = []
+        for group in self.config.partial_tail_groups:
+            if group.tail_rows != 1:
+                return None
+            rows.append(make_offload_key(bytes(tail_key), group.group_idx))
+        return tuple(rows)
+
     def _tail_is_held(self, tail_key: BlockHash, group_ids: Sequence[int]) -> bool:
         """Whether the arena holds every row of the tail this key names.
 
@@ -4821,15 +4901,20 @@ class OffloadingConnectorScheduler:
         A restore that reads a wrong recurrent state, or a window with a row
         gone, is reported nowhere: the resume is simply wrong.
 
-        A tail whose rows were never recorded is not held, which covers one the
-        pool evicted (``_forget_tail_key`` drops the record) and one stored
-        before the record existed.
+        A tail whose rows were never recorded is answered from the pool's own
+        record of the tails it holds, which is how a turn finished by another
+        engine is answered at all; the fence still asks the arena for every row
+        before it grants. A tail in neither record is not held, which covers one
+        the pool evicted (``_forget_tail_key`` drops the record) and one nobody
+        has written down.
         """
         if not self.config.enable_partial_tail_offload:
             return False
         rows = self._tail_row_keys.get(bytes(tail_key))
         if not rows:
-            return False
+            return bytes(tail_key) in self._pool_tail_keys and (
+                self._partial_tail_group_ids.issubset(group_ids)
+            )
         tail_groups = {
             get_offload_group_idx(key)
             for key in rows

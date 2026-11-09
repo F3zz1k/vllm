@@ -339,6 +339,45 @@ def test_free_fraction_comes_from_state_at_most_once_a_second(server):
     assert server.ops().count(P.OP_STATE) == 1
 
 
+# --- the tails the pool holds ---
+
+
+def test_the_tails_the_pool_holds_are_read_in_one_call(server):
+    """A tail key hashes the finished turn's tokens, so which parent and length
+    a row was stored under is only knowable by the side that kept the row. The
+    engine asks on every probe and caches what it is told, so the record comes
+    in one reply rather than one call per parent."""
+    server.handlers[P.OP_TAILS] = lambda a: {
+        b"parent": [[12, b"tail"]],
+        b"": [[7, b"root"]],
+    }
+    manager = manager_of(make_spec(server.sock_path))
+
+    assert manager.tail_index() == {
+        b"parent": ((12, b"tail"),),
+        b"": ((7, b"root"),),
+    }
+    assert server.ops().count(P.OP_TAILS) == 1
+
+
+def test_a_pool_that_never_heard_of_tails_is_asked_once(server):
+    """The record is new and production keeps the server that predates it until
+    the roll. Such a pool answers the question with an error, and an engine that
+    asked every probe would fill the log and pay for it on the critical path:
+    the manager stops asking and answers that it cannot say, which is what the
+    connector falls back on. Everything the old pool does answer still works."""
+    def refuse(args):
+        raise Refuse("ValueError: unknown op 'tails'")
+
+    server.handlers[P.OP_TAILS] = refuse
+    manager = manager_of(make_spec(server.sock_path))
+
+    assert manager.tail_index() is None
+    assert manager.tail_index() is None
+    assert server.ops().count(P.OP_TAILS) == 1
+    assert manager.lookup(key(1), CTX) == LookupResult.HIT
+
+
 # --- running without the pool ---
 
 

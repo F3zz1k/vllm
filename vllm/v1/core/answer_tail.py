@@ -397,7 +397,8 @@ class AnswerTail:
         prefix match unit full attention holds down to the normal hit, longest
         first, so a hit is always longer than the normal one. A hit needs every
         group and ends one token before the finished request's last token, which
-        the key covers, so it skips the EAGLE drop.
+        the key covers, so it skips the EAGLE drop. What the GPU registry cannot
+        answer is put to the tier, over every boundary the request repeats.
         """
         coordinator = self.coordinator
         assert isinstance(coordinator, HybridKVCacheCoordinator)
@@ -407,7 +408,9 @@ class AnswerTail:
         # between leaves the request holding a name for rows nothing can reach.
         request.tail_resume = None
         lengths_by_parent = self.block_pool.answer_tail.lengths_by_parent
-        if not lengths_by_parent:
+        if not lengths_by_parent and not self.store.answers_lookups():
+            # Nothing this process finished, and no tier to ask about it: the
+            # walk below costs a per-group cache-hit search on every request.
             return None
         hash_block_size = self.block_pool.hash_block_size
         anchor_blocks: list[list[KVCacheBlock]] = [
@@ -461,7 +464,44 @@ class AnswerTail:
                 # one worth taking: a shallower tail the tier holds is one the
                 # next probe reaches again once this request is retried.
                 self._probe_tier(request, tail_hash, end)
+        if request.tail_resume is None:
+            self._probe_tier_candidates(request, num_computed_tokens)
         return None
+
+    def _probe_tier_candidates(
+        self, request: Request, num_computed_tokens: int
+    ) -> None:
+        """Record the deepest tail the tier holds under this request's own
+        hash boundaries, which is how a turn finished in another process is
+        found at all.
+
+        The registry names the tails this process finished, so a turn finished
+        before a restart is not among them and the walk above never asks about
+        it. Every boundary the resuming request repeats is a candidate parent;
+        only the tier can say which of them it holds a tail under, because a
+        tail key hashes the tokens between the parent and the end of the turn
+        that made it and cannot be enumerated. Deepest first: the connector
+        fences the position against what its load can reach, and a tail deeper
+        than that is the one this request would rather have.
+        """
+        hash_block_size = self.block_pool.hash_block_size
+        starts = range(
+            round_down(request.num_tokens - 1, hash_block_size), -1, -hash_block_size
+        )
+        parents = [self._finish_tail_parent(request, start) for start in starts]
+        lengths_by_parent = self.store.tail_lengths(parents)
+        if not lengths_by_parent:
+            return
+        for start, parent in zip(starts, parents):
+            for length in sorted(lengths_by_parent.get(parent, ()), reverse=True):
+                end = start + length
+                if end <= num_computed_tokens + 1 or end > request.num_tokens:
+                    continue
+                self._probe_tier(
+                    request, self._finish_tail_hash(request, start, end), end
+                )
+                if request.tail_resume is not None:
+                    return
 
     def _probe_tier(
         self, request: Request, tail_hash: BlockHash, end: int

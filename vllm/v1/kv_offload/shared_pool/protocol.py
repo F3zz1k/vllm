@@ -52,6 +52,7 @@ OP_MERGE_TAG = "merge_tag"  # (src_tag, dst_tag)
 OP_COMPLETE_STORE = "complete_store"
 OP_TOUCH = "touch"
 OP_EVICTED = "evicted"  # -> [keys taken out of the client's class since its last call, overflow]
+OP_TAILS = "tails"  # -> {parent: [[length, tail_hash], ...]}, the tails the class holds
 OP_RELEASE_ALL = "release_all"
 OP_STATS = "stats"
 # Operator calls (no attach needed).
