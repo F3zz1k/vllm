@@ -2,7 +2,8 @@
 
 Phase 2 step A, branch `answer-tail`: one section per item of `spec-phase2-A.md`, at this
 branch's line numbers. Sections 1 to 5 predate the store hand-off, section 6 is the rows a
-tail costs, and section 7 is the block a state row may be copied from.
+tail costs, section 7 is the block a state row may be copied from, section 8 is the marker
+control, and section 9 is the tail a restarted engine never stored.
 
 ## 1. Tail key naming, and who computes it on lookup
 
@@ -340,3 +341,87 @@ sitting in group 2's row.
 7.1 records as unproven for a finish checkpoint and section 7.2 replaces; key-level pairing
 assertions, which a common permutation passes; and a per-group row count, which is section 6
 and says nothing about which row is whose.
+
+## 9. The tail a restarted engine never stored
+
+**The finding.** Functional-test-5 resumed a conversation the instance before it had
+saved and got nothing: the tail's rows were in the arena, its key was reconstructible by
+nobody, and the request fell back to recomputing the turn. `p1-verify-2.md` rules out
+the shapes that look like a fix. The GPU-side registry is per-process
+(`_find_finish_tail_hit`, `answer_tail.py:391`), so a turn finished before a restart is
+not among the tails anything can offer. And a tail key is `_finish_tail_hash`
+(`answer_tail.py:381`) over the tokens between the parent and the end of the finished
+turn, salted at a position that is not a hash boundary: the pool cannot enumerate tail
+keys any more than it can guess them, because the bytes that name a tail are the
+conversation's tokens, not the row's address.
+
+**What the pool keeps, and who names it.** Two facts per tail row, named by the store
+that writes them and by nobody else: the parent hash the key is chained on, and the
+length the tail covers. `Arena.prepare_store` takes them as a fourth optional argument
+(`shared_pool/server.py:1457`), `LayoutClass.note_tail` (`server.py:749`) puts them on
+the `Entry` (`server.py:236`) and into `LayoutClass.tails` (`server.py:642`), and
+`forget` (`server.py:769`) drops them with the row. `Arena.tails` (`server.py:1578`)
+answers `{parent: [[length, tail_hash], ...]}` for the client's class, deduped across
+the groups one tail spans and skipping a row whose store has not completed. The
+connector's half is `_pool_tail_lengths` (`offloading/scheduler.py:4856`), which the
+store is built with (`scheduler.py:931`) and rereads at most once per
+`_POOL_TAILS_REFRESH_SEC` (`scheduler.py:140`), because a probe runs on every lookup of
+every waiting request.
+
+**What the pool does not keep, and cannot.** Which tail a token prefix names. That needs
+the hash chain over the tokens, which is the core's (`_finish_tail_parent`,
+`answer_tail.py:375`) and lives in the request. So the question is put the other way
+round: the core walks the boundaries the resuming request itself repeats, deepest first,
+and the tier answers which of those parents it holds a tail under and how long that tail
+is (`_probe_tier_candidates`, `answer_tail.py:471`). A tier that cannot answer at all is
+asked nothing (`answers_lookups`, `kv_offload/answer_tail_store.py:112`), so a tierless
+deployment never pays for the walk.
+
+**Section 1's rule, narrowed and still held.** The core still owns the tail hash:
+nothing here computes one outside `answer_tail.py`. The connector appends a group index
+to a hash the core named (`_derived_tail_rows`, `scheduler.py:4894`, from
+`record.tail_key`) and looks that row up, which is naming a tail key on lookup at the
+fence and nowhere else -- never in `_lookup_complete_chunks_impl`, which stays a chunk
+walk. The fence is where this was always going to happen, because it is the one place a
+tail key is already in hand: the rows a tail was stored as were recorded there by the
+store that wrote them, and section 2's refusal of a tail key in the band's membership
+test is what keeps such a record from becoming a licence to copy blocks. What the
+narrowing costs is the finish-tail hash arriving in the connector's process as an opaque
+value it can neither produce nor extend, which is not the request lifetime section 1
+warned about.
+
+**A grant is still the arena's, not the pool's say-so.** The record says a length exists
+under a parent; it does not say the rows are readable. The fence derives the rows the
+key names, asks for each one (`_confirm_tail_rows`, `scheduler.py:2796`), and refuses
+the resume whole on the first row the arena will not confirm -- a tail that comes back
+missing a group reads a wrong state and reports nothing, which is the phase-1 P0 class.
+Only a confirmed set is written into `_tail_row_keys`, and the generation fence is
+untouched: a record of a cache that has been wiped names nothing this engine may load.
+
+**Band membership, unchanged in kind.** A relearned tail is recorded in `_tail_row_keys`
+and marked in `_pool_has` on the arena's answer, the same mark a store's completion
+makes, so a second request of the same conversation is answered from the record rather
+than by a second query. It enters no state set, which section 2 forbids for a tail key
+of any origin, and the eviction feed drops both records exactly as it drops a tail this
+process stored itself.
+
+**How the two halves meet in production, until the roll.** The query is a new op
+(`OP_TAILS`, `shared_pool/protocol.py:55`) and the store's facts are a new positional
+argument, so each side degrades on its own. An old server reads the arguments it knows
+and ignores the tail names, and answers an unknown op with an error, on which the client
+stops asking and counts `tail_index_unsupported` once (`offloading/metrics.py:161`). An
+old client sends no fourth argument, the new server defaults it away, records nothing,
+and stores exactly what it used to. No layout version moves, because no row's bytes do:
+this is index state, not format state.
+
+**What the record is not.** Not durable, and not a ledger of tails ever stored: it
+hangs off the same in-memory index as the rows themselves, so a pool restart loses it,
+which is what a pool restart already does to the index, and it does not outlive a row
+either. A tail whose row goes to the cold tier therefore takes its record with it, and a
+promotion brings the bytes back without it: that conversation pays one recompute, and in
+exchange the record cannot outgrow the arena. Not a key form (D10 stands), not a marker
+row, not a KV event, and not a second copy of anything. Not a fast path either: a tail
+found this way costs the conversation one probe, and the deepest candidate is tried
+first so the shallower ones go unused.
+
+decided
