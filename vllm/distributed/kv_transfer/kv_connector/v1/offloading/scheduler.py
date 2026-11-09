@@ -3825,15 +3825,19 @@ class OffloadingConnectorScheduler:
         # the arena dropped leaves a state no resume should be handed.
         self._tail_row_keys[bytes(handoff.tail_hash)] = tuple(row.key for row in rows)
         if not accepted:
-            # The arena holds every row of this tail, so there is no copy to
-            # run and no job to hand over. It is still a store as far as the
-            # band is concerned: a re-offer is the only way the band relearns
-            # residency after its own view of the pool was dropped, and a tail
-            # the band forgot while the arena kept it is one no resume can ever
-            # be granted for again. The pool's own answer is what the mirror is
-            # corrected with, and the tail is counted as stored, not refused.
-            self._note_in_pool([row.key for row in rows])
+            # The pool took none of the keys back, so there is no copy to run and
+            # no job to hand over. It is still a store as far as the band is
+            # concerned: a re-offer is the only way the band relearns residency
+            # after its own view of the pool was dropped, and a tail the band
+            # forgot while the arena kept it is one no resume can be granted for
+            # again. The rows are recorded either way, and the mirror is marked on
+            # the arena's answer rather than on the absence of work: "no keys to
+            # write" says the index has the key, not that the row is ready to
+            # read, and a row the band believes it can restore from has to be one
+            # the arena said HIT for.
             self._count_tail_event("tail_stored")
+            if self._confirm_tail_rows(keys, req_status.req_context) is None:
+                self._note_in_pool(keys)
             return None
         # No KV event here, unlike the aligned tail stores: a self-describing
         # event describes the hash-aligned prefix of one physical block, and an

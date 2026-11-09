@@ -1914,6 +1914,7 @@ def test_the_fence_asks_the_arena_before_it_grants_a_resume():
     assert scheduler._tail_counts["tail_restore_refused"] == 1
     assert scheduler._tail_counts["tail_restore_granted"] == 0
     assert req_status.tail_resume is None
+    assert not scheduler._current_batch_load_jobs
     looked_up = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
     assert all(row in looked_up for row in rows)
 
@@ -2039,7 +2040,8 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     assert not scheduler._tail_row_keys and not scheduler._pool_has
 
     # The replayed turn finishes at the same tail and offers it again. The arena
-    # holds every row, so its answer names none to write.
+    # holds every row and says so, and its answer names no row to write.
+    scheduler.manager.lookup.return_value = LookupResult.HIT
     offer()
     scheduler.manager.prepare_store_run = MagicMock(
         return_value=PrepareStoreOutput(
@@ -2052,7 +2054,6 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     assert scheduler._tail_counts["tail_stored"] == 2
 
     # A later resume of the same conversation is granted again.
-    scheduler.manager.lookup.return_value = LookupResult.HIT
     request.tail_resume = AnswerTailHit(
         tail_key=BlockHash(b"tail"),
         resume_token=29,
@@ -2062,6 +2063,31 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     )
     assert scheduler._lookup(req_status) == 29
     assert scheduler._tail_counts["tail_restore_granted"] == 1
+
+    # The heal reaches as far as the arena's answer and no further. Another reset
+    # drops the record, and this time one row is not there to be found: the tail
+    # is recorded again, because which rows a tail is made of is a fact about the
+    # offer, while the pool view is only ever the arena's. A resume is then
+    # refused rather than granted on a belief nobody confirmed.
+    scheduler.answer_tail_store.reset()
+    lost = rows[-1]
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.MISS if key == lost else LookupResult.HIT
+    )
+    offer()
+    assert not scheduler._build_answer_tail_store_jobs()
+    assert scheduler._tail_row_keys[bytes(handoff.tail_hash)] == rows
+    assert not scheduler._pool_has
+    request.tail_resume = AnswerTailHit(
+        tail_key=BlockHash(b"tail"),
+        resume_token=29,
+        group_block_ids={},
+        num_tokens=30,
+        generation=scheduler._cache_generation,
+    )
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
 
 
 def test_the_answer_tail_store_is_installed_only_with_the_flag():
