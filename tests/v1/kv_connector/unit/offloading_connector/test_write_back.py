@@ -1866,6 +1866,30 @@ def test_a_resume_the_arena_cannot_fill_is_refused_and_claims_nothing():
     assert not scheduler._current_batch_load_jobs
 
 
+def test_the_fence_asks_the_arena_before_it_grants_a_resume():
+    # The band's view of the pool is drained once per step, inside the band
+    # builder, which runs after this lookup: on its own it can still believe in
+    # a row the arena dropped, and a row that is not ready by the time the load
+    # asks for it ends the engine. So the arena is the last word, and it is
+    # asked for every row -- which is also the hold that keeps those rows for
+    # the step this decision is made in.
+    scheduler, req_status, _ = _tail_resume_layout()
+    rows = scheduler._tail_row_keys[b"tail"]
+    lost = rows[-1]
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.MISS if key == lost else LookupResult.HIT
+    )
+
+    # The aligned boundary the request proved for itself stands; only the
+    # resume's extra token goes.
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
+    assert req_status.tail_resume is None
+    looked_up = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
+    assert all(row in looked_up for row in rows)
+
+
 def test_a_resume_record_of_a_cache_that_is_gone_is_refused():
     # A reset wipes the prefix cache without asking the tier, and every key the
     # record names went with it. Honouring one would read rows under keys that

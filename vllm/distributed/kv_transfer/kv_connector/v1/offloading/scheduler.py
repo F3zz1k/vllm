@@ -2737,7 +2737,7 @@ class OffloadingConnectorScheduler:
             return self._refuse_tail_resume(
                 req_status,
                 record.resume_token,
-                "the arena does not hold every row of the tail",
+                "the band's view of the pool does not hold every tail row",
             )
         if len({get_offload_group_idx(key) for key in rows}) != len(rows):
             return self._refuse_tail_resume(
@@ -2752,7 +2752,32 @@ class OffloadingConnectorScheduler:
                 record.resume_token,
                 "the resume position is past what this load can reach",
             )
+        detail = self._confirm_tail_rows(rows, req_status.req_context)
+        if detail is not None:
+            return self._refuse_tail_resume(req_status, record.resume_token, detail)
         return record
+
+    def _confirm_tail_rows(
+        self, rows: Sequence[OffloadKey], req_context: ReqContext
+    ) -> str | None:
+        """Ask the arena for every row of a tail, and name what came back, or
+        None when it holds the lot.
+
+        The band's mirror of the pool is a step behind by construction: the
+        eviction feed is drained once per step, inside the band builder, which
+        runs after this lookup. A row the mirror still believes in that the
+        arena has dropped would reach ``prepare_load``, and that ends the engine
+        on a key that is not ready. So the arena is asked here, at the decision,
+        the same call the band's store route makes of it. A HIT also holds that
+        row for the rest of the session, which is the span between this grant
+        and the ``prepare_load`` that reserves the rows; the load's own
+        references then carry them to completion. Anything other than HIT for
+        any row refuses the resume, and a refusal claims nothing.
+        """
+        for _, result in self._lookup_results(rows, req_context, False):
+            if result is not LookupResult.HIT:
+                return f"the arena answered {result.name} for a row of the tail"
+        return None
 
     def _maybe_register_shared_prefix_junction(
         self, req_status: RequestOffloadState, num_hit_tokens: int
