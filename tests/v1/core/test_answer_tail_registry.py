@@ -57,6 +57,11 @@ NUM_BLOCKS = 64
 FULL, MAMBA, SWA, RING = 0, 1, 2, 3
 PROMPT = list(range(1, 41))
 OUTPUT = list(range(1000, 1008))
+# A turn finished by another engine: the prompt and answer a later request
+# replays, and the follow-up that makes the replay longer than the turn that
+# produced the tail.
+REPLAYED = PROMPT + OUTPUT
+FOLLOWUP = list(range(2000, 2008))
 # 40 prompt + 8 answer tokens. The answer ends on a prefix match unit boundary,
 # so the tail spans exactly one full unit and its untagged hash is that unit's
 # key, which is what the tail-key marker has to keep apart. Only 47 of the 48
@@ -323,14 +328,27 @@ def test_a_prefix_cache_reset_tells_the_tier_keyed_on_it():
 class _RecordingTailStore(NullAnswerTailStore):
     """The tier a finished turn's tails are offered to, keeping the keys it was
     told the GPU forgot, the rows it was offered per group, whether it was told
-    the prefix cache it was keyed on is gone, and the answer it gives a probe."""
+    the prefix cache it was keyed on is gone, the tails it holds by parent, and
+    the answer it gives a probe."""
 
     def __init__(self) -> None:
         self.forgotten: list[BlockHashWithGroupId] = []
         self.offered: list[tuple[int, list[int]]] = []
         self.resets = 0
         self.probed: list[tuple[BlockHash, tuple[int, ...]]] = []
+        self.asked: list[tuple[BlockHash | None, ...]] = []
+        self.lengths: dict[BlockHash | None, tuple[int, ...]] = {}
         self.answer = False
+        self.can_answer = False
+
+    def answers_lookups(self) -> bool:
+        return self.can_answer
+
+    def tail_lengths(
+        self, parents: Sequence[BlockHash | None]
+    ) -> dict[BlockHash | None, tuple[int, ...]]:
+        self.asked.append(tuple(parents))
+        return {p: self.lengths[p] for p in parents if p in self.lengths}
 
     def store_tail(
         self, handoff: AnswerTailHandoff, group_id: int, block_ids: list[int]
@@ -441,6 +459,53 @@ def test_a_record_of_a_tail_is_made_afresh_on_every_probe():
     store.answer = False
     manager.answer_tail._find_finish_tail_hit(resuming, 0, 0)
 
+    assert resuming.tail_resume is None
+
+
+def test_a_fresh_engine_asks_the_tier_for_the_tails_its_registry_cannot_know():
+    """A brand-new engine has finished nothing, so the registry the probe walks
+    is empty and the turn replayed from before the restart is never asked
+    about. Its candidates are the resuming request's own hash boundaries, and
+    only the tier can say which of them it holds a tail under."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    store.answer = True
+    store.can_answer = True
+    manager.answer_tail.store = store
+    finished = make_request("a", REPLAYED, BLOCK, sha256)
+    tail, parent, length = _tail_key(finished)
+    store.lengths = {parent: (length,)}
+    resuming = make_request("b", REPLAYED + FOLLOWUP, BLOCK, sha256)
+    assert not _tail_maps(manager.block_pool)[1]
+
+    manager.answer_tail._find_finish_tail_hit(resuming, resuming.num_tokens - 1, 0)
+
+    assert store.probed == [(tail, tuple(range(manager.num_kv_cache_groups)))]
+    assert store.asked and parent in store.asked[0]
+    record = resuming.tail_resume
+    assert record is not None
+    assert record.tail_key == tail
+    assert record.resume_token == finished.num_tokens - 1
+    assert record.num_tokens == finished.num_tokens
+
+
+def test_a_tier_that_cannot_answer_is_never_asked_about_those_candidates():
+    """The empty registry is also the fast path that keeps a tierless
+    deployment, and every deployment before any tail finishes, off the
+    per-group cache-hit walk on every request: the candidates are only worth
+    enumerating once a tier exists that could answer for them."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    manager.answer_tail.store = store
+    finished = make_request("a", REPLAYED, BLOCK, sha256)
+    _, parent, length = _tail_key(finished)
+    store.lengths = {parent: (length,)}
+    resuming = make_request("b", REPLAYED + FOLLOWUP, BLOCK, sha256)
+
+    manager.answer_tail._find_finish_tail_hit(resuming, resuming.num_tokens - 1, 0)
+
+    assert store.asked == []
+    assert store.probed == []
     assert resuming.tail_resume is None
 
 
