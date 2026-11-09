@@ -8,11 +8,14 @@ offers one here when it registers the finished turn, and the connector scheduler
 turns the offer into a store on the step that follows. The queue is all the
 state this object holds.
 
-Restore is refused until a byte-level check says a tail comes back whole. A
-tail that returns missing a group, or carrying a state that is not the one the
-resume position needs, is read silently: the resume is wrong and nothing
-reports it. So the load methods refuse by name, count it once per attempt, and
-hand back nothing, which leaves no half tail to reach a request.
+The load side is a fence the connector holds, not one held here. A tail that
+returns missing a group, or carrying a state that is not the one the resume
+position needs, is read silently: the resume is wrong and nothing reports it. So
+the tier answers only whether the rows are here, the connector decides over every
+row of a tail or none of them, and it decides before the scheduler allocates the
+destination blocks. The rows then travel as the resumed request's own load, so
+there is one wait surface, the connector's job machinery, and no second gate that
+could report a tail landed that has not.
 """
 
 from collections import OrderedDict
@@ -31,6 +34,12 @@ from vllm.v1.kv_offload.answer_tail_store import (
 # crowding the scheduler's memory: a dropped offer costs one resume, not a
 # conversation.
 _MAX_OFFERS = 1 << 12
+
+# Restores already committed, remembered so a lookup retried over blocks that
+# are already being filled joins the load in flight instead of counting and
+# issuing the same rows again. Bounded the same way the offer queue is: what
+# losing one costs is a duplicate count, never a wrong byte.
+_MAX_RESTORES = 1 << 12
 
 
 @dataclass
@@ -51,6 +60,8 @@ class AnswerTailNotifier(AnswerTailStore):
         self,
         report: Callable[[str, int], bool],
         on_reset: Callable[[], None],
+        holds: Callable[[BlockHash, Sequence[int]], bool],
+        generation: Callable[[], int],
         max_offers: int = _MAX_OFFERS,
     ) -> None:
         """``report`` is the connector's tail reporter: the refusals this object
@@ -62,10 +73,24 @@ class AnswerTailNotifier(AnswerTailStore):
         only thing keyed on the prefix cache: the connector remembers which keys
         are tails, which run owns them and which rows it believes the arena
         holds, and a reset of that cache takes those facts with it whether or
-        not the queue happened to hold anything."""
+        not the queue happened to hold anything.
+
+        ``holds`` answers whether the arena holds every row of a tail, which is
+        what a lookup is asking: the rows are the connector's to know, and this
+        object only holds the offers that have not become stores yet.
+
+        ``generation`` is the connector's prefix-cache counter. A hit is a
+        promise about rows in a particular cache, and a reset can happen without
+        this object being asked, so the number travels on the answer and the
+        connector that reads it is the one that turns down a stale record."""
         self.report = report
         self.on_reset = on_reset
+        self.holds = holds
+        self.generation = generation
         self.pending: OrderedDict[tuple[str, bytes], TailOffer] = OrderedDict()
+        self._restored: OrderedDict[tuple[bytes, tuple[tuple[int, ...], ...]], bool] = (
+            OrderedDict()
+        )
         self._max_offers = max_offers
 
     # --- the store side: record the offer ---
@@ -137,32 +162,73 @@ class AnswerTailNotifier(AnswerTailStore):
         """
         return any(request_id == key[0] for key in self.pending)
 
-    # --- the load side: refused, by name ---
+    # --- the load side: the tier answers, the connector fences ---
 
     def lookup_tail(
         self, tail_key: BlockHash, group_ids: Sequence[int]
     ) -> AnswerTailHit | None:
-        """No hit while restore is closed. Miss here rather than hand back a
-        hit that ``start_load`` would then refuse: a caller that believes the
-        tail is coming will go on to reserve the tokens it covers."""
-        return None
+        """The tail the arena holds rows for, whole or not at all.
+
+        The hit carries no resume position: the tail was stored under a key the
+        finished turn's tokens made, and where a resume restarts from it is the
+        core's to know, because the core is the one that repeated the turn. The
+        caller reads the position off the tail it probed and leaves this hit as
+        the answer to "do you have it", which is all the connector can say: the
+        rows are named by the key, and their count is the layout's.
+
+        Nothing is counted here. A lookup runs on every probe of every request,
+        so it reads as a gauge; what a miss costs is a tail that recomputes.
+        """
+        if not self.holds(tail_key, group_ids):
+            return None
+        return AnswerTailHit(
+            tail_key=tail_key,
+            resume_token=0,
+            group_block_ids={},
+            num_tokens=0,
+            generation=self.generation(),
+        )
 
     def start_load(
         self, hit: AnswerTailHit, dest_block_ids: Mapping[int, Sequence[int]]
     ) -> bool:
-        """Refuse the restore and count it.
+        """Commit a restore the connector has already fenced and built.
 
-        The count sits here rather than on the lookup because a lookup runs on
-        every resume probe and would read as a gauge; one call here is one
-        restore that was asked for and turned down. Nothing is copied, so
-        nothing can be half copied: the resume falls back to computing the
-        tokens the tail would have covered.
+        The copy is the resumed request's own load job, so this records that the
+        rows are on their way to the blocks they land on and counts the restore
+        once. A second call for the same rows into the same blocks is the same
+        load asked twice, which happens when a lookup is retried, so it joins
+        what is in flight and counts nothing: two counts for one copy would
+        report a tail restored that was not.
+
+        False is still the answer for a restore this object will not stand
+        behind, and nothing here copies: a tail that cannot come back whole is
+        refused by the connector before it allocates, never half loaded.
         """
-        self.report("tail_restore_refused", 1)
-        return False
+        destination = tuple(
+            (group_id, tuple(block_ids))
+            for group_id, block_ids in sorted(dest_block_ids.items())
+        )
+        if not destination:
+            # No block to land on is no restore. The caller fenced a resume it
+            # could not fill, and counting one here would report a tail restored
+            # that no request was given.
+            return False
+        key = (bytes(hit.tail_key), destination)
+        if key in self._restored:
+            return True
+        # The reporter is the connector's one flag-off predicate, so a tier that
+        # is not supposed to be serving says so here as well as in its counters.
+        if not self.report("tail_restored", 1):
+            return False
+        if len(self._restored) >= _MAX_RESTORES:
+            self._restored.popitem(last=False)
+        self._restored[key] = True
+        return True
 
     def wait(self, hit: AnswerTailHit) -> bool:
-        """Nothing is ever in flight: no load starts while restore is closed."""
+        """Nothing is ever in flight here: the copy is the request's own load
+        job, and the connector's job machinery is the one wait surface."""
         return False
 
     # --- pins, reset, shutdown ---
@@ -181,6 +247,7 @@ class AnswerTailNotifier(AnswerTailStore):
         connector's bookkeeping over that cache goes in the same step, from the
         same call, whichever way the reset was asked for."""
         self.pending.clear()
+        self._restored.clear()
         self.on_reset()
 
     def discard_offers(self) -> None:

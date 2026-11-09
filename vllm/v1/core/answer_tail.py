@@ -11,6 +11,7 @@ so the entries are neither offloaded nor published as KV events."""
 
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -400,6 +401,11 @@ class AnswerTail:
         """
         coordinator = self.coordinator
         assert isinstance(coordinator, HybridKVCacheCoordinator)
+        # A record of a tail is made against the cache that was here when it was
+        # probed, and this probe runs again whenever the scheduler looks at the
+        # request, so a record never outlives the step that made it: a reset in
+        # between leaves the request holding a name for rows nothing can reach.
+        request.tail_resume = None
         lengths_by_parent = self.block_pool.answer_tail.lengths_by_parent
         if not lengths_by_parent:
             return None
@@ -438,9 +444,9 @@ class AnswerTail:
             if num_computed_tokens + 1 < tail_start + length <= request.num_tokens
         )
         for end, tail_start in reversed(tails):
+            tail_hash = self._finish_tail_hash(request, tail_start, end)
             hit_blocks = self._finish_tail_blocks(
-                request, self._finish_tail_hash(request, tail_start, end), end,
-                anchor_blocks,
+                request, tail_hash, end, anchor_blocks
             )
             if hit_blocks is not None:
                 logger.debug(
@@ -449,7 +455,30 @@ class AnswerTail:
                     end - 1,
                 )
                 return hit_blocks, end - 1
+            if request.tail_resume is None:
+                # The GPU registry has come up short, so ask the tier the
+                # connector keeps. Deepest first, and the first answer is the
+                # one worth taking: a shallower tail the tier holds is one the
+                # next probe reaches again once this request is retried.
+                self._probe_tier(request, tail_hash, end)
         return None
+
+    def _probe_tier(
+        self, request: Request, tail_hash: BlockHash, end: int
+    ) -> None:
+        """Leave a tier's answer on the request for the connector to fence.
+
+        The tier answers only "these rows are here": the position a resume
+        restarts from is this side's to know, because this side is the one that
+        repeated the turn. So the record carries the position and the tier's own
+        cache number, and it grants nothing. Whether the rows can actually be
+        read back is decided by the connector, which is the only one that can
+        see them, and it decides before the scheduler allocates.
+        """
+        hit = self.store.lookup_tail(tail_hash, range(self.num_kv_cache_groups))
+        if hit is None:
+            return
+        request.tail_resume = replace(hit, resume_token=end - 1, num_tokens=end)
 
     def _finish_tail_blocks(
         self,

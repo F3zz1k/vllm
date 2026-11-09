@@ -51,7 +51,10 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
-from vllm.v1.kv_offload.answer_tail_store import tail_rows_for_group
+from vllm.v1.kv_offload.answer_tail_store import (
+    AnswerTailHit,
+    tail_rows_for_group,
+)
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     Locality,
@@ -530,6 +533,10 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
+    # The tail the core found in the tier when its own registry came up short,
+    # accepted by the connector's fence at the lookup that reached no further.
+    # Consumed when the load that fills the boundary is scheduled.
+    tail_resume: AnswerTailHit | None = None
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
@@ -913,8 +920,22 @@ class OffloadingConnectorScheduler:
         # and bytes move only in a worker's transfer job, so the core cannot
         # store a tail and the notifier is all the seam it gets.
         self.answer_tail_store = AnswerTailNotifier(
-            self._count_tail_event, self._forget_local_cache
+            self._count_tail_event,
+            self._forget_local_cache,
+            self._tail_is_held,
+            lambda: self._cache_generation,
         )
+        # The rows each stored tail was written as, by tail key. A restore is
+        # granted over every row of a tail or none of them, and a windowed
+        # group's rows are keyed by the blocks they came from rather than by the
+        # tail's key, so the tail key alone does not name what a restore reads.
+        self._tail_row_keys: dict[bytes, tuple[OffloadKey, ...]] = {}
+        # Bumped every time the prefix cache these keys live in is wiped. A
+        # resume record is named after the cache that was here when the core
+        # made it, and a reset can happen without the connector's own reset, so
+        # the one honest test of such a record is whether it names the cache
+        # that is here now.
+        self._cache_generation = 0
         # Requests an answer-tail offer is keeping in _req_status after their
         # release, so the state goes the step the offer leaves the queue.
         self._tail_offer_holds: set[ReqId] = set()
@@ -1487,7 +1508,12 @@ class OffloadingConnectorScheduler:
             self._forget_tail_key(next(iter(self._tail_run)))
 
     def _forget_tail_key(self, key: OffloadKey) -> None:
-        """Drop a tail key from the band's view, and from its run's tail list."""
+        """Drop a tail key from the band's view, and from its run's tail list.
+
+        The whole tail goes with it: a restore reads every row the store wrote,
+        so one row the arena dropped is a tail no restore can be granted over.
+        """
+        self._tail_row_keys.pop(bytes(key)[:-4], None)
         owned = self._tail_run.pop(key, None)
         tails = self._run_tails.get(owned) if owned is not None else None
         if tails is not None:
@@ -2561,6 +2587,27 @@ class OffloadingConnectorScheduler:
 
         return num_hit_tokens
 
+    def _tail_boundary_key(
+        self, req_status: RequestOffloadState, group_config: GroupOffloadConfig
+    ) -> OffloadKey:
+        """The key the row at a partial boundary is loaded under.
+
+        A tail the connector granted from the tier is keyed by the tail's own
+        hash, which no block of the resuming request owns; an aligned boundary
+        the request reached on its own is keyed by the block hash at it. One row
+        either way, so the destination block and the pairing are the same, and
+        the two routes differ only in the name they ask the arena under.
+        """
+        resume = req_status.tail_resume
+        if resume is not None:
+            return make_offload_key(bytes(resume.tail_key), group_config.group_idx)
+        return self._make_boundary_key(
+            req_status.req,
+            group_config.group_idx,
+            req_status.partial_tail_boundary,
+            req_status.req_context,
+        )
+
     def _make_boundary_key(
         self,
         request: Request,
@@ -2587,51 +2634,125 @@ class OffloadingConnectorScheduler:
         complete_boundary = local_tokens + complete_hit
         tokens_per_hash = self.config.tokens_per_hash
         block_end = complete_boundary + self._partial_tail_block_size
-        max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
+        ceiling = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
         if max_num_new_tokens is not None:
-            max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
+            ceiling = min(ceiling, local_tokens + max_num_new_tokens)
         if req_status.max_load_tokens is not None:
-            max_boundary = min(
-                max_boundary,
-                local_tokens + req_status.max_load_tokens,
-            )
-        max_boundary = round_down(max_boundary, tokens_per_hash)
-        if max_boundary <= complete_boundary:
-            return complete_hit
+            ceiling = min(ceiling, local_tokens + req_status.max_load_tokens)
 
-        pending = False
-        tail_configs = self.config.partial_tail_groups
-        for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
-            boundary_pending = False
-            boundary_missed = False
-            boundary_keys = []
-            for group_config in tail_configs:
-                key = self._make_boundary_key(
-                    req_status.req,
-                    group_config.group_idx,
-                    boundary,
-                    req_status.req_context,
-                )
-                boundary_keys.append(key)
-                result = self.manager.lookup(key, req_status.req_context)
-                if result is LookupResult.MISS:
-                    boundary_missed = True
-                    break
-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
-                    boundary_pending = True
+        # The tail the core's own probe found in the tier, fenced here because
+        # the decision has to be made before the scheduler allocates anything.
+        # It competes with the aligned boundary below rather than replacing it:
+        # a tail resumes wherever the finished turn ended, which is not always
+        # deeper than the last boundary the request's own chunks prove.
+        resume = self._fence_tail_resume(req_status, complete_boundary, ceiling)
 
-            pending |= boundary_pending
-            if not boundary_missed and not boundary_pending:
-                for group_config, key in zip(tail_configs, boundary_keys):
-                    self._events_tracker.record_partial_lookup(
-                        req_status.req, group_config, boundary, key
+        max_boundary = round_down(ceiling, tokens_per_hash)
+        aligned_boundary: int | None = None
+        if max_boundary > complete_boundary:
+            pending = False
+            tail_configs = self.config.partial_tail_groups
+            for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
+                boundary_pending = False
+                boundary_missed = False
+                boundary_keys = []
+                for group_config in tail_configs:
+                    key = self._make_boundary_key(
+                        req_status.req,
+                        group_config.group_idx,
+                        boundary,
+                        req_status.req_context,
                     )
-                req_status.partial_tail_boundary = boundary
-                return boundary - local_tokens
+                    boundary_keys.append(key)
+                    result = self.manager.lookup(key, req_status.req_context)
+                    if result is LookupResult.MISS:
+                        boundary_missed = True
+                        break
+                    if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+                        boundary_pending = True
 
-        if pending and complete_hit == 0:
+                pending |= boundary_pending
+                if not boundary_missed and not boundary_pending:
+                    req_status.partial_tail_boundary = boundary
+                    aligned_boundary = boundary
+                    for group_config, key in zip(tail_configs, boundary_keys):
+                        self._events_tracker.record_partial_lookup(
+                            req_status.req, group_config, boundary, key
+                        )
+                    break
+            if aligned_boundary is None and pending and complete_hit == 0:
+                return None
+
+        reached = complete_boundary if aligned_boundary is None else aligned_boundary
+        if resume is not None and resume.resume_token > reached:
+            req_status.tail_resume = resume
+            req_status.partial_tail_boundary = resume.resume_token
+            self._count_tail_event("tail_restore_granted")
+            return resume.resume_token - local_tokens
+        return reached - local_tokens
+
+    def _fence_tail_resume(
+        self,
+        req_status: RequestOffloadState,
+        complete_boundary: int,
+        ceiling: int,
+    ) -> AnswerTailHit | None:
+        """The tail a restore may be granted for, or None and a count.
+
+        The core probed the tier when its own registry came up short and left
+        the record on the request. This is where the connector decides it can
+        serve it, and the decision is made here, before the scheduler allocates
+        anything, because a resume that later comes up short reads a wrong
+        recurrent state and reports nothing. So every row the tail was stored as
+        has to be in the arena, the record has to name the cache that is still
+        here, and the position has to be one this load can reach.
+
+        The rows a windowed group takes before its tail block are keyed by the
+        keys their own blocks own, the same keys the chunk load reads, so they
+        come with the chunks below the tail; requiring all of them held is what
+        makes the window whole at the resume position rather than merely the
+        tail block. A layout where such a group costs more than one row is
+        refused outright: one boundary row is all a resume has a destination for,
+        and half a window is the wrong state to hand back.
+
+        Nothing is claimed here. The caller takes the deeper of this and the
+        boundary the request's own chunks prove, so a record that loses the
+        contest costs nothing and is counted as nothing.
+        """
+        record = req_status.req.tail_resume
+        if record is None:
             return None
-        return complete_hit
+        if not self._cache_is_current(record.generation):
+            return self._refuse_tail_resume(
+                req_status,
+                record.resume_token,
+                "the prefix cache it was recorded against has been reset",
+            )
+        if req_status.req.is_finished():
+            return self._refuse_tail_resume(
+                req_status, record.resume_token, "the request is gone"
+            )
+        rows = self._tail_row_keys.get(bytes(record.tail_key))
+        if rows is None or not all(key in self._pool_has for key in rows):
+            return self._refuse_tail_resume(
+                req_status,
+                record.resume_token,
+                "the arena does not hold every row of the tail",
+            )
+        if len({get_offload_group_idx(key) for key in rows}) != len(rows):
+            return self._refuse_tail_resume(
+                req_status,
+                record.resume_token,
+                "a windowed group's rows need more destination blocks than a "
+                "resume fills",
+            )
+        if not complete_boundary < record.resume_token <= ceiling:
+            return self._refuse_tail_resume(
+                req_status,
+                record.resume_token,
+                "the resume position is past what this load can reach",
+            )
+        return record
 
     def _maybe_register_shared_prefix_junction(
         self, req_status: RequestOffloadState, num_hit_tokens: int
@@ -2821,6 +2942,7 @@ class OffloadingConnectorScheduler:
         # per group
         group_sizes: list[int] = []
         block_indices: list[int] = []
+        tail_dests: dict[int, list[int]] = {}
         for group_config, group_state in zip(
             self.config.kv_group_configs,
             req_status.group_states,
@@ -2875,12 +2997,7 @@ class OffloadingConnectorScheduler:
                     and group_config.group_idx in self._partial_tail_group_ids
                 ):
                     group_keys_to_load.append(
-                        self._make_boundary_key(
-                            request,
-                            group_config.group_idx,
-                            partial_tail_boundary,
-                            req_status.req_context,
-                        )
+                        self._tail_boundary_key(req_status, group_config)
                     )
                 keys_to_load.extend(group_keys_to_load)
                 if isinstance(group_config.kv_cache_spec, MambaSpec):
@@ -2928,6 +3045,16 @@ class OffloadingConnectorScheduler:
             )
             group_sizes.append(num_dst_blocks)
             block_indices.append(load_start_gpu_block_idx)
+            if (
+                num_dst_blocks
+                and req_status.tail_resume is not None
+                and group_config.group_idx in self._partial_tail_group_ids
+            ):
+                # The row this group's tail contributes lands on the last
+                # destination block of the load, the one at the resume position.
+                tail_dests[group_config.group_idx] = [
+                    group_blocks[dst_end_gpu_block_idx - 1].block_id
+                ]
 
             # Skip prefix-hit chunks for block-level policy; for
             # request-level, next_stored_chunk_idx stays at 0 so all
@@ -2973,6 +3100,14 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
+        if (resume := req_status.tail_resume) is not None:
+            # The rows are the request's own load now, so this is where a
+            # restore is committed: the store records it against the blocks it
+            # lands on and says whether it is new, so a lookup retried over
+            # blocks that are already being filled joins the load in flight
+            # instead of asking the arena for the same rows a second time.
+            self.answer_tail_store.start_load(resume, tail_dests)
+        req_status.tail_resume = None
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update request states from the Scheduler's output."""
@@ -3401,6 +3536,39 @@ class OffloadingConnectorScheduler:
         )
         return False
 
+    def _refuse_tail_resume(
+        self,
+        req_status: RequestOffloadState,
+        boundary: int,
+        detail: str,
+    ) -> AnswerTailHit | None:
+        """Turn down a resume the connector cannot serve, and say why.
+
+        The request keeps the shorter hit it already had and recomputes the rest,
+        which is the whole cost: the tail stays in the arena for the next probe.
+        Nothing here is claimed, so the scheduler allocates for the shorter hit
+        and no destination block is reserved for rows that will not arrive.
+
+        A separate line from a refused store, because the two cost different
+        things: a refused store leaves a tail unwritten, a refused restore
+        leaves a conversation to recompute its own tail. Both counts go through
+        the one flag-off predicate.
+        """
+        req_status.req.tail_resume = None
+        if self._count_tail_event("tail_restore_refused"):
+            logger.info_once(
+                "KV offloading: refused an answer-tail restore; the request "
+                "resumes from the hit it already has and recomputes the tail."
+            )
+        logger.debug(
+            "KV offloading: refused the answer-tail restore of request %s at %s "
+            "tokens (%s)",
+            req_status.req.request_id,
+            boundary,
+            detail,
+        )
+        return None
+
     def bind_answer_tail_store(self, kv_cache_manager: Any) -> None:
         """Give the engine core's answer tail the connector's notifier.
 
@@ -3607,6 +3775,11 @@ class OffloadingConnectorScheduler:
         # window row's key is the key its block owns, and a block the band
         # could copy later must stay copyable.
         self._note_tail_keys(req_status, [row.key for row in accepted if row.is_tail])
+        # What a restore has to read, indexed by the one key a resume can name.
+        # Every row counts, including the ones the pool already held, because a
+        # restore is granted over the whole tail or not at all and a window row
+        # the arena dropped leaves a state no resume should be handed.
+        self._tail_row_keys[bytes(handoff.tail_hash)] = tuple(row.key for row in rows)
         # No KV event here, unlike the aligned tail stores: a self-describing
         # event describes the hash-aligned prefix of one physical block, and an
         # answer tail is neither aligned nor a prefix of anything. A tail key is
@@ -4563,6 +4736,51 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
+    def _tail_is_held(self, tail_key: BlockHash, group_ids: Sequence[int]) -> bool:
+        """Whether the arena holds every row of the tail this key names.
+
+        The fence a restore is granted behind, and the whole of it. A tail comes
+        back as one row per group under the tail's own key, except in a windowed
+        group, whose rows are keyed by the blocks they came from, so the tail key
+        names only the last of them: the rows recorded at the store are what a
+        restore reads, and a tail that would come back missing one is refused.
+        A restore that reads a wrong recurrent state, or a window with a row
+        gone, is reported nowhere: the resume is simply wrong.
+
+        A tail whose rows were never recorded is not held, which covers one the
+        pool evicted (``_forget_tail_key`` drops the record) and one stored
+        before the record existed.
+        """
+        if not self.config.enable_partial_tail_offload:
+            return False
+        rows = self._tail_row_keys.get(bytes(tail_key))
+        if not rows:
+            return False
+        tail_groups = {
+            get_offload_group_idx(key)
+            for key in rows
+            if get_offload_group_idx(key) in self._partial_tail_group_ids
+        }
+        if not tail_groups.issubset(group_ids):
+            # A group the probe left out is a group whose row the resume would
+            # not read, which is not the state at the tail.
+            return False
+        return all(key in self._pool_has for key in rows)
+
+    def _cache_is_current(self, generation: int) -> bool:
+        """Whether a record made against the prefix cache still names the cache
+        that is here.
+
+        One predicate for both lifetimes that ride on the local cache: an offer
+        waiting to become a store, and a resume record waiting for its
+        destination blocks. A reset drops the keys both are named after, and it
+        can happen without the connector's own reset, so a stale record is not a
+        rare race to log about but a record that can never mean what it says.
+        Refusing on one costs a tail, or a resume that recomputes; honouring it
+        stores or loads bytes under a key nothing can name again.
+        """
+        return generation == self._cache_generation
+
     def _forget_local_cache(self) -> None:
         """The prefix cache these keys live in is gone.
 
@@ -4576,6 +4794,8 @@ class OffloadingConnectorScheduler:
         still running, whose blocks the core cannot have freed, and the arena
         itself, which a local cache wipe does not touch.
         """
+        self._cache_generation += 1
+        self._tail_row_keys.clear()
         # A held request was held for its offer; with the offer gone it is held
         # for nothing. Only a signalled request is ever held, so releasing it
         # here cannot skip the on_request_finished the full reset owes.

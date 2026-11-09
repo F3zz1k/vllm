@@ -97,6 +97,13 @@ class AnswerTailHit:
     num_tokens: int
     """The finished request's token count, the tail's own length included."""
 
+    generation: int = 0
+    """Which prefix cache the tier was in when it answered. A record of a tail
+    names keys from the cache that was here when it was made, and that cache can
+    be wiped without the tier being asked, so a record from an older cache names
+    keys nothing can reach again. The tier stamps its own number because only it
+    knows, and the connector that reads the record is the one that fences it."""
+
 
 class AnswerTailStore(ABC):
     """The tier that keeps finished requests' tail blocks after the GPU drops

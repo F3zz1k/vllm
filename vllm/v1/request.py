@@ -28,6 +28,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.kv_offload.answer_tail_store import AnswerTailHit
 
 
 @dataclass
@@ -207,6 +208,12 @@ class Request:
         # DeepSeek-V4.1 only: SWA bounded replay. The request holds no
         # sliding-window KV below this position; 0 when nothing replays.
         self.replay_start = 0
+
+        # A finished turn's tail that the GPU no longer holds but a tier does:
+        # the resume position and the tail's key, recorded where the lookup that
+        # missed is made. Only the KV connector reads it, because only it can
+        # name the rows and take lane time to copy them.
+        self.tail_resume: "AnswerTailHit | None" = None
 
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted

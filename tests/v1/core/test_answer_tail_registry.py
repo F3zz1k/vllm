@@ -11,6 +11,7 @@ time by _tail_maps and the FINISH_TAIL_EXTRA_KEY import; everything else is
 reached the way the scheduler reaches it, through the manager and the pool."""
 
 from collections import Counter
+from collections.abc import Sequence
 
 import pytest
 import torch
@@ -37,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
 try:  # The tail store is new; base 539da2bff6 has no answer_tail_store module.
     from vllm.v1.kv_offload.answer_tail_store import (
         AnswerTailHandoff,
+        AnswerTailHit,
         NullAnswerTailStore,
     )
 except ImportError:  # base 539da2bff6
@@ -320,15 +322,15 @@ def test_a_prefix_cache_reset_tells_the_tier_keyed_on_it():
 
 class _RecordingTailStore(NullAnswerTailStore):
     """The tier a finished turn's tails are offered to, keeping the keys it was
-    told the GPU forgot, the rows it was offered per group, and whether it was
-    told the prefix cache it was keyed on is gone. The store side of the seam
-    is tested with the store that actually serves it; here only the reach of the
-    registry's forget and what the core hands over."""
+    told the GPU forgot, the rows it was offered per group, whether it was told
+    the prefix cache it was keyed on is gone, and the answer it gives a probe."""
 
     def __init__(self) -> None:
         self.forgotten: list[BlockHashWithGroupId] = []
         self.offered: list[tuple[int, list[int]]] = []
         self.resets = 0
+        self.probed: list[tuple[BlockHash, tuple[int, ...]]] = []
+        self.answer = False
 
     def store_tail(
         self, handoff: AnswerTailHandoff, group_id: int, block_ids: list[int]
@@ -338,6 +340,20 @@ class _RecordingTailStore(NullAnswerTailStore):
 
     def forget_tail(self, tail_key: BlockHashWithGroupId) -> None:
         self.forgotten.append(tail_key)
+
+    def lookup_tail(
+        self, tail_key: BlockHash, group_ids: Sequence[int]
+    ) -> AnswerTailHit | None:
+        self.probed.append((tail_key, tuple(group_ids)))
+        if not self.answer:
+            return None
+        return AnswerTailHit(
+            tail_key=tail_key,
+            resume_token=0,
+            group_block_ids={},
+            num_tokens=0,
+            generation=7,
+        )
 
     def reset(self) -> None:
         self.resets += 1
@@ -363,6 +379,69 @@ def test_a_tail_the_gpu_forgot_reaches_the_store_it_was_offered_to():
 
     assert pool.get_cached_block(tail, [MAMBA]) is None
     assert store.forgotten == [make_block_hash_with_group_id(tail, MAMBA)]
+
+
+def test_a_tail_the_tier_holds_is_recorded_with_the_position_the_core_knows():
+    """The tier answers only that rows are here; where a resume restarts from is
+    the core's to know, because the core is the one that repeated the turn. So
+    the record the request is left carrying has the core's position and the
+    tier's cache number, and grants nothing: the connector that can see the rows
+    is the one that decides, and it decides before anything is allocated.
+    """
+    manager = _manager()
+    store = _RecordingTailStore()
+    store.answer = True
+    manager.answer_tail.store = store
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    tail, _, _ = _tail_key(finished)
+    resuming = make_request("b", PROMPT, BLOCK, sha256)
+
+    manager.answer_tail._probe_tier(resuming, tail, finished.num_tokens)
+
+    assert store.probed == [(tail, tuple(range(manager.num_kv_cache_groups)))]
+    record = resuming.tail_resume
+    assert record is not None
+    assert record.tail_key == tail
+    assert record.resume_token == finished.num_tokens - 1
+    assert record.num_tokens == finished.num_tokens
+    assert record.generation == 7
+
+
+def test_a_tail_the_tier_has_not_is_recorded_as_nothing():
+    """A miss leaves no record, so the request resumes from the hit it already
+    has rather than from a position nothing agreed to fill."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    manager.answer_tail.store = store
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    tail, _, _ = _tail_key(finished)
+    resuming = make_request("b", PROMPT, BLOCK, sha256)
+
+    manager.answer_tail._probe_tier(resuming, tail, finished.num_tokens)
+
+    assert store.probed == [(tail, tuple(range(manager.num_kv_cache_groups)))]
+    assert resuming.tail_resume is None
+
+
+def test_a_record_of_a_tail_is_made_afresh_on_every_probe():
+    """A lookup can be retried a step later, and a prefix cache reset in between
+    takes the keys the record names with it. The probe runs again on every
+    attempt, so clearing what it left the previous time is what stops a request
+    resuming from rows that belonged to the cache that is gone."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    store.answer = True
+    manager.answer_tail.store = store
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    tail, _, _ = _tail_key(finished)
+    resuming = make_request("b", PROMPT, BLOCK, sha256)
+    manager.answer_tail._probe_tier(resuming, tail, finished.num_tokens)
+    assert resuming.tail_resume is not None
+
+    store.answer = False
+    manager.answer_tail._find_finish_tail_hit(resuming, 0, 0)
+
+    assert resuming.tail_resume is None
 
 
 def test_the_store_is_offered_the_window_a_windowed_group_state_sits_in():

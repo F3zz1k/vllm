@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
 )
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
@@ -34,6 +35,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.kv_offload.base import (
+    GPULoadStoreSpec,
     LookupResult,
     OffloadKey,
     PrepareStoreOutput,
@@ -1682,9 +1684,9 @@ def test_a_retry_revalidates_every_row_the_offer_named():
 
 def test_the_restore_of_a_tail_is_refused_by_name():
     # A tail that comes back missing a group, or carrying a state that is not
-    # the one the resume position needs, is read silently. So the load side
-    # refuses by name and copies nothing, which leaves no half tail to reach a
-    # request: the byte-level gate is what opens it.
+    # the one the resume position needs, is read silently. So nothing is copied
+    # until every row is proven held, which leaves no half tail to reach a
+    # request, and a restore that was not earned is counted rather than hidden.
     scheduler, handoff, _ = _answer_tail_offer()
     hit = AnswerTailHit(
         tail_key=handoff.tail_hash,
@@ -1694,9 +1696,235 @@ def test_the_restore_of_a_tail_is_refused_by_name():
     )
 
     assert scheduler.answer_tail_store.lookup_tail(handoff.tail_hash, [0, 1]) is None
+    # No destination block is no restore: the caller fenced a resume it could not
+    # fill, and counting one would report a tail restored that no request got.
     assert scheduler.answer_tail_store.start_load(hit, {}) is False
     assert scheduler.answer_tail_store.wait(hit) is False
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+
+
+# --- the restore route: the core records a tail, the connector fences it ---
+
+
+def _tail_resume_layout(
+    resume_token: int = 29,
+    rows: tuple[OffloadKey, ...] | None = None,
+    generation: int | None = None,
+):
+    """A request whose own chunks stop at the last proved boundary, and the tail
+    the tier answered for the token beyond it: the scheduler, its request state,
+    the record the core left, and the rows a restore has to read.
+
+    The rows are marked resident through the band's own record of the pool, so a
+    test says "the arena holds these" rather than reaching into a dict.
+    """
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler, num_prompt_tokens=32)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    if rows is None:
+        rows = tuple(
+            make_offload_key(b"tail", group.group_idx)
+            for group in scheduler.config.partial_tail_groups
+        )
+    scheduler._tail_row_keys[b"tail"] = rows
+    scheduler._note_in_pool(rows)
+    record = AnswerTailHit(
+        tail_key=BlockHash(b"tail"),
+        resume_token=resume_token,
+        group_block_ids={},
+        num_tokens=30,
+        generation=(
+            scheduler._cache_generation if generation is None else generation
+        ),
+    )
+    request.tail_resume = record
+    return scheduler, req_status, record
+
+
+def test_a_stored_tail_records_the_rows_a_restore_has_to_read():
+    # The tail key names only a windowed group's last row, so the store writes
+    # down every row it wrote. Without that record a restore would be granted
+    # over the rows the tail key happens to name and read the rest as whatever
+    # the arena holds under some other key.
+    scheduler, handoff, _ = _answer_tail_offer()
+    scheduler._build_answer_tail_store_jobs()
+
+    rows = scheduler._tail_row_keys[bytes(handoff.tail_hash)]
+    tail_groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
+    assert list(rows) == _tail_keys(handoff, sorted(tail_groups))
+
+
+def test_a_tail_the_arena_holds_is_answered_for_every_group_it_carries():
+    # The tier answers "these rows are here" and nothing else; a probe that
+    # leaves out a group the tail carries would resume without that group's
+    # state, so the answer is no.
+    scheduler, _, record = _tail_resume_layout()
+    groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
+
+    hit = scheduler.answer_tail_store.lookup_tail(record.tail_key, groups)
+    assert hit is not None
+    assert hit.generation == scheduler._cache_generation
+    assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups[:1]) is None
+
+
+def test_a_resume_the_fence_grants_adds_its_token_to_the_hit():
+    # A tail resumes one token past the last boundary the request's own chunks
+    # prove, which is a token the request would otherwise recompute. The grant
+    # is the deeper of the two routes, so the boundary the connector records is
+    # the resume's, not the aligned one's.
+    scheduler, req_status, record = _tail_resume_layout()
+
+    assert scheduler._lookup(req_status) == record.resume_token
+    assert req_status.partial_tail_boundary == record.resume_token
+    assert req_status.tail_resume is record
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+
+
+def test_a_granted_resume_is_loaded_under_the_tail_key_into_its_own_block():
+    # The row at a resume is the tail's own, keyed by a hash no block of the
+    # resuming request owns, so the load asks for the tail key where an aligned
+    # boundary would ask for the block's. One key, one destination block, in the
+    # same group order: the pairing the transfer layer depends on is the test.
+    scheduler, req_status, record = _tail_resume_layout()
+    request = req_status.req
+    drafter_group_idx = 2
+    mamba_group_idx = 1
+    assert scheduler._lookup(req_status) == record.resume_token
+
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                [KVCacheBlock(51), KVCacheBlock(52)],
+            )
+        ),
+        num_external_tokens=record.resume_token,
+    )
+
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    dst_spec = load_job.dst_spec
+    assert isinstance(dst_spec, GPULoadStoreSpec)
+    [job] = scheduler._jobs.values()
+    assert dst_spec.group_sizes == [2, 1, 1]
+    assert sum(dst_spec.group_sizes) == len(dst_spec.block_ids) == len(job.keys)
+    tail_keys = [
+        make_offload_key(b"tail", group.group_idx)
+        for group in scheduler.config.partial_tail_groups
+    ]
+    assert all(key in job.keys for key in tail_keys)
+    # The boundary key belongs to the aligned route only: asking for both would
+    # load two rows into the block at the resume position.
+    boundary = make_offload_key(BlockHash(b"h6"), 0)
+    assert boundary not in job.keys
+    assert scheduler._tail_counts["tail_restored"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+    # Consumed: a second allocation for the same request cannot load it again.
+    assert req_status.tail_resume is None
+    assert req_status.partial_tail_boundary is None
+
+
+def test_a_resume_retried_over_the_same_blocks_is_one_restore():
+    # A deferred lookup is retried, and the retry builds the same load into the
+    # same blocks. The rows are on their way already, so the retry joins them:
+    # counting twice would report a tail restored that was restored once.
+    scheduler, _, record = _tail_resume_layout()
+    dests = {0: [32], 1: [41]}
+
+    assert scheduler.answer_tail_store.start_load(record, dests) is True
+    assert scheduler.answer_tail_store.start_load(record, dests) is True
+    assert scheduler._tail_counts["tail_restored"] == 1
+    # Other blocks are other rows: a second request resuming the same tail needs
+    # its own copy, because the copy lands in the blocks it was allocated.
+    assert scheduler.answer_tail_store.start_load(record, {0: [99]}) is True
+    assert scheduler._tail_counts["tail_restored"] == 2
+
+
+def test_a_resume_the_arena_cannot_fill_is_refused_and_claims_nothing():
+    # The fence is all or nothing, and it is decided before the scheduler
+    # allocates: a resume that loaded some rows would hand the request a state
+    # that is not the one at the position it restarts from, and nothing reports
+    # that. So a row the arena lost costs the request its recompute and nothing
+    # else.
+    scheduler, req_status, record = _tail_resume_layout()
+    lost = scheduler._tail_row_keys[b"tail"][-1]
+    scheduler._forget_in_pool([lost])
+
+    assert scheduler._lookup(req_status) == 28
     assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
+    # The aligned boundary the request proved for itself stands; only the
+    # resume's extra token is gone.
+    assert req_status.tail_resume is None
+    assert req_status.partial_tail_boundary != record.resume_token
+    assert req_status.req.tail_resume is None
+    assert not scheduler._current_batch_load_jobs
+
+
+def test_a_resume_record_of_a_cache_that_is_gone_is_refused():
+    # A reset wipes the prefix cache without asking the tier, and every key the
+    # record names went with it. Honouring one would read rows under keys that
+    # now belong to a different conversation.
+    scheduler, req_status, record = _tail_resume_layout()
+    scheduler._forget_local_cache()
+
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.tail_resume is None
+
+
+def test_a_resume_past_what_the_load_can_reach_is_refused():
+    # A resume the chunks below cannot reach leaves a hole the request believes
+    # computed. The reach is the one the aligned boundary shares, so a tail that
+    # resumes past the last token the request can be given is not this load's.
+    scheduler, req_status, _ = _tail_resume_layout(resume_token=32)
+
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.tail_resume is None
+
+
+def test_a_tail_whose_window_needs_more_rows_than_a_resume_fills_is_refused():
+    # A windowed group's tail costs the window's worth of rows, and a resume has
+    # one destination block for a group. Half a window is the wrong state to
+    # hand back, so that layout is refused by name until a restore can size it.
+    scheduler, req_status, _ = _tail_resume_layout(
+        rows=(make_offload_key(b"tail", 0), make_offload_key(b"other", 0))
+    )
+    scheduler._forget_in_pool([make_offload_key(b"other", 0)])
+    scheduler._note_in_pool([make_offload_key(b"other", 0)])
+
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+
+
+def test_an_aligned_boundary_deeper_than_a_resume_is_kept_and_counts_nothing():
+    # A tail is not a claim to be the deepest hit: where the request's own
+    # chunks prove a boundary as deep, that route is taken and the record costs
+    # nothing, so the counters say no restore happened.
+    scheduler, req_status, record = _tail_resume_layout(resume_token=28)
+
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.tail_resume is None
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+
+
+def test_a_resume_is_refused_for_a_request_that_is_gone():
+    # The record is made while the request is being scheduled and the fence runs
+    # whenever the lookup does; a request that has since finished has no
+    # destination for the rows and no one to read them.
+    scheduler, req_status, _ = _tail_resume_layout()
+    req_status.req.is_finished.return_value = True
+
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.tail_resume is None
 
 
 def test_the_answer_tail_store_is_installed_only_with_the_flag():
