@@ -1432,6 +1432,51 @@ def test_a_tail_store_holds_its_rows_only_for_the_copy():
     assert "tail_pin_leaked" not in scheduler._tail_counts
 
 
+def test_a_local_cache_reset_takes_the_tail_bookkeeping_with_it():
+    """``/reset_prefix_cache`` without ``reset_connector`` wipes the core's
+    block hashes and never asks the connector, and every piece of tail
+    bookkeeping is named after those hashes: a queued offer names blocks the
+    core has forgotten, and the run a tail belongs to, the keys the arena holds
+    and the finished request an offer was keeping alive are all named after keys
+    that no longer exist. The connector's own reset cleared all of it; the
+    point here is that the *local* reset reaches the same surface, because the
+    core tells the tier it offered its tails to."""
+    scheduler, handoff, blocks = _answer_tail_offer()
+    req_status = scheduler._req_status["req"]
+    keys = _tail_keys(handoff, sorted(blocks))
+    scheduler._note_tail_keys(req_status, keys)
+    scheduler._note_in_pool(keys)
+    req_status.finished_signaled = True
+    scheduler._release_finished_request("req")
+    assert scheduler.answer_tail_store.pending and scheduler._tail_offer_holds
+    assert scheduler._tail_run and scheduler._pool_has
+
+    # What the core's registry reset reaches: the tier the tails were offered
+    # to is told once, and the connector's state goes with it.
+    scheduler.answer_tail_store.reset()
+
+    assert not scheduler.answer_tail_store.pending
+    assert not scheduler._tail_offer_holds
+    assert "req" not in scheduler._req_status
+    assert not scheduler._tail_run and not scheduler._run_tails
+    assert not scheduler._pool_has and not scheduler._state_sets
+
+
+def test_a_local_cache_reset_leaves_a_running_request_alone():
+    """A prefix-cache reset cannot free a block a running request holds, so the
+    keys its chunks are named after survive it. Dropping that state would make
+    the request re-offer chunks the arena already holds, and the reset is not
+    allowed to cost that."""
+    scheduler, handoff, blocks = _answer_tail_offer()
+    req_status = scheduler._req_status["req"]
+    keys = _tail_keys(handoff, sorted(blocks))
+    scheduler._note_in_pool(keys)
+
+    scheduler.answer_tail_store.reset()
+
+    assert scheduler._req_status["req"] is req_status
+
+
 def test_a_tail_pin_left_by_a_shutdown_is_released():
     # No completion arrives for a job the engine never finished, and the pool
     # does not release a client's pins when the client goes away: releasing here

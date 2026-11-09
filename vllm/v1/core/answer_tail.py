@@ -85,6 +85,13 @@ class AnswerTailRegistry:
         # and written, so the offer has to go with the key. ``AnswerTail``
         # installs it, because that is where the store lives.
         self.forget_hook: Callable[[BlockHashWithGroupId], None] | None = None
+        # Optional hook for the tier a tail was offered to, called when the
+        # whole prefix cache goes. A tier keyed on that cache cannot outlive it
+        # knowing anything about it, and a reset does not run the per-key hook:
+        # it drops the index in one step, so the tier has to be told once, in
+        # the same step, or it keeps bookkeeping for a cache it no longer
+        # shares a key space with.
+        self.reset_hook: Callable[[], None] | None = None
 
     def register(
         self,
@@ -144,9 +151,13 @@ class AnswerTailRegistry:
         return block.block_id in self.hashes_by_block
 
     def clear(self) -> None:
-        """Drop the registry together with the prefix cache it belongs to."""
+        """Drop the registry together with the prefix cache it belongs to, and
+        tell the tier the tails were offered to that its key space is gone."""
         self.hashes_by_block.clear()
         self.lengths_by_parent.clear()
+        hook = self.reset_hook
+        if hook is not None:
+            hook()
 
 
 class AnswerTail:
@@ -177,10 +188,18 @@ class AnswerTail:
         # when it runs, so the connector installing its own store later is
         # seen. The null store's ``forget_tail`` does nothing.
         block_pool.answer_tail.forget_hook = self._forget_from_store
+        # A reset of the prefix cache drops the registry in one step, so the
+        # per-key hook never runs: the tier is told once, here, and the only
+        # thing it can honestly do is forget everything keyed on this cache.
+        block_pool.answer_tail.reset_hook = self._reset_store
 
     def _forget_from_store(self, tail_key: BlockHashWithGroupId) -> None:
         """Tell the store that the GPU no longer holds a tail's key."""
         self.store.forget_tail(tail_key)
+
+    def _reset_store(self) -> None:
+        """Tell the store that the prefix cache it was keyed on is gone."""
+        self.store.reset()
 
     @staticmethod
     def validate_groups(coordinator: HybridKVCacheCoordinator) -> None:

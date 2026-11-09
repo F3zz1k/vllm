@@ -912,7 +912,9 @@ class OffloadingConnectorScheduler:
         # route is this connector: arena rows come from the offloading manager
         # and bytes move only in a worker's transfer job, so the core cannot
         # store a tail and the notifier is all the seam it gets.
-        self.answer_tail_store = AnswerTailNotifier(self._count_tail_event)
+        self.answer_tail_store = AnswerTailNotifier(
+            self._count_tail_event, self._forget_local_cache
+        )
         # Requests an answer-tail offer is keeping in _req_status after their
         # release, so the state goes the step the offer leaves the queue.
         self._tail_offer_holds: set[ReqId] = set()
@@ -3429,8 +3431,10 @@ class OffloadingConnectorScheduler:
         """
         store_jobs: dict[int, TransferJob] = {}
         if not self.config.enable_partial_tail_offload:
-            # Nothing here can serve them, and no counter may be emitted.
-            self.answer_tail_store.reset()
+            # Nothing here can serve them, and no counter may be emitted. The
+            # offers go; what this connector believes about the pool does not,
+            # because nothing about the pool changed.
+            self.answer_tail_store.discard_offers()
             return store_jobs
         # Before this step's offers: a request an earlier offer was holding is
         # released the step its offer stops being queued, for any reason.
@@ -4559,6 +4563,29 @@ class OffloadingConnectorScheduler:
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
 
+    def _forget_local_cache(self) -> None:
+        """The prefix cache these keys live in is gone.
+
+        Reached from the core's own reset through the answer tail's store hook,
+        and from the connector's full reset on its way through the notifier.
+        Everything dropped here is bookkeeping named after GPU block hashes the
+        core has just forgotten: which keys are tails and which run owns them,
+        which rows the band believes the arena holds and which boundaries those
+        rows make restorable, the offers still queued, and the finished requests
+        an offer was keeping alive. What stays is the state of requests that are
+        still running, whose blocks the core cannot have freed, and the arena
+        itself, which a local cache wipe does not touch.
+        """
+        # A held request was held for its offer; with the offer gone it is held
+        # for nothing. Only a signalled request is ever held, so releasing it
+        # here cannot skip the on_request_finished the full reset owes.
+        for req_id in list(self._tail_offer_holds):
+            self._release_finished_request(req_id)
+        self._tail_run.clear()
+        self._run_tails.clear()
+        self._pool_has.clear()
+        self._state_sets.clear()
+
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored chunks."""
         # reset_cache cannot be called in the middle of a schedule step
@@ -4579,7 +4606,6 @@ class OffloadingConnectorScheduler:
         # Reset offloading manager cache
         self._release_tail_pins()
         self.answer_tail_store.reset()
-        self._tail_offer_holds.clear()
         self.manager.reset_cache()
 
         # Reset store progress so active requests re-offload from chunk 0.
@@ -4601,11 +4627,6 @@ class OffloadingConnectorScheduler:
         self._wb_submitted.clear()
         self._wb_rescue.clear()
         self._flush_jobs.clear()
-        self._pool_has.clear()
-        self._state_sets.clear()
-        self._tail_run.clear()
-        self._run_tails.clear()
-        self._tail_pinned.clear()
         self._jobs.clear()
         self._block_id_to_pending_jobs.clear()
 

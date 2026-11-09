@@ -298,15 +298,37 @@ def test_reset_prefix_cache_clears_the_tail_registry():
         assert pool.get_cached_block(tail, [group_id]) is None
 
 
+def test_a_prefix_cache_reset_tells_the_tier_keyed_on_it():
+    """A tier that keeps tails by key cannot outlive the cache those keys come
+    from, and a reset drops the registry in one step rather than key by key, so
+    the per-key forget never runs. Without one reset call the tier keeps
+    bookkeeping for a cache it no longer shares a key space with: a queue of
+    offers naming blocks the core has forgotten, and beliefs about rows whose
+    keys nothing can name again. The hole is only visible through a bound tier,
+    because the core's own store is the one that is told."""
+    manager = _manager()
+    store = _RecordingTailStore()
+    manager.answer_tail.store = store
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    _run_to_finish(manager, finished, OUTPUT)
+    assert store.resets == 0
+
+    assert manager.block_pool.reset_prefix_cache() is True
+
+    assert store.resets == 1
+
+
 class _RecordingTailStore(NullAnswerTailStore):
     """The tier a finished turn's tails are offered to, keeping the keys it was
-    told the GPU forgot and the rows it was offered per group. The store side
-    of the seam is tested with the store that actually serves it; here only the
-    reach of the registry's forget and what the core hands over."""
+    told the GPU forgot, the rows it was offered per group, and whether it was
+    told the prefix cache it was keyed on is gone. The store side of the seam
+    is tested with the store that actually serves it; here only the reach of the
+    registry's forget and what the core hands over."""
 
     def __init__(self) -> None:
         self.forgotten: list[BlockHashWithGroupId] = []
         self.offered: list[tuple[int, list[int]]] = []
+        self.resets = 0
 
     def store_tail(
         self, handoff: AnswerTailHandoff, group_id: int, block_ids: list[int]
@@ -316,6 +338,9 @@ class _RecordingTailStore(NullAnswerTailStore):
 
     def forget_tail(self, tail_key: BlockHashWithGroupId) -> None:
         self.forgotten.append(tail_key)
+
+    def reset(self) -> None:
+        self.resets += 1
 
 
 def test_a_tail_the_gpu_forgot_reaches_the_store_it_was_offered_to():

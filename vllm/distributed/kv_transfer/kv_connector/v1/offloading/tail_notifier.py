@@ -48,13 +48,23 @@ class AnswerTailNotifier(AnswerTailStore):
     """The queue the engine core hands a finished turn's tail to."""
 
     def __init__(
-        self, report: Callable[[str, int], bool], max_offers: int = _MAX_OFFERS
+        self,
+        report: Callable[[str, int], bool],
+        on_reset: Callable[[], None],
+        max_offers: int = _MAX_OFFERS,
     ) -> None:
         """``report`` is the connector's tail reporter: the refusals this object
         makes on the load side have to reach /metrics through the same predicate
         every other tail event is counted by, including the rule that a flag-off
-        deployment reports nothing at all."""
+        deployment reports nothing at all.
+
+        ``on_reset`` is the connector's own reset step. This queue is not the
+        only thing keyed on the prefix cache: the connector remembers which keys
+        are tails, which run owns them and which rows it believes the arena
+        holds, and a reset of that cache takes those facts with it whether or
+        not the queue happened to hold anything."""
         self.report = report
+        self.on_reset = on_reset
         self.pending: OrderedDict[tuple[str, bytes], TailOffer] = OrderedDict()
         self._max_offers = max_offers
 
@@ -167,7 +177,16 @@ class AnswerTailNotifier(AnswerTailStore):
         return None
 
     def reset(self) -> None:
-        """The prefix cache is being wiped: nothing queued survives it."""
+        """The prefix cache is being wiped: nothing queued survives it, and the
+        connector's bookkeeping over that cache goes in the same step, from the
+        same call, whichever way the reset was asked for."""
+        self.pending.clear()
+        self.on_reset()
+
+    def discard_offers(self) -> None:
+        """Drop the queue and nothing else. The connector's own view of the
+        cache is not in question here, so a caller that cannot serve the offers
+        it holds still believes what it believed about the pool."""
         self.pending.clear()
 
     def shutdown(self) -> None:
