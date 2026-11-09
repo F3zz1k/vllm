@@ -261,3 +261,51 @@ restore against one pool, one conversation asking twice, so the refused key is a
 a later load and the finish route's key is present.
 
 decided
+## 8. The marker positive control, and why it needs an arena it does not have yet
+
+Phase 2 commit 5 was to be the per-group marker positive control that `gpu-gate-1.md`
+section 7.2 asks for: seed each group's tail block with a distinguishable payload, run the
+store, read the rows back, and require group g's row to carry g's payload byte for byte. It
+is not written, and the reason is worth keeping because it decides the shape of the test.
+
+**What the control has to prove.** Not that a row round-trips, which the pool already
+proves, but that the connector paired the right source block with the right destination row
+for each group. A permutation of the groups that is applied to both the store and the load
+is invisible to every assertion the connector tests make today: the key set matches, the
+row count matches, `group_sizes` sums to the number of keys, and the tail restores a state
+that is one group's state standing in for another's. Nothing downstream can see it, because
+a recurrent state carries no group label. That is the residual the note says byte equality
+never closed, and it is why the control must be payload-level rather than key-level.
+
+**Why the connector's suite cannot host it.** The byte copy lives in a worker between a GPU
+block and an arena row, and `tests/v1/kv_connector/unit/offloading_connector/` runs against
+`MockOffloadingSpec`. Its manager returns rows from `_cpu_store_output`, which hands back
+`CPULoadStoreSpec(range(len(keys)))`: row numbers, not a buffer. There is no memory on
+either side of that job to seed and read, so a test there can assert the pairing of a key to
+a row number, which is what `_assert_one_row_per_key` already does, and cannot assert where
+a byte went. Writing a payload into a mock is the tautology the note warns about.
+
+**What it does need.** The shared arena has the bytes. `tests/v1/kv_offload/shared_pool/`
+builds an `Arena` over a real `mmap` and its tests already write and read payload through
+`arena.mm[row * ROW:(row + 1) * ROW]`, so the destination side is genuinely there. The
+missing half is the source: the arena is given rows to allocate, and the bytes that reach
+them come from a GPU block the CPU tests have no equivalent of. The control therefore needs
+a second buffer standing in for GPU memory, a copy that walks the *job's own* source and
+destination specs rather than the test's own knowledge of the layout, and the tail keys of a
+store the connector built, so that the pairing under test is the connector's and not one the
+test wrote down. Those three pieces do not exist together anywhere yet.
+
+**The shape to build, when it is built.** One arena over a real `mmap` with a class whose row
+size matches the group stride, a byte array standing in for the GPU blocks, a tail store
+built by `OffloadingConnectorScheduler._answer_tail_store_job` rather than by hand, a copy
+loop that reads `job.src_spec.block_ids` and `job.dst_spec.block_ids` in the order the
+transfer layer will read them, and one assertion per group: the row the arena now holds under
+`make_offload_key(tail_hash, g)` carries the payload that was written into group g's block,
+and no payload that belongs to any other group. The failure it must catch is the one the
+existing suite cannot express: every count right, every key present, and group 1's state
+sitting in group 2's row.
+
+**What is not a substitute.** Byte equality between two runs, which `gpu-gate-1.md` section
+7.1 records as unproven for a finish checkpoint and section 7.2 replaces; key-level pairing
+assertions, which a common permutation passes; and a per-group row count, which is section 6
+and says nothing about which row is whose.
