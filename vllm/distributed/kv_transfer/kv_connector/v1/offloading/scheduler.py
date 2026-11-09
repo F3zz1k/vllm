@@ -1368,9 +1368,11 @@ class OffloadingConnectorScheduler:
         self._run_by_group.pop(tag, None)
         self._run_extras.pop(tag, None)
         # A tail leaves when its run leaves: the band stops offering it, and no
-        # later store of another run takes it along.
+        # later store of another run takes it along. The ownership and the rows
+        # it indexes go together: the eviction feed reaches a tail only through
+        # _tail_run, so a record left behind would be one no cleaner can find.
         for key in self._run_tails.pop(tag, ()):
-            self._tail_run.pop(key, None)
+            self._forget_tail_key(key)
         if old is not None:
             for key in old:
                 if self._key_run.get(key) == tag:
@@ -1496,7 +1498,10 @@ class OffloadingConnectorScheduler:
     def _note_tail_keys(
         self, req_status: "RequestOffloadState", keys: Iterable[OffloadKey]
     ) -> None:
-        """Record the keys a tail store wrote and the run that owns them.
+        """Record the tail keys the band knows and the run that owns them.
+
+        Both routes that come to know a tail's rows come here: the store that
+        wrote them, and the fence that found them in the arena.
 
         A tail belongs to a run, not to a session: the run is named after the
         request's last full-attention chunk key, and a tail leaves when that run
@@ -2785,10 +2790,17 @@ class OffloadingConnectorScheduler:
             return self._refuse_tail_resume(req_status, record.resume_token, detail)
         if bytes(record.tail_key) not in self._tail_row_keys:
             # The arena holds them, so which rows they are is now known here as
-            # well as there, and the eviction feed drops both records if one of
-            # them leaves. A grant was never made on a belief nobody confirmed:
-            # this is the confirmation, and the mirror is marked on the arena's
-            # answer, the same way a tail the pool already held is marked.
+            # well as there, and the record is taken on the way a store takes
+            # one: owned by a run, because the eviction feed reaches a tail only
+            # through _tail_run and a mirror written without that ownership
+            # would outlive every cleaner, keep answering for rows the arena
+            # dropped and count nothing when they left. Every row a re-learn
+            # names is keyed by the tail's own hash, so any one of them reaches
+            # the whole record. A grant was never made on a belief nobody
+            # confirmed: this is the confirmation, and the mirror is marked on
+            # the arena's answer, the same way a tail the pool already held is
+            # marked.
+            self._note_tail_keys(req_status, rows)
             self._tail_row_keys[bytes(record.tail_key)] = rows
             self._note_in_pool(rows)
         return record

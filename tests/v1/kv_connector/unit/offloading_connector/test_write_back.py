@@ -1078,12 +1078,17 @@ def test_a_tail_key_is_never_offered_as_a_whole_run_state(band):
 
 def test_a_tail_leaves_when_its_run_leaves():
     # A tail belongs to a run, not to a session: the band forgets it the step
-    # the run is dropped, so no later run picks up a tail it cannot write.
+    # the run is dropped, so no later run picks up a tail it cannot write. The
+    # rows it was written as go with the ownership, not after it: the eviction
+    # feed reaches a tail only through _tail_run, so a record left behind would
+    # be one no cleaner could ever find.
     scheduler, _, keys, run = _stored_tail()
     assert run is not None and scheduler._run_tails[run] == keys
+    assert scheduler._tail_row_keys
     scheduler._drop_run(run)
     assert run not in scheduler._run_tails
     assert not [k for k in keys if k in scheduler._tail_run]
+    assert not scheduler._tail_row_keys
 
 
 def test_a_tail_the_pool_evicted_is_counted_and_forgotten(band_with_tails):
@@ -2248,6 +2253,62 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
         num_tokens=30,
         generation=scheduler._cache_generation,
     )
+    assert scheduler._lookup(req_status) == 28
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+
+
+def test_a_tail_relearned_at_the_fence_leaves_when_the_pool_evicts_a_row():
+    """A tail the fence re-learns has to be owned the way a stored tail is. The
+    eviction feed reaches a tail only through ``_tail_run``, so a mirror written
+    without that ownership could never be dropped, would keep answering for rows
+    the arena had dropped, and would count nothing when they left."""
+    scheduler, req_status, record = _tail_resume_layout()
+    rows = scheduler._tail_row_keys[b"tail"]
+
+    # What a restart looks like to the band: its own records are gone, and the
+    # arena still holds every row.
+    scheduler.answer_tail_store.reset()
+    assert not scheduler._tail_row_keys and not scheduler._pool_has
+    req_status.req.tail_resume = AnswerTailHit(
+        tail_key=BlockHash(b"tail"),
+        resume_token=record.resume_token,
+        group_block_ids={},
+        num_tokens=record.num_tokens,
+        generation=scheduler._cache_generation,
+    )
+
+    assert scheduler._lookup(req_status) == record.resume_token
+    assert scheduler._tail_row_keys[b"tail"] == rows
+    # Owned, the way the store route owns a tail: the resuming request is
+    # replaying the run the tail belongs to, and it has keyed chunks of it.
+    assert all(key in scheduler._tail_run for key in rows)
+    assert all(key in scheduler._pool_has for key in rows)
+    assert scheduler._tail_counts["tail_run_missing"] == 0
+
+    # The arena drops one row of the tail and the feed says so.
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.MISS if key == rows[0] else LookupResult.HIT
+    )
+    scheduler.manager.pool_evicted = MagicMock(return_value=([rows[0]], False))
+    scheduler._note_pool_evictions()
+
+    assert b"tail" not in scheduler._tail_row_keys
+    assert rows[0] not in scheduler._pool_has and rows[0] not in scheduler._tail_run
+    assert scheduler._tail_counts["tail_evicted"] == 1
+    # And the band is honest about it either way: the tier no longer answers for
+    # this tail, and the fence refuses over the arena's own answer rather than
+    # over a record nothing can clean.
+    groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
+    assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups) is None
+    req_status.req.tail_resume = AnswerTailHit(
+        tail_key=BlockHash(b"tail"),
+        resume_token=record.resume_token,
+        group_block_ids={},
+        num_tokens=record.num_tokens,
+        generation=scheduler._cache_generation,
+    )
+
     assert scheduler._lookup(req_status) == 28
     assert scheduler._tail_counts["tail_restore_granted"] == 1
     assert scheduler._tail_counts["tail_restore_refused"] == 1
