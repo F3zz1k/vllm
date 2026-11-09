@@ -88,11 +88,27 @@ def _queue_ids(pool: FakeGPUPool) -> list[int]:
 
 @pytest.fixture
 def band(monkeypatch):
+    return _make_band(monkeypatch)
+
+
+@pytest.fixture
+def band_with_tails(monkeypatch):
+    """The band with `enable_partial_tail_offload` on. A tail key reaches the
+    band's view only through the tail store route, which the flag gates, so a
+    test that counts what the band does with a tail key has to run here: on the
+    flag-off band that state cannot exist, and the flag's one counting predicate
+    reports nothing, as it must."""
+    return _make_band(monkeypatch, partial_tail_offload=True)
+
+
+def _make_band(monkeypatch, partial_tail_offload: bool = False):
     monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
     monkeypatch.setattr(sched_mod, "WRITE_BACK_SCAN", 8)
     monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 4)
     monkeypatch.setattr(sched_mod, "WRITE_BACK_FREE_SHARE", 1.0)
-    scheduler = _make_partial_tail_scheduler()
+    scheduler = _make_partial_tail_scheduler(
+        partial_tail_offload=partial_tail_offload
+    )
     chunk = scheduler.config.kv_group_configs[0].tokens_per_chunk
     group = scheduler.config.kv_group_configs[0].group_idx
     blocks = [KVCacheBlock(i) for i in range(1, 7)]
@@ -1050,10 +1066,10 @@ def test_a_tail_leaves_when_its_run_leaves():
     assert not [k for k in keys if k in scheduler._tail_run]
 
 
-def test_a_tail_the_pool_evicted_is_counted_and_forgotten(band):
+def test_a_tail_the_pool_evicted_is_counted_and_forgotten(band_with_tails):
     # A tail has no GPU hash to be re-offered from, so the pool's eviction feed
     # is the only way the band learns the arena dropped it.
-    scheduler, pool, blocks = band
+    scheduler, pool, blocks = band_with_tails
     tag = OffloadKey(bytes(blocks[5].block_hash))
     tail = _hkey(7, 1)
     scheduler._tail_run[tail] = tag
