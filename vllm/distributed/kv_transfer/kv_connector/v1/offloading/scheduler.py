@@ -3653,6 +3653,11 @@ class OffloadingConnectorScheduler:
             return store_jobs
         for offer in offers:
             job = self._answer_tail_store_job(offer)
+            if job is None:
+                # Recorded, not copied: the arena already held the rows, so no
+                # job is holding this request's state for a completion.
+                self._release_finished_request(offer.handoff.request_id)
+                continue
             if not isinstance(job, TailStoreRefusal):
                 job_id, store_job = job
                 store_jobs[job_id] = store_job
@@ -3715,9 +3720,10 @@ class OffloadingConnectorScheduler:
 
     def _answer_tail_store_job(
         self, offer: TailOffer
-    ) -> tuple[int, TransferJob] | TailStoreRefusal:
+    ) -> tuple[int, TransferJob] | TailStoreRefusal | None:
         """Build the one store job an answer tail needs, or a refusal naming
-        why nothing was reserved.
+        why nothing was reserved. None when the tail is recorded and needs no
+        copy, because the arena already holds every row of it.
 
         A tail is stored as the finished turn's state at the tail, one row per
         group whose state there is one block and the window's worth of rows per
@@ -3789,22 +3795,29 @@ class OffloadingConnectorScheduler:
         # the keys it already holds, so taking the rows in that same order
         # pairs each row with the block its key names.
         accepted = [row for row in rows if row.key in store_output.keys_to_store]
-        if not accepted:
-            # The pool holds every tail row already: nothing was written and
-            # nothing was lost, but there is no job to hand over.
-            return TailStoreRefusal("keys_already_resident")
 
         # Record the tail before the job can complete: on completion the band
         # must believe the pool holds these keys without reading them as the
         # state of a chunk boundary. Only the tail's own keys are tails: a
         # window row's key is the key its block owns, and a block the band
         # could copy later must stay copyable.
-        self._note_tail_keys(req_status, [row.key for row in accepted if row.is_tail])
+        self._note_tail_keys(req_status, [row.key for row in rows if row.is_tail])
         # What a restore has to read, indexed by the one key a resume can name.
         # Every row counts, including the ones the pool already held, because a
         # restore is granted over the whole tail or not at all and a window row
         # the arena dropped leaves a state no resume should be handed.
         self._tail_row_keys[bytes(handoff.tail_hash)] = tuple(row.key for row in rows)
+        if not accepted:
+            # The arena holds every row of this tail, so there is no copy to
+            # run and no job to hand over. It is still a store as far as the
+            # band is concerned: a re-offer is the only way the band relearns
+            # residency after its own view of the pool was dropped, and a tail
+            # the band forgot while the arena kept it is one no resume can ever
+            # be granted for again. The pool's own answer is what the mirror is
+            # corrected with, and the tail is counted as stored, not refused.
+            self._note_in_pool([row.key for row in rows])
+            self._count_tail_event("tail_stored")
+            return None
         # No KV event here, unlike the aligned tail stores: a self-describing
         # event describes the hash-aligned prefix of one physical block, and an
         # answer tail is neither aligned nor a prefix of anything. A tail key is

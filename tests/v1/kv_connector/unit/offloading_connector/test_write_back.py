@@ -1951,6 +1951,91 @@ def test_a_resume_is_refused_for_a_request_that_is_gone():
     assert req_status.tail_resume is None
 
 
+def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
+    """The bench's own sequence, end to end: store a tail, a bare
+    ``/reset_prefix_cache``, the turn replayed and its tail offered again, then
+    a later resume. The arena already holds the rows, so the re-offer takes none
+    of them back; unless that counts as a store the band records, the reset
+    dropped the rows a restore is granted over and the tail can never be
+    resumed again for as long as the arena keeps holding it."""
+    # The band's view of the pool is what a restore is pre-filtered on, and the
+    # completion path is what fills it, so the run is the one a rig does.
+    monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(scheduler, num_prompt_tokens=32)
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    handoff = AnswerTailHandoff(
+        request_id="req",
+        tail_hash=BlockHash(b"tail"),
+        parent=None,
+        length=12,
+        resume_token=29,
+    )
+    blocks = {
+        group.group_idx: [
+            100 + 10 * group.group_idx + row
+            for row in range(group.tail_rows)
+        ]
+        for group in scheduler.config.partial_tail_groups
+    }
+
+    def offer() -> None:
+        for group_idx, block_ids in blocks.items():
+            assert scheduler.answer_tail_store.store_tail(
+                handoff, group_idx, block_ids
+            )
+
+    offer()
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
+    )
+    jobs = scheduler._build_answer_tail_store_jobs()
+    _assert_one_row_per_key(scheduler, jobs)
+    [job_id] = jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+    rows = scheduler._tail_row_keys[bytes(handoff.tail_hash)]
+    assert rows and all(key in scheduler._pool_has for key in rows)
+    assert scheduler._tail_counts["tail_stored"] == 1
+
+    # The bare reset: the core's hashes go, and the connector's record of which
+    # rows the arena holds is named after them.
+    scheduler.answer_tail_store.reset()
+    assert not scheduler._tail_row_keys and not scheduler._pool_has
+
+    # The replayed turn finishes at the same tail and offers it again. The arena
+    # holds every row, so its answer names none to write.
+    offer()
+    scheduler.manager.prepare_store_run = MagicMock(
+        return_value=PrepareStoreOutput(
+            keys_to_store=[], store_spec=CPULoadStoreSpec([]), evicted_keys=[]
+        )
+    )
+    assert not scheduler._build_answer_tail_store_jobs()
+    assert scheduler._tail_row_keys[bytes(handoff.tail_hash)] == rows
+    assert all(key in scheduler._pool_has for key in rows)
+    assert scheduler._tail_counts["tail_stored"] == 2
+
+    # A later resume of the same conversation is granted again.
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    request.tail_resume = AnswerTailHit(
+        tail_key=BlockHash(b"tail"),
+        resume_token=29,
+        group_block_ids={},
+        num_tokens=30,
+        generation=scheduler._cache_generation,
+    )
+    assert scheduler._lookup(req_status) == 29
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+
+
 def test_the_answer_tail_store_is_installed_only_with_the_flag():
     # The core offers a tail to whatever store its answer tail holds, so the
     # install is the seam a flag-off deployment must not cross.
@@ -1983,6 +2068,8 @@ def test_an_offered_answer_tail_is_inert_without_the_flag():
     scheduler.manager.prepare_store_run.assert_not_called()
     assert dict(scheduler._tail_counts) == {}
     assert scheduler.answer_tail_store.pending == {}
+    # The record a re-offer of a resident tail writes is written nowhere here.
+    assert not scheduler._tail_row_keys and not scheduler._pool_has
 
     hit = AnswerTailHit(
         tail_key=handoff.tail_hash,
