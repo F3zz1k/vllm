@@ -261,12 +261,16 @@ restore against one pool, one conversation asking twice, so the refused key is a
 a later load and the finish route's key is present.
 
 decided
-## 8. The marker positive control, and why it needs an arena it does not have yet
+## 8. The marker positive control, and the arena it needed
 
 Phase 2 commit 5 was to be the per-group marker positive control that `gpu-gate-1.md`
 section 7.2 asks for: seed each group's tail block with a distinguishable payload, run the
 store, read the rows back, and require group g's row to carry g's payload byte for byte. It
-is not written, and the reason is worth keeping because it decides the shape of the test.
+exists now, at `b9229c8512`, as the last section of
+`tests/v1/kv_connector/unit/offloading_connector/test_write_back.py`: one mmap-backed arena,
+the positive control and three injected faults, with the review's P2 batch at `4c780f241d`
+adding the fourth fault and pinning the boundaries the harness had assumed. Why it could
+not be written then is worth keeping, because it decides the shape it has.
 
 **What the control has to prove.** Not that a row round-trips, which the pool already
 proves, but that the connector paired the right source block with the right destination row
@@ -277,6 +281,32 @@ that is one group's state standing in for another's. Nothing downstream can see 
 a recurrent state carries no group label. That is the residual the note says byte equality
 never closed, and it is why the control must be payload-level rather than key-level.
 
+**What it proves.** Each group's payload is seeded into the GPU block the core's offer
+names, stored through the job `_build_answer_tail_store_jobs` builds, and read back through
+the job `update_state_after_alloc` builds, into a destination buffer the harness holds. Both
+legs are the product's own jobs, the arena answers for every row, and rows are addressed
+through the server's own `LayoutClass.offset`, so what is proved is which block id is paired
+with which arena row for every group, in bytes. That covers the residual above, a
+permutation applied to both legs alike, because the expectation is anchored to the arena's
+key-to-row index and not to a comparison between the legs: a permutation is wrong on the
+store side before it can be consistent anywhere.
+
+**What it does not reach.** The GPU tensors and the fragment walk under the two specs
+(`gpu_worker.py:700-770`) are stood in for by `_StandInBlocks` and
+`_copy_as_the_worker_would`, a CPU transcription that pairs by position, so the control says
+nothing about the CUDA copy engine, the per-layer page layout, or the bytes inside a row.
+Three limits follow from that and are disclosed in the test's own section text rather than
+argued away. The drafter exemption leaves this fixture two tail groups, so the permutation
+the control can express is a swap of two, and the faults injected differ by path (a store
+swap, a restore swap, a row left unwritten, a tail row copied twice into a chunk block);
+a layout with three tail groups would widen that space and has no control here. A windowed
+group costs the window's worth of rows and the fence refuses a resume whose tail holds more
+than one row for a group, so no multi-row restore control is reachable: one row per group is
+all a resume has a destination for. And every group's row is the same harness-chosen
+`ROW_BYTES`, while a `group_sizes` that preserves the flat order pairs the same rows in this
+transcription and in the worker because both partition on that one field, so a wrong
+per-group row size and that whole `group_sizes` class are blind here by construction.
+
 **Why the connector's suite cannot host it.** The byte copy lives in a worker between a GPU
 block and an arena row, and `tests/v1/kv_connector/unit/offloading_connector/` runs against
 `MockOffloadingSpec`. Its manager returns rows from `_cpu_store_output`, which hands back
@@ -285,17 +315,18 @@ either side of that job to seed and read, so a test there can assert the pairing
 a row number, which is what `_assert_one_row_per_key` already does, and cannot assert where
 a byte went. Writing a payload into a mock is the tautology the note warns about.
 
-**What it does need.** The shared arena has the bytes. `tests/v1/kv_offload/shared_pool/`
+**What it needed.** The shared arena has the bytes. `tests/v1/kv_offload/shared_pool/`
 builds an `Arena` over a real `mmap` and its tests already write and read payload through
 `arena.mm[row * ROW:(row + 1) * ROW]`, so the destination side is genuinely there. The
 missing half is the source: the arena is given rows to allocate, and the bytes that reach
-them come from a GPU block the CPU tests have no equivalent of. The control therefore needs
+them come from a GPU block the CPU tests have no equivalent of. The control therefore needed
 a second buffer standing in for GPU memory, a copy that walks the *job's own* source and
 destination specs rather than the test's own knowledge of the layout, and the tail keys of a
 store the connector built, so that the pairing under test is the connector's and not one the
-test wrote down. Those three pieces do not exist together anywhere yet.
+test wrote down. Those three pieces did not exist together anywhere then, and the section's
+last two paragraphs are the shape they took.
 
-**The shape to build, when it is built.** One arena over a real `mmap` with a class whose row
+**The shape that was built.** One arena over a real `mmap` with a class whose row
 size matches the group stride, a byte array standing in for the GPU blocks, a tail store
 built by `OffloadingConnectorScheduler._answer_tail_store_job` rather than by hand, a copy
 loop that reads `job.src_spec.block_ids` and `job.dst_spec.block_ids` in the order the
