@@ -1001,14 +1001,18 @@ def test_a_pinned_alias_block_without_its_own_hash_is_released(band, monkeypatch
 # --- a tail key in the band's view ---
 
 
-def _assert_one_row_per_key(scheduler, jobs):
+def _assert_one_row_per_key(scheduler, jobs, load: bool = False):
     """The invariant the transfer layer pairs on: the per-group split of a
     store's keys, the GPU blocks it reads, and the keys themselves are the same
     size. A store whose split does not add up to its keys mis-pairs rows with
-    GPU blocks, the phase-1 P0 class."""
+    GPU blocks, the phase-1 P0 class. A restore pairs on the same invariant, and
+    there the GPU side is the destination, so ``load`` names which spec carries
+    the split.
+    """
     for job_id, job in jobs.items():
         keys = scheduler._jobs[job_id].keys
-        assert sum(job.src_spec.group_sizes) == len(job.src_spec.block_ids) == len(keys)
+        gpu_spec = job.dst_spec if load else job.src_spec
+        assert sum(gpu_spec.group_sizes) == len(gpu_spec.block_ids) == len(keys)
 
 
 def _stored_tail():
@@ -2181,13 +2185,24 @@ def test_an_offered_answer_tail_is_inert_without_the_flag():
 # state, because a recurrent state carries no group label. That is the residual
 # byte equality never closed (gpu-gate-1.md 7.2, key-contract.md 8).
 #
-# Two things here stand in for something else, and the claim stops at each.
+# Three things here stand in for something else, and the claim stops at each.
 # The copy is the CPU transcription of the worker's per-group walk
 # (``SingleDirectionOffloadingHandler.transfer_async``), so what is under test
 # is the pairing the job's two specs carry, not the CUDA copy engine or the
 # per-layer page layout below it. And the rows a restore reads that are not the
 # tail's own, the conversation's chunk rows, are seeded by the harness because
-# no producer ran here; every tail row is the store's, end to end.
+# no producer ran here; every tail row is the store's, end to end. And the
+# consumer restores over the producer's store record, which only the engine
+# that stored the tail ever writes, so that one record stands in for a store
+# this consumer did not run.
+#
+# What the control cannot see, by construction, is disclosed rather than
+# claimed: every group's row is the same harness-chosen ROW_BYTES, so a wrong
+# per-group row size is invisible here, and a ``group_sizes`` that preserves the
+# flat order, [2, 0] where [1, 1] is right, pairs the same rows in this copy and
+# in the worker because both partition by that same field. In production such a
+# value lands in the wrong byte plan; here the two sides move together, so no
+# fault of that class can show up as a mismatch.
 
 ROW_BYTES = 1024
 ARENA_SUPERPAGES = 16
@@ -2390,6 +2405,7 @@ def _copy_as_the_worker_would(
     gpu_to_cpu: bool,
     swap_groups: tuple[int, int] | None = None,
     skip_groups: tuple[int, ...] = (),
+    dup_row_into: tuple[int, int] | None = None,
 ) -> None:
     """Move the bytes one transfer job names, reading nothing but the job's own
     two specs.
@@ -2399,8 +2415,12 @@ def _copy_as_the_worker_would(
     tail gate requires, that is one arena row per block. This is the CPU
     stand-in for that walk: it pairs by position alone, so rows that sit in the
     wrong group's run move the wrong bytes here exactly as they would there.
-    ``swap_groups`` and ``skip_groups`` are the deliberate faults the mutation
-    tests inject, and neither moves a count.
+    ``swap_groups``, ``skip_groups`` and ``dup_row_into`` are the deliberate
+    faults the mutation tests inject, and none of them moves a count.
+    ``dup_row_into=(group, position)`` repeats a group's last source row at an
+    earlier position of its own run, which for a tail group is the row its tail
+    key names: the destination block at that position is a chunk block, so the
+    fault parks a tail row where a chunk row belongs.
     """
     gpu_spec = job.src_spec if gpu_to_cpu else job.dst_spec
     cpu_spec = job.dst_spec if gpu_to_cpu else job.src_spec
@@ -2410,6 +2430,14 @@ def _copy_as_the_worker_would(
         first, second = swap_groups
         assert len(runs[first]) == len(runs[second]), "not a like-for-like swap"
         runs[first], runs[second] = runs[second], runs[first]
+    if dup_row_into is not None:
+        group_idx, position = dup_row_into
+        run = runs[group_idx]
+        assert 0 <= position < len(run) - 1, (
+            f"position {position} is not a chunk position in group {group_idx}'s run"
+        )
+        assert run[position] != run[-1], "the fault repeats a row already there"
+        run[position] = run[-1]
     cpu_ids = [block for run in runs for block in run]
     assert len(cpu_ids) == len(gpu_ids)
     offset = 0
@@ -2449,18 +2477,34 @@ def _marker_round_trip(
     store_swap: tuple[int, int] | None = None,
     store_skip: tuple[int, ...] = (),
     load_swap: tuple[int, int] | None = None,
+    load_dup: tuple[int, int] | None = None,
 ) -> tuple[dict[int, bytes], dict[int, bytes]]:
     """One tail stored into a real arena by one engine and restored out of it by
     the next, and what each group's row carries at the end.
 
     Returns the bytes of each group's arena row, by group, and the bytes of
-    every destination block the restore filled, by block id. The last three
+    every destination block the restore filled, by block id. The last four
     arguments are the injected faults: a swap or a skip applied to the store's
-    rows, or a swap applied to the restore's.
+    rows, or a swap or a duplicated row applied to the restore's.
+
+    The two engines are not symmetric. Only the engine that stores a tail
+    records the rows it stored, so the consumer's record is the producer's,
+    transplanted below: the restore is the consumer's own job over a store it
+    did not run.
     """
     # The producer: a finished turn offers its tail and the store route takes
     # it, so the keys, the rows and the group order are all the connector's.
     producer, handoff, blocks = _answer_tail_offer()
+    # The copy below pairs one GPU block with one arena row, which is what the
+    # worker does only while a chunk is one GPU block. The fixture sits at 1; pin
+    # it here, because a fixture that moved the chunk size would decouple this
+    # transcription from the walk it stands in for while every assertion kept
+    # passing. Both schedulers come from this fixture, so the producer's answer
+    # is the consumer's too.
+    assert producer.config.blocks_per_chunk == 1, (
+        f"the fixture runs at blocks_per_chunk={producer.config.blocks_per_chunk}, "
+        "where one GPU block is no longer one arena row"
+    )
     pool.bind(producer)
     gpu = _StandInBlocks()
     for group_idx, block_ids in blocks.items():
@@ -2497,6 +2541,10 @@ def _marker_round_trip(
     # and a resume is granted one token past the deepest boundary it reaches.
     pool.seed_rows(key for gs in req_status.group_states for key in gs.offload_keys)
     # What a restore has to read is the store's own record, not a list here.
+    # ``_tail_row_keys`` is written by the engine that stores a tail and the
+    # fence refuses a resume without it, so an engine that stored nothing never
+    # holds this record on its own: the transplant stands in for the store the
+    # consumer did not run, and the job built from it is still the connector's.
     consumer._tail_row_keys[bytes(handoff.tail_hash)] = tail_keys
     consumer._note_in_pool(tail_keys)
     request.tail_resume = AnswerTailHit(
@@ -2524,8 +2572,14 @@ def _marker_round_trip(
         num_external_tokens=handoff.resume_token,
     )
     [load_job] = consumer._current_batch_load_jobs.values()
+    _assert_one_row_per_key(consumer, consumer._current_batch_load_jobs, load=True)
     _copy_as_the_worker_would(
-        load_job, pool.rows, dest, gpu_to_cpu=False, swap_groups=load_swap
+        load_job,
+        pool.rows,
+        dest,
+        gpu_to_cpu=False,
+        swap_groups=load_swap,
+        dup_row_into=load_dup,
     )
     assert set(dest.landed) == {int(b) for b in load_job.dst_spec.block_ids}
     return stored_by_group, dest.landed
@@ -2607,6 +2661,18 @@ def test_the_marker_control_fails_when_a_restore_reads_another_groups_row(
     # would call this clean.
     with pytest.raises(AssertionError, match="group 1's marker did not reach"):
         _assert_markers_landed(*_marker_round_trip(marker_arena, load_swap=(1, 2)))
+
+
+def test_the_marker_control_fails_when_a_restore_copies_a_tail_row_into_a_chunk(
+    marker_arena,
+):
+    # The negative half, which no other fault reaches: every tail row lands where
+    # its own key says, so each positive check passes, and group 0's tail row is
+    # read a second time into the chunk block that sits below it. A control that
+    # only followed the tail's own destinations would call this clean, and a
+    # resume would later read that chunk row as the conversation's state.
+    with pytest.raises(AssertionError, match="block 31 holds group 0's marker"):
+        _assert_markers_landed(*_marker_round_trip(marker_arena, load_dup=(0, 0)))
 
 
 def test_the_marker_control_fails_when_a_groups_row_is_left_zero(marker_arena):
