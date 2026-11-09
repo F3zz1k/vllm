@@ -4,8 +4,15 @@
 The band holds the hashed, chunk-aligned GPU blocks nearest the free-queue head,
 stores the ones the pool lacks, and on completion returns them to the queue
 HEAD with their hash, so the hold does not change eviction order.
+
+The last section is the answer tail's marker positive control: one payload per
+group, written through the store job the connector builds and read back through
+the restore job it builds, so a group whose bytes land in another group's row
+is caught by the bytes and not by a count.
 """
 
+import mmap
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -48,6 +55,7 @@ from vllm.v1.kv_offload.answer_tail_store import (
     AnswerTailHit,
 )
 from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
+from vllm.v1.kv_offload.shared_pool import server as pool_server
 from vllm.v1.outputs import KVConnectorOutput
 
 
@@ -2161,3 +2169,449 @@ def test_an_offered_answer_tail_is_inert_without_the_flag():
     stats = scheduler.get_stats()
     series = stats.data["data"] if stats is not None else {}
     assert sched_mod._ConnectorMetricName.PARTIAL_TAIL_EVENTS not in series
+
+
+# --- the marker positive control: a group's bytes, in the row its key names ---
+#
+# What this section proves is not that a row round-trips, which the pool's own
+# tests do, but that the connector paired the right source block with the right
+# destination row for every group. A permutation applied to the store and to
+# the restore alike leaves every key, every count and the one-row-per-key
+# invariant intact and hands the resuming request another group's recurrent
+# state, because a recurrent state carries no group label. That is the residual
+# byte equality never closed (gpu-gate-1.md 7.2, key-contract.md 8).
+#
+# Two things here stand in for something else, and the claim stops at each.
+# The copy is the CPU transcription of the worker's per-group walk
+# (``SingleDirectionOffloadingHandler.transfer_async``), so what is under test
+# is the pairing the job's two specs carry, not the CUDA copy engine or the
+# per-layer page layout below it. And the rows a restore reads that are not the
+# tail's own, the conversation's chunk rows, are seeded by the harness because
+# no producer ran here; every tail row is the store's, end to end.
+
+ROW_BYTES = 1024
+ARENA_SUPERPAGES = 16
+# Group indices a marker is defined for: the offloaded groups of the layout
+# under test, with room for one the control never sees.
+MARKER_GROUPS = 4
+
+
+def _group_marker(group_idx: int) -> bytes:
+    """What one group's row must carry: its own index in the first four bytes
+    and a fill byte no other group uses, so a row that came back with another
+    group's state, or with nobody's, says which it is."""
+    fill = bytes([0x60 + group_idx])
+    return group_idx.to_bytes(4, "big") + fill * (ROW_BYTES - 4)
+
+
+def _row_payload(key: OffloadKey) -> bytes:
+    """The bytes of a row the conversation's own store wrote: named after the
+    row's key, and never a group's marker."""
+    filler = b"row:" + bytes(key)
+    return (filler * (ROW_BYTES // len(filler) + 1))[:ROW_BYTES]
+
+
+def _marker_owner(payload: bytes) -> int | None:
+    """Which group's marker a row carries, or None when it carries nobody's."""
+    for group_idx in range(MARKER_GROUPS):
+        if payload == _group_marker(group_idx):
+            return group_idx
+    return None
+
+
+class _StandInBlocks:
+    """A byte array standing in for GPU memory, one ROW_BYTES span per block
+    id. The real copy reads a KV tensor per layer; all the pairing under test
+    can reach is the ROW_BYTES span an arena row is paired with, so that span
+    is all this holds."""
+
+    def __init__(self) -> None:
+        self.landed: dict[int, bytes] = {}
+
+    def seed(self, block_id: int, payload: bytes) -> None:
+        self.landed[block_id] = payload
+
+    def read(self, block_id: int) -> bytes:
+        return self.landed[block_id]
+
+    def write(self, block_id: int, payload: bytes) -> None:
+        self.landed[block_id] = payload
+
+
+class MarkerPool:
+    """A real arena over a real ``mmap``, answering the connector as a shared
+    pool would.
+
+    The connector keeps its mock manager and this replaces the answers a pool
+    gives it, so every row, hold and completion below is the arena's own answer
+    to the connector's own call. Rows are read and written through the mapping,
+    which is what makes where a byte landed a fact about the arena rather than a
+    number in a table the test wrote.
+    """
+
+    def __init__(self, tmp_path, state_groups: tuple[int, ...]) -> None:
+        path = str(tmp_path / "arena.mmap")
+        size = ARENA_SUPERPAGES * ROW_BYTES
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.ftruncate(fd, size)
+        self.arena = pool_server.Arena(path, size, ROW_BYTES, quarantine_sec=0.0)
+        self.arena.open_file(fd, mmap.mmap(fd, size))
+        self.cls = self.arena.class_for(
+            "marker", {}, "L-marker", ROW_BYTES, state_groups
+        )
+        self.rows = _ArenaRows(self)
+        self.clients: list = []
+
+    def close(self) -> None:
+        self.arena.close()
+
+    def bind(self, scheduler) -> None:
+        """Attach one more engine: the connector's pool calls answer from here."""
+        client = pool_server.ClientState(
+            client_id=len(self.clients), name=f"engine{len(self.clients)}", cls=self.cls
+        )
+        self.clients.append(client)
+        self.cls.clients += 1
+        manager = scheduler.manager
+        manager.prepare_store = lambda keys, ctx: self._prepare_store(
+            keys, client, None
+        )
+        manager.prepare_store_run = (
+            lambda keys, tag, whole=False, held=False: self._prepare_store(
+                keys, client, bytes(tag), whole, held
+            )
+        )
+        manager.complete_store = lambda keys, ctx, success=True: (
+            self.arena.complete_store(client, [bytes(k) for k in keys], success)
+        )
+        manager.lookup = lambda key, ctx: self._lookup(key, client)
+        manager.prepare_load = lambda keys, ctx: self._prepare_load(keys, client)
+        manager.complete_load = lambda keys, ctx: self.arena.complete_load(
+            client, [bytes(k) for k in keys]
+        )
+        manager.pin = lambda keys: self.arena.pin(self.cls, [bytes(k) for k in keys])
+        manager.unpin = lambda keys: self.arena.unpin(
+            self.cls, [bytes(k) for k in keys]
+        )
+        manager.on_schedule_end = lambda ctx: self.arena.end_session(client)
+
+    def read_row(self, row: int) -> bytes:
+        start = self.cls.offset(row)
+        return bytes(self.arena.mm[start : start + ROW_BYTES])
+
+    def write_row(self, row: int, payload: bytes) -> None:
+        start = self.cls.offset(row)
+        self.arena.mm[start : start + ROW_BYTES] = payload
+
+    def row_of(self, key: OffloadKey) -> int:
+        return self.cls.index[bytes(key)].row
+
+    def _prepare_store(self, keys, client, tag, whole=False, held=False):
+        out = self.arena.prepare_store(
+            client,
+            [bytes(k) for k in keys],
+            tag if tag is not None else client.name,
+            whole=whole,
+            held=held,
+        )
+        if out is None:
+            return None
+        new, rows, evicted = out
+        # The control sizes its arena so nothing is reclaimed under it: an
+        # evicted row would take a marker with it and read as a pairing fault.
+        assert not evicted, "the arena evicted a row mid-control"
+        return PrepareStoreOutput(
+            keys_to_store=[OffloadKey(k) for k in new],
+            store_spec=CPULoadStoreSpec(list(rows)),
+            evicted_keys=[OffloadKey(k) for k in evicted],
+        )
+
+    def _lookup(self, key: OffloadKey, client) -> LookupResult:
+        result = self.arena.lookup(client, [bytes(key)])[0]
+        assert result != pool_server.P.HIT_PENDING, "a row left unwritten"
+        return LookupResult.HIT if result == pool_server.P.HIT else LookupResult.MISS
+
+    def seed_rows(self, keys) -> None:
+        """Store a row for each key, the way the conversation's own stores
+        would have, from the engine that stored the tail. A resume is reachable
+        only over the chunk rows the arena holds, so a control that wants a
+        restore has to leave those rows behind first. They carry their key's
+        payload and never a group's marker, so a chunk row cannot be mistaken
+        for one of the tail's.
+        """
+        producer = self.clients[0]
+        for key in keys:
+            raw = bytes(key)
+            if raw in self.cls.index:
+                continue
+            out = self.arena.prepare_store(producer, [raw], raw)
+            assert out is not None and out[0] == [raw], "no room for a chunk row"
+            self.write_row(out[1][0], _row_payload(OffloadKey(raw)))
+            self.arena.complete_store(producer, [raw], True)
+
+    def _prepare_load(self, keys, client) -> CPULoadStoreSpec:
+        """The rows a restore reads, which is the arena's own answer and nothing
+        else: a key it does not hold ready raises, as it does in production."""
+        return CPULoadStoreSpec(
+            self.arena.prepare_load(client, [bytes(k) for k in keys])
+        )
+
+
+class _ArenaRows:
+    """The pool side of a copy: row N is the ROW_BYTES span the arena file
+    holds at ``N * ROW_BYTES``, read and written for real."""
+
+    def __init__(self, pool: "MarkerPool") -> None:
+        self.pool = pool
+
+    def read(self, row: int) -> bytes:
+        return self.pool.read_row(row)
+
+    def write(self, row: int, payload: bytes) -> None:
+        self.pool.write_row(row, payload)
+
+
+def _group_runs(block_ids, group_sizes) -> list[list[int]]:
+    """A spec's flat block list as one run per KV group, the way the copy
+    walks it."""
+    runs: list[list[int]] = []
+    offset = 0
+    for size in group_sizes:
+        runs.append(list(block_ids[offset : offset + size]))
+        offset += size
+    assert offset == len(block_ids)
+    return runs
+
+
+def _copy_as_the_worker_would(
+    job,
+    src,
+    dst,
+    gpu_to_cpu: bool,
+    swap_groups: tuple[int, int] | None = None,
+    skip_groups: tuple[int, ...] = (),
+) -> None:
+    """Move the bytes one transfer job names, reading nothing but the job's own
+    two specs.
+
+    The worker walks the GPU spec's per-group sizes and takes that many blocks
+    from each side in order; with one GPU block per chunk, which is what the
+    tail gate requires, that is one arena row per block. This is the CPU
+    stand-in for that walk: it pairs by position alone, so rows that sit in the
+    wrong group's run move the wrong bytes here exactly as they would there.
+    ``swap_groups`` and ``skip_groups`` are the deliberate faults the mutation
+    tests inject, and neither moves a count.
+    """
+    gpu_spec = job.src_spec if gpu_to_cpu else job.dst_spec
+    cpu_spec = job.dst_spec if gpu_to_cpu else job.src_spec
+    gpu_ids = [int(b) for b in gpu_spec.block_ids]
+    runs = _group_runs(cpu_spec.block_ids, gpu_spec.group_sizes)
+    if swap_groups is not None:
+        first, second = swap_groups
+        assert len(runs[first]) == len(runs[second]), "not a like-for-like swap"
+        runs[first], runs[second] = runs[second], runs[first]
+    cpu_ids = [block for run in runs for block in run]
+    assert len(cpu_ids) == len(gpu_ids)
+    offset = 0
+    for group_idx, size in enumerate(gpu_spec.group_sizes):
+        for position in range(size):
+            gpu_id = gpu_ids[offset + position]
+            cpu_id = cpu_ids[offset + position]
+            if group_idx not in skip_groups:
+                if gpu_to_cpu:
+                    dst.write(cpu_id, src.read(gpu_id))
+                else:
+                    dst.write(gpu_id, src.read(cpu_id))
+        offset += size
+    assert offset == len(gpu_ids)
+
+
+@pytest.fixture
+def marker_arena(tmp_path):
+    """The arena the control runs over, closed whatever the test does next. The
+    state groups come from the same layout the connector is built from, because
+    they are what the server reads to decide which runs restore nothing."""
+    layout = _make_drafter_partial_tail_scheduler(True)
+    pool = MarkerPool(
+        tmp_path,
+        tuple(
+            group.group_idx
+            for group in layout.config.kv_group_configs
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ),
+    )
+    yield pool
+    pool.close()
+
+
+def _marker_round_trip(
+    pool: "MarkerPool",
+    store_swap: tuple[int, int] | None = None,
+    store_skip: tuple[int, ...] = (),
+    load_swap: tuple[int, int] | None = None,
+) -> tuple[dict[int, bytes], dict[int, bytes]]:
+    """One tail stored into a real arena by one engine and restored out of it by
+    the next, and what each group's row carries at the end.
+
+    Returns the bytes of each group's arena row, by group, and the bytes of
+    every destination block the restore filled, by block id. The last three
+    arguments are the injected faults: a swap or a skip applied to the store's
+    rows, or a swap applied to the restore's.
+    """
+    # The producer: a finished turn offers its tail and the store route takes
+    # it, so the keys, the rows and the group order are all the connector's.
+    producer, handoff, blocks = _answer_tail_offer()
+    pool.bind(producer)
+    gpu = _StandInBlocks()
+    for group_idx, block_ids in blocks.items():
+        for block_id in block_ids:
+            gpu.seed(block_id, _group_marker(group_idx))
+    store_jobs = producer._build_answer_tail_store_jobs()
+    [store_id] = store_jobs
+    _assert_one_row_per_key(producer, store_jobs)
+    _copy_as_the_worker_would(
+        store_jobs[store_id],
+        gpu,
+        pool.rows,
+        gpu_to_cpu=True,
+        swap_groups=store_swap,
+        skip_groups=store_skip,
+    )
+    _complete_all(producer, store_jobs)
+    tail_keys = producer._tail_row_keys[bytes(handoff.tail_hash)]
+    stored_by_group = {
+        get_offload_group_idx(key): pool.read_row(pool.row_of(key)) for key in tail_keys
+    }
+
+    # The consumer: the turn replayed against the same arena by an engine that
+    # stored nothing, fenced by the arena's own answer and loaded by the
+    # connector's own restore route.
+    consumer = _make_drafter_partial_tail_scheduler(True)
+    request = _make_partial_tail_request(consumer, num_prompt_tokens=32)
+    req_status = consumer._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    pool.bind(consumer)
+    # The conversation's own rows, stored before the resume is decided: the
+    # aligned route can only reach a boundary over chunk rows the arena holds,
+    # and a resume is granted one token past the deepest boundary it reaches.
+    pool.seed_rows(key for gs in req_status.group_states for key in gs.offload_keys)
+    # What a restore has to read is the store's own record, not a list here.
+    consumer._tail_row_keys[bytes(handoff.tail_hash)] = tail_keys
+    consumer._note_in_pool(tail_keys)
+    request.tail_resume = AnswerTailHit(
+        tail_key=handoff.tail_hash,
+        resume_token=handoff.resume_token,
+        group_block_ids={},
+        num_tokens=30,
+        generation=consumer._cache_generation,
+    )
+    assert consumer._lookup(req_status) == handoff.resume_token
+
+    # The destination blocks this control allocates, per KV group. The tail
+    # fills the last block of its group's range, the one at the resume
+    # position; the drafter group is not a tail group and fills one block with
+    # its own chunk row.
+    destination_blocks = (
+        [KVCacheBlock(31), KVCacheBlock(32)],
+        [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+        [KVCacheBlock(51), KVCacheBlock(52)],
+    )
+    dest = _StandInBlocks()
+    consumer.update_state_after_alloc(
+        request,
+        KVCacheBlocks(destination_blocks),
+        num_external_tokens=handoff.resume_token,
+    )
+    [load_job] = consumer._current_batch_load_jobs.values()
+    _copy_as_the_worker_would(
+        load_job, pool.rows, dest, gpu_to_cpu=False, swap_groups=load_swap
+    )
+    assert set(dest.landed) == {int(b) for b in load_job.dst_spec.block_ids}
+    return stored_by_group, dest.landed
+
+
+def _assert_markers_landed(
+    stored_by_group: dict[int, bytes], landed: dict[int, bytes]
+) -> None:
+    """The control's assertion, one per group: the row the arena holds under
+    group g's tail key carries group g's marker, and the destination block that
+    row is restored into carries it too. Every other block the restore filled
+    must carry nobody's marker, because a tail state parked in a chunk row is
+    the same fault wearing a different hat. A group whose bytes sit in another
+    group's row, or in nobody's, fails here with its own index in the message.
+    """
+    # Where each group's row has to land, read off the destination table the
+    # control writes: the last block of the group's own allocated range, the
+    # one at the resume position.
+    tail_destinations = {0: 32, 1: 41}
+    assert set(stored_by_group) == set(tail_destinations)
+    for group_idx, payload in stored_by_group.items():
+        assert payload == _group_marker(group_idx), (
+            f"group {group_idx}'s row holds "
+            f"{_describe_marker(payload)}: the store paired the wrong block "
+            "with the row this group's key names"
+        )
+    for group_idx, block_id in tail_destinations.items():
+        payload = landed[block_id]
+        assert payload == _group_marker(group_idx), (
+            f"group {group_idx}'s marker did not reach block {block_id}, which "
+            f"holds {_describe_marker(payload)}: the restore paired the wrong "
+            "row with this group's destination block"
+        )
+    for block_id, payload in landed.items():
+        if block_id in tail_destinations.values():
+            continue
+        assert _marker_owner(payload) is None, (
+            f"block {block_id} holds {_describe_marker(payload)}, but no tail "
+            "row was meant to land there"
+        )
+
+
+def _describe_marker(payload: bytes) -> str:
+    owner = _marker_owner(payload)
+    if owner is not None:
+        return f"group {owner}'s marker"
+    if not any(payload):
+        return "nothing but zeros"
+    return "a row that is no group's marker"
+
+
+def test_a_tail_marker_lands_in_the_row_its_group_names(marker_arena):
+    """The positive control: each group's marker is written into the GPU block
+    the offer names, stored through the store job the connector built, and read
+    back through the restore job it built. Every count can be right and every
+    key present while group 1's state sits in group 2's row, and this is the
+    assertion that says otherwise."""
+    stored_by_group, landed = _marker_round_trip(marker_arena)
+
+    _assert_markers_landed(stored_by_group, landed)
+
+
+def test_the_marker_control_fails_when_the_store_swaps_two_groups_rows(marker_arena):
+    # Permutation is the failure the control exists for, applied identically by
+    # every path is what a key-level assertion cannot see. Here the store writes
+    # each group's bytes into the other group's row: the arena's index is
+    # untouched, so every key and count still agrees, and a resume would hand
+    # back another group's state.
+    with pytest.raises(AssertionError, match="group 0's row holds group 1's"):
+        _assert_markers_landed(*_marker_round_trip(marker_arena, store_swap=(0, 1)))
+
+
+def test_the_marker_control_fails_when_a_restore_reads_another_groups_row(
+    marker_arena,
+):
+    # The other half, and the one the store-side assertions cannot reach: the
+    # rows are all correct, and the restore reads group 1's row into the
+    # drafter group's block and back. A control that only read the arena back
+    # would call this clean.
+    with pytest.raises(AssertionError, match="group 1's marker did not reach"):
+        _assert_markers_landed(*_marker_round_trip(marker_arena, load_swap=(1, 2)))
+
+
+def test_the_marker_control_fails_when_a_groups_row_is_left_zero(marker_arena):
+    # A row nobody wrote is the third shape: the tail comes back whole, with one
+    # group's state read as zeros, which is a state like any other as far as
+    # every count is concerned.
+    with pytest.raises(AssertionError, match="group 1's row holds nothing"):
+        _assert_markers_landed(*_marker_round_trip(marker_arena, store_skip=(1,)))
