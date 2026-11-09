@@ -2707,6 +2707,12 @@ class OffloadingConnectorScheduler:
         has to be in the arena, the record has to name the cache that is still
         here, and the position has to be one this load can reach.
 
+        The band's own view of the pool is not consulted. It mirrors the arena
+        one step late, and only where a deployment keeps such a mirror at all:
+        pre-filtering on it refused every resume a deployment that does not
+        write back could otherwise have served, for rows the arena was ready to
+        answer for.
+
         The rows a windowed group takes before its tail block are keyed by the
         keys their own blocks own, the same keys the chunk load reads, so they
         come with the chunks below the tail; requiring all of them held is what
@@ -2733,11 +2739,11 @@ class OffloadingConnectorScheduler:
                 req_status, record.resume_token, "the request is gone"
             )
         rows = self._tail_row_keys.get(bytes(record.tail_key))
-        if rows is None or not all(key in self._pool_has for key in rows):
+        if rows is None:
             return self._refuse_tail_resume(
                 req_status,
                 record.resume_token,
-                "the band's view of the pool does not hold every tail row",
+                "the band never recorded the rows this tail was stored as",
             )
         if len({get_offload_group_idx(key) for key in rows}) != len(rows):
             return self._refuse_tail_resume(
@@ -3840,11 +3846,12 @@ class OffloadingConnectorScheduler:
             # again. The rows are recorded either way, and the mirror is marked on
             # the arena's answer rather than on the absence of work: "no keys to
             # write" says the index has the key, not that the row is ready to
-            # read, and a row the band believes it can restore from has to be one
-            # the arena said HIT for.
-            self._count_tail_event("tail_stored")
+            # read. The count rides on the same answer: a tail whose rows the
+            # arena would not confirm is one no restore can be granted for, and
+            # counting it as stored would report a tail the band does not hold.
             if self._confirm_tail_rows(keys, req_status.req_context) is None:
                 self._note_in_pool(keys)
+                self._count_tail_event("tail_stored")
             return None
         # No KV event here, unlike the aligned tail stores: a self-describing
         # event describes the hash-aligned prefix of one physical block, and an
@@ -4369,6 +4376,7 @@ class OffloadingConnectorScheduler:
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
         )
+        # Ends this step's session: the tail store route below holds one step.
         self.manager.on_schedule_end(schedule_end_context)
 
         # Flush jobs for preempted requests.

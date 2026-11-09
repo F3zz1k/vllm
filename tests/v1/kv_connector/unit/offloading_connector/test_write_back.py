@@ -1715,8 +1715,9 @@ def _tail_resume_layout(
     the tier answered for the token beyond it: the scheduler, its request state,
     the record the core left, and the rows a restore has to read.
 
-    The rows are marked resident through the band's own record of the pool, so a
-    test says "the arena holds these" rather than reaching into a dict.
+    The arena answers HIT for every key, and the rows are marked in the band's
+    mirror as a deployment that mirrors the pool would have them. A test that
+    wants one without the other says so itself.
     """
     scheduler = _make_drafter_partial_tail_scheduler(True)
     request = _make_partial_tail_request(scheduler, num_prompt_tokens=32)
@@ -1878,10 +1879,13 @@ def test_a_resume_the_arena_cannot_fill_is_refused_and_claims_nothing():
     # allocates: a resume that loaded some rows would hand the request a state
     # that is not the one at the position it restarts from, and nothing reports
     # that. So a row the arena lost costs the request its recompute and nothing
-    # else.
+    # else. It is the arena that has to be short of the row, not the band's
+    # mirror, which decides nothing here.
     scheduler, req_status, record = _tail_resume_layout()
     lost = scheduler._tail_row_keys[b"tail"][-1]
-    scheduler._forget_in_pool([lost])
+    scheduler.manager.lookup.side_effect = lambda key, ctx: (
+        LookupResult.MISS if key == lost else LookupResult.HIT
+    )
 
     assert scheduler._lookup(req_status) == 28
     assert scheduler._tail_counts["tail_restore_refused"] == 1
@@ -1917,6 +1921,21 @@ def test_the_fence_asks_the_arena_before_it_grants_a_resume():
     assert not scheduler._current_batch_load_jobs
     looked_up = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
     assert all(row in looked_up for row in rows)
+
+
+def test_an_empty_pool_view_refuses_no_resume_the_arena_holds():
+    # The band's mirror of the pool is filled by the completion path only where
+    # a deployment writes back, so the default deployment has an empty one and
+    # pre-filtered every resume away on it, whatever the arena would have
+    # answered. The arena is the last word, and it is asked for every row.
+    scheduler, req_status, record = _tail_resume_layout()
+    scheduler._pool_has.clear()
+    scheduler, req_status, record = _tail_resume_layout()
+    scheduler._pool_has.clear()
+
+    assert scheduler._lookup(req_status) == record.resume_token
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
 
 
 def test_a_resume_record_of_a_cache_that_is_gone_is_refused():
@@ -1987,8 +2006,8 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     of them back; unless that counts as a store the band records, the reset
     dropped the rows a restore is granted over and the tail can never be
     resumed again for as long as the arena keeps holding it."""
-    # The band's view of the pool is what a restore is pre-filtered on, and the
-    # completion path is what fills it, so the run is the one a rig does.
+    # The completion path fills the band's mirror of the pool only under
+    # write-back, so the run is the one a rig does.
     monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
     scheduler = _make_drafter_partial_tail_scheduler(True)
     request = _make_partial_tail_request(scheduler, num_prompt_tokens=32)
@@ -2078,6 +2097,10 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     assert not scheduler._build_answer_tail_store_jobs()
     assert scheduler._tail_row_keys[bytes(handoff.tail_hash)] == rows
     assert not scheduler._pool_has
+    # And it is not counted either: the mirror was left unmarked, so no restore
+    # can be granted over this tail, and a store counted here would be a tail
+    # reported as held that the arena refused to confirm.
+    assert scheduler._tail_counts["tail_stored"] == 2
     request.tail_resume = AnswerTailHit(
         tail_key=BlockHash(b"tail"),
         resume_token=29,
