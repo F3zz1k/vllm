@@ -3131,7 +3131,23 @@ class OffloadingConnectorScheduler:
             # lands on and says whether it is new, so a lookup retried over
             # blocks that are already being filled joins the load in flight
             # instead of asking the arena for the same rows a second time.
-            self.answer_tail_store.start_load(resume, tail_dests)
+            #
+            # A tail group whose block at the resume position the GPU already
+            # has fills no destination row, so its row never reaches the load at
+            # all: the tier says so with False, and the count says it for the
+            # groups that filled a row but not all of them. This is not a
+            # restore, and counting one would report a tail handed to a request
+            # that was handed part of one.
+            whole = len(tail_dests) == len(self._partial_tail_group_ids)
+            if whole:
+                whole = self.answer_tail_store.start_load(resume, tail_dests)
+            if not whole:
+                self._refuse_tail_resume(
+                    req_status,
+                    resume.resume_token,
+                    f"{len(tail_dests)} of {len(self._partial_tail_group_ids)} "
+                    "tail groups filled a destination block",
+                )
         req_status.tail_resume = None
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
@@ -3580,11 +3596,12 @@ class OffloadingConnectorScheduler:
         the one flag-off predicate.
         """
         req_status.req.tail_resume = None
-        if self._count_tail_event("tail_restore_refused"):
-            logger.info_once(
-                "KV offloading: refused an answer-tail restore; the request "
-                "resumes from the hit it already has and recomputes the tail."
-            )
+        if not self._count_tail_event("tail_restore_refused"):
+            return None
+        logger.info_once(
+            "KV offloading: refused an answer-tail restore; the request "
+            "resumes from the hit it already has and recomputes the tail."
+        )
         logger.debug(
             "KV offloading: refused the answer-tail restore of request %s at %s "
             "tokens (%s)",

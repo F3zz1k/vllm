@@ -1829,6 +1829,34 @@ def test_a_granted_resume_is_loaded_under_the_tail_key_into_its_own_block():
     assert req_status.partial_tail_boundary is None
 
 
+def test_a_resume_that_fills_no_destination_row_is_not_counted_as_a_restore():
+    # A tail group whose block at the resume position the GPU already holds
+    # fills no destination row, so that group's row never reaches the load. The
+    # tier says so, and the count says it for a load that filled some rows but
+    # not every group's: a restore counted here would report a tail handed to a
+    # request that was handed part of one.
+    scheduler, req_status, record = _tail_resume_layout()
+    assert scheduler._lookup(req_status) == record.resume_token
+
+    scheduler.update_state_after_alloc(
+        req_status.req,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                # The recurrent group's blocks are both null: nothing here to
+                # copy a row into.
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(0, is_null=True)],
+                [KVCacheBlock(51), KVCacheBlock(52)],
+            )
+        ),
+        num_external_tokens=record.resume_token,
+    )
+
+    assert scheduler._tail_counts["tail_restored"] == 0
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.req.tail_resume is None
+
+
 def test_a_resume_retried_over_the_same_blocks_is_one_restore():
     # A deferred lookup is retried, and the retry builds the same load into the
     # same blocks. The rows are on their way already, so the retry joins them:
