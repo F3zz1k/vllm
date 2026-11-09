@@ -24,6 +24,7 @@ from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
     _make_drafter_partial_tail_scheduler,
     _make_partial_tail_request,
     _make_partial_tail_scheduler,
+    _make_shared_group_partial_tail_scheduler,
     _make_windowed_tail_scheduler,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
@@ -40,7 +41,7 @@ from vllm.v1.core.kv_cache_utils import (
     make_block_hash_with_group_id,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LookupResult,
@@ -1780,6 +1781,7 @@ def _tail_resume_layout(
     resume_token: int = 29,
     rows: tuple[OffloadKey, ...] | None = None,
     generation: int | None = None,
+    scheduler: OffloadingConnectorScheduler | None = None,
 ):
     """A request whose own chunks stop at the last proved boundary, and the tail
     the tier answered for the token beyond it: the scheduler, its request state,
@@ -1789,7 +1791,8 @@ def _tail_resume_layout(
     mirror as a deployment that mirrors the pool would have them. A test that
     wants one without the other says so itself.
     """
-    scheduler = _make_drafter_partial_tail_scheduler(True)
+    if scheduler is None:
+        scheduler = _make_drafter_partial_tail_scheduler(True)
     request = _make_partial_tail_request(scheduler, num_prompt_tokens=32)
     req_status = scheduler._req_status["req"]
     req_status.num_locally_computed_tokens = 0
@@ -2138,6 +2141,71 @@ def test_the_tier_answers_for_a_tail_this_process_never_stored():
     assert hit is not None
     assert hit.generation == scheduler._cache_generation
     assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups[:1]) is None
+
+
+def _only_attention_group(scheduler: OffloadingConnectorScheduler) -> int:
+    """The index of the layout's one full-attention group."""
+    groups = [
+        config.group_idx
+        for config in scheduler.config.kv_group_configs
+        if isinstance(config.kv_cache_spec, FullAttentionSpec)
+    ]
+    assert len(groups) == 1
+    return groups[0]
+
+
+def test_a_shared_group_tail_stores_the_attention_row_the_target_needs():
+    """The exemption is for KV the drafter owns. Where an MTP drafter is merged
+    into the target's own full-attention group, the annotation still reaches
+    that group, but the KV in it is what the resumed request attends with, so
+    the tail has to carry it: exempting it stored the tail one row short, and
+    the tail key names only the groups the tail carries, so nothing noticed.
+    """
+    scheduler = _make_shared_group_partial_tail_scheduler()
+    attention_group = _only_attention_group(scheduler)
+    scheduler, handoff, blocks = _answer_tail_offer(scheduler=scheduler)
+
+    jobs = scheduler._build_answer_tail_store_jobs()
+
+    [job_id] = jobs
+    assert attention_group in blocks
+    assert scheduler._jobs[job_id].keys == set(_tail_keys(handoff, sorted(blocks)))
+    _assert_one_row_per_key(scheduler, jobs)
+
+
+def test_a_shared_group_resume_loads_the_row_of_the_group_it_cannot_omit():
+    """A resume past the request's own boundary is granted for the shared-group
+    layout, and the group the exemption dropped left a hole there: the load
+    asked for no row for it and the destination spec dropped the block at the
+    resume position in the same breath, so the counts agreed over a block the
+    request believes computed. A group with a block to fill has to be given a
+    row for it.
+    """
+    scheduler = _make_shared_group_partial_tail_scheduler()
+    attention_group = _only_attention_group(scheduler)
+    scheduler, req_status, record = _tail_resume_layout(scheduler=scheduler)
+    assert scheduler._lookup(req_status) == record.resume_token
+
+    scheduler.update_state_after_alloc(
+        req_status.req,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+            )
+        ),
+        num_external_tokens=record.resume_token,
+    )
+
+    _assert_one_row_per_key(scheduler, scheduler._current_batch_load_jobs, load=True)
+    [load_job] = scheduler._current_batch_load_jobs.values()
+    [job] = scheduler._jobs.values()
+    assert make_offload_key(b"tail", attention_group) in job.keys
+    # The attention group's own block at the resume position is filled by the
+    # tail row: the chunk below it and the row at the position, two blocks.
+    assert load_job.dst_spec.group_sizes[attention_group] == 2
+    assert scheduler._tail_counts["tail_restored"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
 
 
 def test_the_tail_candidates_come_from_the_pool_and_are_asked_for_once_a_refresh():

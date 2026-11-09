@@ -286,6 +286,26 @@ def _make_drafter_partial_tail_scheduler(
     return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
 
 
+def _make_shared_group_partial_tail_scheduler() -> OffloadingConnectorScheduler:
+    """The partial-tail layout with its only full-attention group annotated as
+    holding drafter layers: the shape a shared-group MTP block leaves, where
+    the drafter is a decoder layer merged into the group the target model reads
+    its own attention from. The annotation is positional, so it reaches a group
+    the target model needs, which is what the drafter exemption must not cover.
+    """
+    vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
+    vllm_config.cache_config.prefix_match_unit = 4
+    vllm_config.cache_config.enable_partial_tail_offload = True
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config.kv_cache_groups[0].is_eagle_group = True
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
 # The Flash-Next store geometry: a sliding window that does not divide the
 # block, so a windowed group's tail costs the rounded-up rows, and a hash
 # granularity finer than the block, so a window row has a key to be named by.

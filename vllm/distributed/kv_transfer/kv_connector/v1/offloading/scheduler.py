@@ -49,6 +49,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
+    get_kv_cache_spec_kind,
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_offload.answer_tail_store import (
@@ -206,6 +207,10 @@ class GroupOffloadConfig(NamedTuple):
     # of these groups is volatile and lacks a stable hash, so it must
     # be excluded from store and load scheduling.
     is_eagle_group: bool = False
+    # True where the group holds drafter layers and the target model keeps its
+    # own group of the same kind beside it, which is the only shape where the
+    # group's KV is spare. See ``tail_optional``.
+    is_drafter_group: bool = False
     # Arena rows an answer tail costs this group: one for a group whose state
     # at a position is one block, the window's worth of blocks for a windowed
     # group. None when the spec does not say, and a tail the store cannot size
@@ -218,10 +223,18 @@ class GroupOffloadConfig(NamedTuple):
 
         A drafter group's KV is already served one chunk stale by the volatile
         tail rule, so a tail it never stored costs speculative acceptance, not
-        correctness. A recurrent group never qualifies: a tail missing a state
-        group cannot be restored at all.
+        correctness. That holds only of a group the drafter owns. The eagle
+        annotation says a group holds drafter layers, not that it holds nothing
+        else: a drafter that reuses the target's spec is merged into the
+        target's own group, and a tail that omitted that group would leave the
+        resumed request attending over a block nobody filled. So the exemption
+        goes to a group the target model does not need, one that stands beside
+        another group of the same kind. A recurrent group never qualifies: a
+        tail missing a state group cannot be restored at all.
         """
-        return self.is_eagle_group and not isinstance(self.kv_cache_spec, MambaSpec)
+        return (
+            self.is_drafter_group and not isinstance(self.kv_cache_spec, MambaSpec)
+        )
 
     def load_window_size_in_chunks(self, num_tokens: int) -> int | None:
         window = self.sliding_window_size_in_chunks
@@ -389,6 +402,20 @@ class SchedulerOffloadConfig(NamedTuple):
                 sorted(eagle_groups),
             )
 
+        # The kinds of KV the target model carries in a group of its own. An
+        # annotated group is the drafter's own only where the target keeps its
+        # state of the same kind in another group the tail carries: the
+        # annotation says a group holds drafter layers, not that it holds
+        # nothing else, and a drafter that reuses the target's spec is merged
+        # into the target's own group.
+        target_kv_kinds = {
+            get_kv_cache_spec_kind(
+                kv_cache_config.kv_cache_groups[group.group_id].kv_cache_spec
+            )
+            for group in spec.config.groups
+            if group.group_id not in eagle_groups
+        }
+
         kv_group_configs_list: list[GroupOffloadConfig] = []
         for group in spec.config.groups:
             group_id = group.group_id
@@ -416,6 +443,10 @@ class SchedulerOffloadConfig(NamedTuple):
                     manager_cls=manager_cls,
                     kv_event_group_spec=get_offloading_event_group_spec(kv_cache_group),
                     is_eagle_group=group_id in eagle_groups,
+                    is_drafter_group=(
+                        group_id in eagle_groups
+                        and get_kv_cache_spec_kind(kv_spec) in target_kv_kinds
+                    ),
                     requires_cow_source=(
                         isinstance(kv_spec, MambaSpec)
                         and kv_spec.mamba_cache_mode == "align"
