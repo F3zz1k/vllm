@@ -1680,7 +1680,10 @@ def test_the_answer_tail_store_is_installed_only_with_the_flag():
 def test_an_offered_answer_tail_is_inert_without_the_flag():
     # Flag off, no core brings a tail here; should one arrive anyway, nothing is
     # stored, nothing is counted and nothing is left queued for a later step to
-    # act on.
+    # act on. The load side is asked through the same reporter the store side
+    # uses, so a refused restore is silent here too: this is the third sighting
+    # of the class, after the layout refusals and the assert-to-refuse helper
+    # each leaked a series into a flag-off engine.
     scheduler = _make_drafter_partial_tail_scheduler(False)
     scheduler.manager.prepare_store_run = MagicMock()
     handoff = AnswerTailHandoff(
@@ -1696,3 +1699,17 @@ def test_an_offered_answer_tail_is_inert_without_the_flag():
     scheduler.manager.prepare_store_run.assert_not_called()
     assert dict(scheduler._tail_counts) == {}
     assert scheduler.answer_tail_store.pending == {}
+
+    hit = AnswerTailHit(
+        tail_key=handoff.tail_hash,
+        resume_token=handoff.resume_token,
+        group_block_ids={},
+        num_tokens=30,
+    )
+    assert scheduler.answer_tail_store.lookup_tail(handoff.tail_hash, [0, 1]) is None
+    assert scheduler.answer_tail_store.start_load(hit, {}) is False
+    assert scheduler.answer_tail_store.wait(hit) is False
+    assert dict(scheduler._tail_counts) == {}
+    stats = scheduler.get_stats()
+    series = stats.data["data"] if stats is not None else {}
+    assert sched_mod._ConnectorMetricName.PARTIAL_TAIL_EVENTS not in series

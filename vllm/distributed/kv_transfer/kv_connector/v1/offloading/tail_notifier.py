@@ -15,8 +15,8 @@ reports it. So the load methods refuse by name, count it once per attempt, and
 hand back nothing, which leaves no half tail to reach a request.
 """
 
-from collections import Counter, OrderedDict
-from collections.abc import Mapping, Sequence
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashWithGroupId
@@ -47,11 +47,14 @@ class TailOffer:
 class AnswerTailNotifier(AnswerTailStore):
     """The queue the engine core hands a finished turn's tail to."""
 
-    def __init__(self, counts: Counter, max_offers: int = _MAX_OFFERS) -> None:
-        """``counts`` is the connector's partial-tail counter: the refusals this
-        object makes on the load side have to reach /metrics through the same
-        place every other tail event is reported from."""
-        self.counts = counts
+    def __init__(
+        self, report: Callable[[str, int], bool], max_offers: int = _MAX_OFFERS
+    ) -> None:
+        """``report`` is the connector's tail reporter: the refusals this object
+        makes on the load side have to reach /metrics through the same predicate
+        every other tail event is counted by, including the rule that a flag-off
+        deployment reports nothing at all."""
+        self.report = report
         self.pending: OrderedDict[tuple[str, bytes], TailOffer] = OrderedDict()
         self._max_offers = max_offers
 
@@ -145,7 +148,7 @@ class AnswerTailNotifier(AnswerTailStore):
         nothing can be half copied: the resume falls back to computing the
         tokens the tail would have covered.
         """
-        self.counts["tail_restore_refused"] += 1
+        self.report("tail_restore_refused", 1)
         return False
 
     def wait(self, hit: AnswerTailHit) -> bool:

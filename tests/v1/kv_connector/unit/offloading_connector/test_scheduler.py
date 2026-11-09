@@ -461,7 +461,8 @@ def test_partial_tail_store_uses_attention_and_finish_state_sources():
     """One tail, one store: a full-attention group reads its row from its own
     table at the boundary and a recurrent group reads the state block the finish
     hand-off named, and the two land under one job with the events a reader
-    needs. This is the only route that stores a state row."""
+    needs. Among the hand-off routes this is the only one that stores a state
+    row; the answer tail writes its state rows through its own store route."""
     scheduler = _make_partial_tail_scheduler(partial_tail_offload=True)
     request = _make_partial_tail_request(scheduler)
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
@@ -1011,7 +1012,8 @@ def test_partial_tail_a_step_tail_leaves_the_restore_no_state_row():
 
 
 def test_partial_tail_a_finished_tail_is_stored_and_the_restore_loads_it():
-    """The other arm of the pair, and the only route that stores a state row: a
+    """The other arm of the pair, and among the hand-off routes the only one
+    that stores a state row: a
     tail registered as the producer finished has its state block written by the
     finish checkpoint at the exact boundary, so the row lands under the boundary
     key, the probe hits it, and the load asks for it. Without this arm the
@@ -1152,7 +1154,7 @@ def test_partial_tail_layout_refusal_says_nothing_when_it_dropped_nothing(
         "mixed_boundaries",
         "untracked_request",
         "hand_off_incomplete",
-        "null_source_block",
+        "live_state_source",
         "layout",
     ],
 )

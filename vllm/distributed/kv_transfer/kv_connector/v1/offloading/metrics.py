@@ -156,10 +156,11 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
                 "of a tail while the load side is closed. The bookkeeping kinds "
                 "for a tail the band recorded are tail_run_missing and "
                 "tail_evicted. A layout refusal counts the tails the hand-off "
-                "carried, every other reason one. The step path stores tails "
-                "without the flag, as it did before it existed, so a flag-off "
-                "deployment writes tail rows and reports none of these kinds: "
-                "the absence of a series is not proof that no tail was stored."
+                "carried, every other reason one. Every kind is reported "
+                "through one predicate that reads enable_partial_tail_offload, "
+                "and every route that could produce one is refused by that "
+                "flag first, so a flag-off deployment writes no tail rows and "
+                "emits no series here at all."
             ),
             labelnames=("event",),
         ),

@@ -906,14 +906,14 @@ class OffloadingConnectorScheduler:
         self._wb_touching = False
         self._wb_counts: Counter = Counter()
         self._wb_counts_emitted: Counter = Counter()  # already on /metrics
-        # Refused partial tails by reason (see _refuse_partial_tail).
+        # Tail events by kind (see _count_tail_event).
         self._tail_counts: Counter = Counter()
         self._tail_counts_emitted: Counter = Counter()
         # The engine core offers a finished turn's answer tail here. The store
         # route is this connector: arena rows come from the offloading manager
         # and bytes move only in a worker's transfer job, so the core cannot
         # store a tail and the notifier is all the seam it gets.
-        self.answer_tail_store = AnswerTailNotifier(self._tail_counts)
+        self.answer_tail_store = AnswerTailNotifier(self._count_tail_event)
         # Requests an answer-tail offer is keeping in _req_status after their
         # release, so the state goes the step the offer leaves the queue.
         self._tail_offer_holds: set[ReqId] = set()
@@ -1474,7 +1474,7 @@ class OffloadingConnectorScheduler:
         by_group = [gs.offload_keys for gs in req_status.group_states]
         tag = self._run_tag(by_group)
         if tag is None:
-            self._tail_counts["tail_run_missing"] += 1
+            self._count_tail_event("tail_run_missing")
         for key in keys:
             if key in self._tail_run:
                 self._tail_run.move_to_end(key)
@@ -1726,7 +1726,7 @@ class OffloadingConnectorScheduler:
             if key in self._tail_run:
                 # A tail has no GPU hash to be re-offered from, so the feed is
                 # the only way the band learns the arena dropped it.
-                self._tail_counts["tail_evicted"] += 1
+                self._count_tail_event("tail_evicted")
                 self._forget_tail_key(key)
         return n
 
@@ -3448,6 +3448,28 @@ class OffloadingConnectorScheduler:
             dst_spec=store_output.store_spec,
         )
 
+    def _count_tail_event(self, event: str, count: int = 1) -> bool:
+        """Record one partial-tail or answer-tail event, if the flag is on.
+
+        The one gate for every tail counter and every tail log line, so that a
+        deployment without `enable_partial_tail_offload` is observably the
+        connector that predates the feature: no ``vllm:kv_partial_tail_events``
+        series and no tail line. Every route that can reach a tail counter is
+        itself refused by the same flag first, so with the flag off there is
+        nothing to report: no tail row is written, no tail is offered, no tail
+        is refused and no restore is asked for. This is the third sighting of
+        the class, after the layout refusals and the assert-to-refuse helper
+        each leaked a series into a flag-off engine, so the rule lives in one
+        predicate here rather than at each call site.
+
+        The notifier counts through this same predicate, which is why it holds
+        a reporter rather than the counter.
+        """
+        if not self.config.enable_partial_tail_offload:
+            return False
+        self._tail_counts[event] += count
+        return True
+
     def _refuse_partial_tail(
         self,
         reason: str,
@@ -3473,19 +3495,17 @@ class OffloadingConnectorScheduler:
         carrying only aligned boundaries would otherwise leave a zero-valued
         counter key and a line about a tail that was in fact stored.
 
-        With the flag off a refusal is reported nowhere: no counter, so no
-        partial-tail series, and no log line. The two bookkeeping counters,
-        tail_run_missing and tail_evicted, are gated the same way in
-        _note_tail_keys. No route stores a tail with the flag off, so a flag-off
-        deployment writes no tail rows at all: the rows the step route used to
-        write held the producer's running state under a boundary key, which is
-        the corruption this refusal exists to stop.
+        A refusal is reported through _count_tail_event, the one flag-off gate
+        every tail counter and tail log line shares, so a flag-off deployment
+        sees neither the series nor the line. It also has nothing to report:
+        no route stores a tail with the flag off, so it writes no tail rows at
+        all. The rows the step route used to write held the producer's running
+        state under a boundary key, which is the corruption that refusal stops.
         """
         if not count:
             return False
-        if not self.config.enable_partial_tail_offload:
+        if not self._count_tail_event(reason, count):
             return False
-        self._tail_counts[reason] += count
         logger.info_once(
             "KV offloading: refused a partial tail (%s); a tail is stored "
             "whole or not at all.",
@@ -3515,13 +3535,15 @@ class OffloadingConnectorScheduler:
         reports store completion through completed jobs rather than
         ``finished_sending``, so a True would hold the request's blocks forever.
 
-        This is the only route that stores a recurrent state row. The manager
-        hands the block only when nothing is in flight and the request computed
-        exactly up to the boundary, and that block is the finish checkpoint's
-        FINALIZE target: the worker copied the state after the exact last token
-        into it in the step that detected the finish, so its bytes are the state
-        the boundary names at a sub-block position too, and no further forward
-        can rewrite them.
+        Among the hand-off routes this is the only one that stores a recurrent
+        state row; the answer tail keeps its own store route and writes a state
+        row per group there. Within the hand-offs, this route is the only one
+        because the manager hands the block only when nothing is in flight and
+        the request computed exactly up to the boundary, and that block is the
+        finish checkpoint's FINALIZE target: the worker copied the state after
+        the exact last token into it in the step that detected the finish, so
+        its bytes are the state the boundary names at a sub-block position too,
+        and no further forward can rewrite them.
         """
         if not self.config.enable_partial_tail_offload or not partial_tail_offloads:
             return False
@@ -3566,7 +3588,7 @@ class OffloadingConnectorScheduler:
             return self._refuse_partial_tail(job.reason, req_id, boundary)
         job_id, store_job = job
         self._finished_partial_tail_jobs[job_id] = store_job
-        self._tail_counts["finish_tail_stored"] += 1
+        self._count_tail_event("finish_tail_stored")
         return False
 
     def bind_answer_tail_store(self, kv_cache_manager: Any) -> None:
@@ -3610,8 +3632,8 @@ class OffloadingConnectorScheduler:
             return store_jobs
         # One per tail the core offered, not per drain: an offer the pool
         # refused comes back with a try on it, and that is a retry, not a tail.
-        self._tail_counts["tail_offered"] += sum(
-            1 for offer in offers if offer.tries == 0
+        self._count_tail_event(
+            "tail_offered", sum(1 for offer in offers if offer.tries == 0)
         )
         if self.config.tail_omitted_groups or not self.config.supports_partial_tail:
             # The whole-tail policy the other two paths hold: a group outside
@@ -3683,7 +3705,7 @@ class OffloadingConnectorScheduler:
         if not self.answer_tail_store.requeue(offer):
             return False
         offer.tries += 1
-        self._tail_counts["tail_retried"] += 1
+        self._count_tail_event("tail_retried")
         return True
 
     def _answer_tail_store_job(
@@ -3813,7 +3835,7 @@ class OffloadingConnectorScheduler:
         # the step that last owned the block.
         self._current_batch_jobs_to_flush.add(job_id)
         self._tail_flush_jobs.add(job_id)
-        self._tail_counts["tail_stored"] += 1
+        self._count_tail_event("tail_stored")
         if self._b70_trace:
             self._b70_job_submitted(req.request_id, True)
             _b70.log(
@@ -3901,7 +3923,7 @@ class OffloadingConnectorScheduler:
         if pin is None or not keys:
             return []
         pin(keys)
-        self._tail_counts["tail_pinned"] += len(keys)
+        self._count_tail_event("tail_pinned", len(keys))
         return keys
 
     def _unpin_tail_rows(self, job_id: int) -> None:
@@ -3911,12 +3933,12 @@ class OffloadingConnectorScheduler:
             # A release with nothing held is the bookkeeping slipping: a row
             # left pinned is skipped by the eviction order for ever, and a cold
             # tier writes it to disk and reads it back after a restart.
-            self._tail_counts["tail_pin_leaked"] += 1
+            self._count_tail_event("tail_pin_leaked")
             return
         unpin = getattr(self.manager, "unpin", None)
         if unpin is not None:
             unpin(keys)
-        self._tail_counts["tail_unpinned"] += len(keys)
+        self._count_tail_event("tail_unpinned", len(keys))
 
     def _release_tail_pins(self) -> None:
         """Drop every pin still held: the jobs they fence are gone with the
@@ -4353,7 +4375,7 @@ class OffloadingConnectorScheduler:
         if self._tail_flush_jobs and self._tail_flush_jobs == (
             self._current_batch_jobs_to_flush
         ):
-            self._tail_counts["tail_flush_only_step"] += 1
+            self._count_tail_event("tail_flush_only_step")
         self._tail_flush_jobs = set()
         self._finished_partial_tail_jobs = {}
 
