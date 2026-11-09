@@ -1333,16 +1333,16 @@ class OffloadingConnectorScheduler:
         )
         # The tails this request stored, wherever they were tagged: a step-path
         # tail was named after the attention key of its own step, and merge_tag
-        # has just moved those rows into this run, so the record moves with them.
+        # has just moved those rows into this run, so the ownership moves with
+        # them. A re-parenting asks the arena nothing, so the rows the store
+        # recorded stay recorded.
         keyed = {k for keys in by_group for k in keys}
         moved = [
             k for k, owned in self._tail_run.items() if owned is tag or owned in keyed
         ]
-        self._drop_run(tag)
+        self._drop_run(tag, keep_tails=True)
         for key in moved:
-            self._forget_tail_key(key)
-            self._tail_run[key] = tag
-            self._run_tails.setdefault(tag, []).append(key)
+            self._move_tail_key(key, tag)
         if not chain:
             # Nothing a restore could read (no boundary with every state
             # group stored): never offered, so never refused every step.
@@ -1364,7 +1364,11 @@ class OffloadingConnectorScheduler:
         while len(self._run_keys) > WRITE_BACK_MAX_RUNS:
             self._drop_run(next(iter(self._run_keys)))
 
-    def _drop_run(self, tag: OffloadKey) -> None:
+    def _drop_run(self, tag: OffloadKey, keep_tails: bool = False) -> None:
+        """Stop tracking a run. ``keep_tails`` is the re-tag in _record_run,
+        which is re-parenting the run's tails rather than losing them: it leaves
+        them owned by this tag for _move_tail_key, because nothing here says the
+        arena dropped a row."""
         old = self._run_keys.pop(tag, None)
         self._run_by_group.pop(tag, None)
         self._run_extras.pop(tag, None)
@@ -1372,8 +1376,9 @@ class OffloadingConnectorScheduler:
         # later store of another run takes it along. The ownership and the rows
         # it indexes go together: the eviction feed reaches a tail only through
         # _tail_run, so a record left behind would be one no cleaner can find.
-        for key in self._run_tails.pop(tag, ()):
-            self._forget_tail_key(key)
+        if not keep_tails:
+            for key in self._run_tails.pop(tag, ()):
+                self._forget_tail_key(key)
         if old is not None:
             for key in old:
                 if self._key_run.get(key) == tag:
@@ -1532,6 +1537,8 @@ class OffloadingConnectorScheduler:
 
         The whole tail goes with it: a restore reads every row the store wrote,
         so one row the arena dropped is a tail no restore can be granted over.
+        This is the primitive for the arena dropping a row; an ownership move
+        keeps the record, see _move_tail_key.
         """
         self._tail_row_keys.pop(bytes(key)[:-4], None)
         owned = self._tail_run.pop(key, None)
@@ -1541,6 +1548,25 @@ class OffloadingConnectorScheduler:
                 tails.remove(key)
             if not tails:
                 del self._run_tails[owned]
+
+    def _move_tail_key(self, key: OffloadKey, tag: OffloadKey | None) -> None:
+        """Re-parent a tail key in _tail_run and in its run's tail list.
+
+        Ownership only. A move asks the arena nothing, so the rows a store wrote
+        under the key are still there and the record of them stays where the
+        store left it: only a row the arena dropped parts a key from its record.
+        """
+        owned = self._tail_run.pop(key, None)
+        if owned is not None:
+            tails = self._run_tails.get(owned)
+            if tails is not None:
+                if key in tails:
+                    tails.remove(key)
+                if not tails:
+                    del self._run_tails[owned]
+        self._tail_run[key] = tag
+        if tag is not None:
+            self._run_tails.setdefault(tag, []).append(key)
 
     def _restore_chain(
         self,

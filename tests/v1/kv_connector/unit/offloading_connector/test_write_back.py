@@ -1138,6 +1138,38 @@ def test_a_tail_moves_to_the_run_its_request_last_named(monkeypatch):
     assert early not in scheduler._run_tails
 
 
+def test_a_retag_keeps_the_rows_the_store_recorded(monkeypatch):
+    # A later turn re-parents the tail stored for the conversation onto the run
+    # that turn names. A move asks the arena nothing, so the rows are still
+    # there and the record a restore is granted over has to survive it. The
+    # ownership holds at the head too, which is why the record is what this
+    # test is for.
+    scheduler, req_status, keys, run = _stored_tail()
+    tail_hash = bytes(keys[0])[:-4]
+    rows = scheduler._tail_row_keys[tail_hash]        # what the store recorded
+    req_status.req.block_hashes.append(BlockHash(b"h7"))
+    req_status.update_offload_keys()           # a deeper chunk, so a new tag
+    monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
+    scheduler._record_run(req_status)
+    last = req_status.group_states[0].offload_keys[-1]
+    assert all(scheduler._tail_run[k] == last for k in keys)
+    assert scheduler._tail_row_keys[tail_hash] == rows
+
+
+def test_a_retag_in_the_storing_step_keeps_the_rows(monkeypatch):
+    # The store and the finish share a step, so the tail is already owned by the
+    # tag the finish names: the run drop that precedes the re-parenting is the
+    # only thing left standing between the row and its record.
+    scheduler, req_status, keys, run = _stored_tail()
+    tail_hash = bytes(keys[0])[:-4]
+    rows = scheduler._tail_row_keys[tail_hash]        # what the store recorded
+    monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
+    scheduler._record_run(req_status)
+    assert all(scheduler._tail_run[k] == run for k in keys)
+    assert scheduler._run_tails[run] == keys
+    assert scheduler._tail_row_keys[tail_hash] == rows
+
+
 def test_a_tail_is_recorded_against_the_run_that_owns_it():
     # A tail belongs to a run, not to a session: the run named after the
     # request's last attention key is what the tail leaves with, and the run a

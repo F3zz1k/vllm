@@ -84,6 +84,14 @@ and the finish moves the request's rows into the run named after its last one (`
 holds and reads it as a chunk key again. Only the band keeps run records, so only the band
 re-tags: with the band off the tag is read by nothing.
 
+**A move is not a drop.** That re-tag re-parents the tail key in `_tail_run` and in its run's
+list (`_move_tail_key`) and asks the arena nothing, so the rows are where the store left them
+and `_tail_row_keys` keeps the record a restore is granted over. Only `_forget_tail_key`, the
+primitive for a row the arena dropped, parts a key from its record; the run drop the re-tag
+begins with keeps its tails for the move (`_drop_run`, `keep_tails`). A record left behind by
+a move is one the cleaner can still reach, which is the difference between a tail the band
+has stopped offering and a tail that can never be dropped again.
+
 **A tail leaves when its run leaves (D17).** `_drop_run` (`scheduler.py:1259`) forgets a
 run's tail keys with its chain and its older restore points. No later run takes a tail
 over: the band cannot write one, and a tail left behind by a dropped run is unreachable.
