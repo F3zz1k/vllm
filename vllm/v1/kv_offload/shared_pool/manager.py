@@ -298,6 +298,17 @@ class SharedPoolOffloadingManager(OffloadingManager):
             for parent, tails in reply.items()  # type: ignore[union-attr]
         }
 
+    def answers_tail_lookups(self) -> bool:
+        """Whether this manager can say which tails the pool holds.
+
+        ``tail_index`` is the question; this says whether asking it could be
+        answered. A manager with no server attached has nobody to ask, and a pool
+        that keeps no tail record said so on the first ask and will keep saying
+        it. A reattach clears the refusal: the pool can be replaced under an
+        engine that is still running.
+        """
+        return self._client is not None and self._tails_supported
+
     def _prepare_store(
         self, keys: Collection[OffloadKey], tag: str | bytes, whole: bool = False,
         held: bool = False, tails: dict[bytes, tuple[bytes, int]] | None = None,

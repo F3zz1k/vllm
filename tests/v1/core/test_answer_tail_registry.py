@@ -493,7 +493,9 @@ def test_a_tier_that_cannot_answer_is_never_asked_about_those_candidates():
     """The empty registry is also the fast path that keeps a tierless
     deployment, and every deployment before any tail finishes, off the
     per-group cache-hit walk on every request: the candidates are only worth
-    enumerating once a tier exists that could answer for them."""
+    enumerating once a tier exists that could answer for them. A registry that
+    does know a tail changes nothing: enumerating the boundaries a request
+    repeats is a question for the tier, whatever this process finished."""
     manager = _manager()
     store = _RecordingTailStore()
     manager.answer_tail.store = store
@@ -506,6 +508,18 @@ def test_a_tier_that_cannot_answer_is_never_asked_about_those_candidates():
 
     assert store.asked == []
     assert store.probed == []
+    assert resuming.tail_resume is None
+
+    # Now the registry knows a tail, so the walk runs and the tier is asked
+    # about what this process finished. The candidates stay the tier's to answer
+    # and it still cannot, so the boundaries are never enumerated.
+    _run_to_finish(manager, finished, OUTPUT)
+    assert _tail_maps(manager.block_pool)[1]
+
+    manager.answer_tail._find_finish_tail_hit(resuming, resuming.num_tokens - 1, 0)
+
+    assert store.asked == []
+    assert store.probed
     assert resuming.tail_resume is None
 
 

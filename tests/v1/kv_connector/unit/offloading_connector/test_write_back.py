@@ -2144,6 +2144,22 @@ def test_a_pool_that_keeps_no_tail_record_leaves_the_route_as_it_was():
     assert scheduler._pool_tail_keys == set()
 
 
+def test_the_store_answers_a_probe_only_when_the_tier_can_answer():
+    """Whether a probe is worth putting is the tier's answer, not this object's:
+    the queue holds offers and no rows, so a candidate tail this process never
+    stored is a question for the pool. A manager that keeps no tail record cannot
+    say which tails it holds, and the walk that asks costs a parent hash per
+    boundary of every waiting request."""
+    scheduler = _make_drafter_partial_tail_scheduler(True)
+    assert scheduler.answer_tail_store.answers_lookups() is False
+
+    scheduler.manager.answers_tail_lookups = MagicMock(return_value=True)
+    assert scheduler.answer_tail_store.answers_lookups() is True
+
+    scheduler.manager.answers_tail_lookups = MagicMock(return_value=False)
+    assert scheduler.answer_tail_store.answers_lookups() is False
+
+
 def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     """The bench's own sequence, end to end: store a tail, a bare
     ``/reset_prefix_cache``, the turn replayed and its tail offered again, then

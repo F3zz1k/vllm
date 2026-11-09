@@ -929,6 +929,7 @@ class OffloadingConnectorScheduler:
             self._tail_is_held,
             lambda: self._cache_generation,
             tails=self._pool_tail_lengths,
+            can_answer=self._answers_tail_lookups,
         )
         # The rows each stored tail was written as, by tail key. A restore is
         # granted over every row of a tail or none of them, and a windowed
@@ -4864,6 +4865,19 @@ class OffloadingConnectorScheduler:
 
         """
         yield from self._events_tracker.take_events(self.manager.take_events())
+
+    def _answers_tail_lookups(self) -> bool:
+        """Whether the manager can answer which tails the pool holds.
+
+        A tail this process never stored can only be found by asking the pool,
+        and only a manager that keeps a tail record can answer: a CPU tier keeps
+        none, and a pool that predates the record said so on the first ask. The
+        probe that enumerates a resuming request's boundaries costs a parent hash
+        for each of them on every lookup, so it asks only where the answer can
+        come from.
+        """
+        answers = getattr(self.manager, "answers_tail_lookups", None)
+        return bool(answers()) if answers is not None else False
 
     def _pool_tail_lengths(
         self, parents: Sequence[BlockHash | None]

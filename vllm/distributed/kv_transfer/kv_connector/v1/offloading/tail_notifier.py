@@ -65,6 +65,7 @@ class AnswerTailNotifier(AnswerTailStore):
         tails: Callable[
             [Sequence[BlockHash | None]], Mapping[BlockHash | None, tuple[int, ...]]
         ],
+        can_answer: Callable[[], bool],
         max_offers: int = _MAX_OFFERS,
     ) -> None:
         """``report`` is the connector's tail reporter: the refusals this object
@@ -91,12 +92,18 @@ class AnswerTailNotifier(AnswerTailStore):
         probe names. A tail key cannot be enumerated by the side that did not
         finish the turn, so this is the only way a brand-new engine finds a tail
         its own registry never saw.
+
+        ``can_answer`` is whether the tier can answer that question at all. This
+        queue holds offers and no rows, so a candidate tail this process never
+        stored is a question for the pool behind the connector, and only the
+        connector's manager knows whether it keeps the record to answer it.
         """
         self.report = report
         self.on_reset = on_reset
         self.holds = holds
         self.generation = generation
         self.tails = tails
+        self.can_answer = can_answer
         self.pending: OrderedDict[tuple[str, bytes], TailOffer] = OrderedDict()
         self._restored: OrderedDict[tuple[bytes, tuple[tuple[int, ...], ...]], bool] = (
             OrderedDict()
@@ -175,9 +182,15 @@ class AnswerTailNotifier(AnswerTailStore):
     # --- the load side: the tier answers, the connector fences ---
 
     def answers_lookups(self) -> bool:
-        """The connector can put a probe to the arena, so the core walks the
-        candidates a turn finished elsewhere would have left behind."""
-        return True
+        """Whether the tier behind this queue can answer a lookup at all.
+
+        The queue holds offers, not rows: a candidate tail this process never
+        stored is a question for the pool, and only the manager knows whether it
+        keeps the record the answer comes from. A tier that cannot answer is not
+        worth walking a resuming request's boundaries for, once per lookup of
+        every waiting request.
+        """
+        return self.can_answer()
 
     def tail_lengths(
         self, parents: Sequence[BlockHash | None]

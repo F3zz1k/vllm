@@ -484,6 +484,12 @@ class AnswerTail:
         fences the position against what its load can reach, and a tail deeper
         than that is the one this request would rather have.
         """
+        if not self.store.answers_lookups():
+            # The enumeration below is a parent hash per boundary of this
+            # request, and it is a question for the tier alone: a store that
+            # cannot answer it (no tier at all, or a pool that keeps no tail
+            # record) is not worth walking, whatever the local registry knows.
+            return
         hash_block_size = self.block_pool.hash_block_size
         starts = range(
             round_down(request.num_tokens - 1, hash_block_size), -1, -hash_block_size
