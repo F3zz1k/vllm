@@ -229,6 +229,19 @@ def test_a_store_that_names_no_tails_records_nothing():
     assert not cls.tails
 
 
+def test_re_naming_a_tail_row_moves_it_out_of_the_parent_it_leaves():
+    # A row is named under one parent. forget reaches a row through entry.tail
+    # alone, so a record left under the parent a re-name leaves behind would keep
+    # answering for a tail whose row no longer says where it belongs.
+    arena, cls, a, _ = single(rows=4)
+    store(arena, a, [key(1, 0)], tails={key(1, 0): (b"parent", 12)})
+
+    store(arena, a, [key(1, 0)], tails={key(1, 0): (b"other", 9)})
+
+    assert arena.tails(a) == {b"other": [[9, key(1, 0)[:-4]]]}
+    assert set(cls.tails) == {b"other"}
+
+
 def test_store_then_other_client_hits_and_loads_same_row():
     arena, cls, a, b = single()
     new, rows, evicted = store(arena, a, [key(1), key(2)])

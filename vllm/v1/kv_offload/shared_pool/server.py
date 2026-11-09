@@ -753,9 +753,26 @@ class LayoutClass:
         tokens it covers: the two facts a tail key does not carry, because it
         hashes the finished turn's tokens. An engine that did not finish that
         turn can name neither, and without them it cannot ask for the tail.
+
+        A row is named under one parent only. ``forget`` reaches a row through
+        ``entry.tail`` alone, so a re-name takes the key out of the parent it no
+        longer names first: a record left behind would answer for a tail whose
+        row no longer says where it belongs.
         """
+        old = entry.tail
+        if old is not None and old[0] != parent:
+            self._untail(key, old[0])
         entry.tail = (parent, length)
         self.tails.setdefault(parent, {})[key] = length
+
+    def _untail(self, key: bytes, parent: bytes) -> None:
+        """Take a row out of one parent's tail rows, and that parent out of the
+        record when the row was its last."""
+        rows = self.tails.get(parent)
+        if rows is not None:
+            rows.pop(key, None)
+            if not rows:
+                del self.tails[parent]
 
     def add_entry(self, key: bytes, entry: Entry) -> None:
         self.index[key] = entry
@@ -774,11 +791,7 @@ class LayoutClass:
             else:
                 w.evicted_overflow = True
         if entry.tail is not None:
-            rows = self.tails.get(entry.tail[0])
-            if rows is not None:
-                rows.pop(key, None)
-                if not rows:
-                    del self.tails[entry.tail[0]]
+            self._untail(key, entry.tail[0])
         del self.index[key]
         del self.row_key[entry.row]
         self.n_pending -= not entry.ready
