@@ -71,8 +71,9 @@ def single(rows=4, **kw):
     return arena, cls, client(cls, 1), client(cls, 2)
 
 
-def store(arena, c, keys, tag=None, success=True):
-    res = arena.prepare_store(c, keys, tag if tag is not None else keys[-1])
+def store(arena, c, keys, tag=None, success=True, tails=None):
+    res = arena.prepare_store(c, keys, tag if tag is not None else keys[-1],
+                              tails=tails)
     assert res is not None
     arena.complete_store(c, res[0], success)
     return res
@@ -160,6 +161,72 @@ def assert_one_row_per_key(keys, rows):
 
 
 # --- single class: stores, loads, holds ---
+
+
+# --- the answer tails a class holds ---
+
+
+def test_a_tail_store_records_the_parent_and_length_it_names():
+    # A tail key hashes the finished turn's tokens, so a restarted engine can
+    # neither read the parent off it nor guess the length: the store names both
+    # with its keys, and that record is the only way the tail is found again.
+    arena, cls, a, b = single(rows=4)
+    store(arena, a, [key(1, 0)], tails={key(1, 0): (b"parent", 12)})
+
+    assert arena.tails(a) == {b"parent": [[12, key(1, 0)[:-4]]]}
+    # The record is the class's, not the client's: the next engine reads it.
+    assert arena.tails(b) == arena.tails(a)
+
+
+def test_the_tail_record_names_a_tail_once_whatever_groups_it_spans():
+    # One row per group, every one of them carrying the same parent and length,
+    # and a reply per row would have an engine probe the same tail four times.
+    arena, _, a, _ = single(rows=4)
+    rows = [key(1, 0), key(1, 1), key(1, 2)]
+    store(arena, a, rows, tails={row: (b"parent", 12) for row in rows})
+
+    assert arena.tails(a) == {b"parent": [[12, key(1, 0)[:-4]]]}
+
+
+def test_a_row_still_being_written_is_no_tail_yet():
+    # A resume onto a half-written tail reads it as the state at the tail, so
+    # the record waits for the store that fills the row.
+    arena, _, a, _ = single(rows=4)
+    arena.prepare_store(a, [key(1, 0)], key(1, 0), tails={key(1, 0): (b"parent", 12)})
+
+    assert arena.tails(a) == {}
+
+
+def test_a_failed_tail_store_records_nothing():
+    arena, _, a, _ = single(rows=4)
+    store(arena, a, [key(1, 0)], tails={key(1, 0): (b"parent", 12)}, success=False)
+
+    assert arena.tails(a) == {}
+
+
+def test_an_evicted_tail_leaves_the_record():
+    # A tail the arena dropped is one no restore can be granted over, and a
+    # record that outlived its rows would send an engine asking for them.
+    arena, cls, a, _ = single(rows=5)
+    store(arena, a, [key(1, 0), key(2, 0)], key(2, 0),
+          tails={key(1, 0): (b"parent", 12)})
+    store(arena, a, [key(3, 0), key(4, 0)], key(4, 0))
+    assert arena.tails(a) == {b"parent": [[12, key(1, 0)[:-4]]]}
+
+    assert arena.prepare_store(a, [key(5, 0), key(6, 0)], key(6, 0)) is not None
+
+    assert arena.tails(a) == {}
+    assert not cls.tails
+
+
+def test_a_store_that_names_no_tails_records_nothing():
+    # The record is new: an old client sends no tails at all and the store it
+    # makes has to be the store it was, down to the arguments it sends.
+    arena, cls, a, _ = single(rows=4)
+    store(arena, a, [key(1, 0)])
+
+    assert arena.tails(a) == {}
+    assert not cls.tails
 
 
 def test_store_then_other_client_hits_and_loads_same_row():

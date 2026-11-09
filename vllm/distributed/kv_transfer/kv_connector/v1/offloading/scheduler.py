@@ -1777,9 +1777,12 @@ class OffloadingConnectorScheduler:
         return out
 
     def _prepare_store_run(
-        self, keys: Any, tag: OffloadKey, whole: bool = False, held: bool = False
+        self, keys: Any, tag: OffloadKey, whole: bool = False, held: bool = False,
+        tails: dict[Any, tuple[bytes, int]] | None = None,
     ) -> Any:
         kw = {"held": True} if held else {}
+        if tails:
+            kw["tails"] = tails
         out = self.manager.prepare_store_run(keys, tag, whole=whole, **kw)
         self._note_evicted(out)
         return out
@@ -2782,10 +2785,12 @@ class OffloadingConnectorScheduler:
             return self._refuse_tail_resume(req_status, record.resume_token, detail)
         if bytes(record.tail_key) not in self._tail_row_keys:
             # The arena holds them, so which rows they are is now known here as
-            # well as there, and the eviction feed drops the record if one of
-            # them leaves. A grant was never going to be made on a belief
-            # nobody confirmed: this is the confirmation.
+            # well as there, and the eviction feed drops both records if one of
+            # them leaves. A grant was never made on a belief nobody confirmed:
+            # this is the confirmation, and the mirror is marked on the arena's
+            # answer, the same way a tail the pool already held is marked.
             self._tail_row_keys[bytes(record.tail_key)] = rows
+            self._note_in_pool(rows)
         return record
 
     def _confirm_tail_rows(
@@ -3836,8 +3841,21 @@ class OffloadingConnectorScheduler:
         # every offered key the pool lacks, and this job writes only its tail's
         # rows. The tail joins its run because it is offered under the run's
         # tag, not because the tag's other members come along.
+        #
+        # The store names the parent and the length with its tail rows. A tail
+        # key hashes the finished turn's tokens, so neither fact can be read
+        # back from the row it is stored under, and an engine that starts after
+        # this one has nothing else to ask the pool with.
+        named = {
+            row.key: (
+                b"" if handoff.parent is None else bytes(handoff.parent),
+                handoff.length,
+            )
+            for row in rows
+            if row.is_tail
+        }
         store_output = (
-            self._prepare_store_run(keys, tag)
+            self._prepare_store_run(keys, tag, tails=named)
             if hasattr(self.manager, "prepare_store_run")
             else self._prepare_store(keys, req_status.req_context)
         )

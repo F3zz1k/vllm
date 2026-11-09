@@ -229,6 +229,11 @@ class Entry:
     pinned: bool = False
     promoting: bool = False  # being read from disk
     moving: int | None = None  # destination row of a copy in flight
+    # (parent hash, tail length) when this row is an answer tail's row, as the
+    # store that wrote it named them. Neither is recoverable from the key, which
+    # hashes the finished turn's tokens, and a fresh engine needs both to find a
+    # turn another instance finished. See LayoutClass.note_tail.
+    tail: tuple[bytes, int] | None = None
     runs: set = field(default_factory=set)
 
 
@@ -629,6 +634,12 @@ class LayoutClass:
         self.num_rows = arena.size // stride
         self.index: dict[bytes, Entry] = {}
         self.row_key: dict[int, bytes] = {}
+        # The answer tails this class holds, ``{parent: {key: length}}``. The
+        # arena is the only thing that outlives an engine and a tail key keeps
+        # nothing a restarted engine could read to find the turn that made it,
+        # so the store hands these two facts over with its keys and they leave
+        # with the rows. Empty for a class no tail was ever stored in.
+        self.tails: dict[bytes, dict[bytes, int]] = {}
         self.runs: dict[bytes, Run] = {}
         # Owned superpage -> its free rows; partial: the superpages with a
         # free row, in allocation order (normal and pin zone apart).
@@ -735,6 +746,17 @@ class LayoutClass:
             self.partial[sp] = None
             self.free_rows += len(free)
 
+    def note_tail(self, key: bytes, entry: Entry, parent: bytes, length: int) -> None:
+        """Record that this row is an answer tail's row, and whose.
+
+        ``parent`` is the hash the tail's key is chained on and ``length`` the
+        tokens it covers: the two facts a tail key does not carry, because it
+        hashes the finished turn's tokens. An engine that did not finish that
+        turn can name neither, and without them it cannot ask for the tail.
+        """
+        entry.tail = (parent, length)
+        self.tails.setdefault(parent, {})[key] = length
+
     def add_entry(self, key: bytes, entry: Entry) -> None:
         self.index[key] = entry
         self.row_key[entry.row] = key
@@ -751,6 +773,12 @@ class LayoutClass:
                 w.evicted.append(key)
             else:
                 w.evicted_overflow = True
+        if entry.tail is not None:
+            rows = self.tails.get(entry.tail[0])
+            if rows is not None:
+                rows.pop(key, None)
+                if not rows:
+                    del self.tails[entry.tail[0]]
         del self.index[key]
         del self.row_key[entry.row]
         self.n_pending -= not entry.ready
@@ -1427,7 +1455,8 @@ class Arena:
                 cls.counters["held_on_load"] += 1
 
     def prepare_store(self, client: ClientState, keys: list[bytes], tag: bytes,
-                      whole: bool = False, held: bool = False
+                      whole: bool = False, held: bool = False,
+                      tails: dict[bytes, tuple[bytes, int]] | None = None
                       ) -> tuple[list[bytes], list[int], list[bytes]] | None:
         """Allocate rows for the keys the class does not hold yet; every
         offered key joins run tag, which becomes newest. Space comes from
@@ -1435,7 +1464,8 @@ class Arena:
         compaction. All or nothing: returns None and changes nothing when the
         walk cannot free enough. The run's rows share superpages (see
         LayoutClass.alloc). ``held``: the client's GPU keeps the blocks it
-        stores from (see hold)."""
+        stores from (see hold). ``tails`` names the answer tails among the
+        offered keys, ``{key: (parent, length)}`` (see LayoutClass.note_tail)."""
         cls = client.cls
         assert cls is not None
         self.maintain()
@@ -1488,6 +1518,14 @@ class Arena:
             cls.add_entry(key, entry)
             self.join(run, key, entry)
             client.writes.add(key)
+        # The tail facts go on the rows they describe, resident ones included:
+        # a tail re-offered to a pool that already holds it is still one a fresh
+        # engine has to be able to find.
+        for key in offered:
+            named = (tails or {}).get(key)
+            entry = cls.index.get(key)
+            if named is not None and entry is not None:
+                cls.note_tail(key, entry, named[0], int(named[1]))
         cls.counters["chunks_stored"] += len(new_keys)
         if held:
             self.hold(run, client)
@@ -1536,6 +1574,30 @@ class Arena:
             else:
                 cls.drop_entry(key, entry, quarantine=True)
                 cls.counters["store_failed"] += 1
+
+    def tails(self, client: ClientState) -> dict[bytes, list[list[object]]]:
+        """The answer tails this client's class holds, ``{parent: [[length,
+        tail], ...]}``.
+
+        The pool cannot recover either fact from a tail key, which hashes the
+        finished turn's tokens, so the store handed them over when the rows were
+        taken and they leave with the rows. A tail is one row per group and every
+        row of one tail carries the same pair, so a tail is named once. A row
+        still being written is not held yet: an engine that resumed onto a
+        half-written tail would read it as the state at the tail.
+        """
+        cls = client.cls
+        assert cls is not None
+        found: dict[bytes, set[tuple[int, bytes]]] = {}
+        for parent, rows in cls.tails.items():
+            for key, length in rows.items():
+                entry = cls.index.get(key)
+                if entry is not None and entry.ready:
+                    found.setdefault(parent, set()).add((length, key[:-4]))
+        return {
+            parent: [[length, tail] for length, tail in sorted(rows)]
+            for parent, rows in found.items()
+        }
 
     def touch(self, client: ClientState, keys: list[bytes]) -> None:
         cls = client.cls
@@ -2777,12 +2839,19 @@ class PoolServer:
         if op == P.OP_PREPARE_STORE_TAGGED:
             whole = bool(args[2]) if len(args) > 2 else False
             held = bool(args[3]) if len(args) > 3 else False
-            res = self.arena.prepare_store(client, args[0], _tag(args[1]), whole, held)
+            tails = args[4] if len(args) > 4 else None
+            res = self.arena.prepare_store(
+                client, args[0], _tag(args[1]), whole, held,
+                None if tails is None else {bytes(k): (bytes(v[0]), v[1])
+                                            for k, v in tails.items()},
+            )
             return None if res is None else list(res)
         if op == P.OP_EVICTED:
             keys, overflow = client.evicted, client.evicted_overflow
             client.evicted, client.evicted_overflow = [], False
             return [keys, overflow]
+        if op == P.OP_TAILS:
+            return self.arena.tails(client)
         if op == P.OP_MERGE_TAG:
             return self.arena.merge_tag(client, _tag(args[0]), _tag(args[1]))
         if op == P.OP_COMPLETE_STORE:

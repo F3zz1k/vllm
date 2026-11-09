@@ -20,7 +20,7 @@ succeeds when the server again serves the arena the workers mapped.
 """
 
 import time
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import Any
 
 from typing_extensions import override
@@ -239,13 +239,20 @@ class SharedPoolOffloadingManager(OffloadingManager):
 
     def prepare_store_run(
         self, keys: Collection[OffloadKey], tag: OffloadKey, whole: bool = False,
-        held: bool = False,
+        held: bool = False, tails: Mapping[OffloadKey, tuple[bytes, int]] | None = None,
     ) -> PrepareStoreOutput | None:
         """Store keys in the run of ``tag``, all or nothing. ``whole`` marks a
         whole conversation, which the server refuses when the run could not
         restore anything (no recurrent state at any of its boundaries).
-        ``held``: this engine's GPU keeps the blocks stored from."""
-        return self._prepare_store(keys, bytes(tag), whole, held)
+        ``held``: this engine's GPU keeps the blocks stored from. ``tails``:
+        ``{key: (parent, length)}`` for the keys that are answer-tail rows, the
+        two facts a tail key does not carry (see the server's note_tail)."""
+        return self._prepare_store(
+            keys, bytes(tag), whole, held,
+            None if tails is None else {
+                bytes(k): (parent, length) for k, (parent, length) in tails.items()
+            },
+        )
 
     def pool_evicted(self) -> tuple[list[OffloadKey], bool]:
         """Keys of this class the pool dropped since the last call, and whether
@@ -293,13 +300,18 @@ class SharedPoolOffloadingManager(OffloadingManager):
 
     def _prepare_store(
         self, keys: Collection[OffloadKey], tag: str | bytes, whole: bool = False,
-        held: bool = False,
+        held: bool = False, tails: dict[bytes, tuple[bytes, int]] | None = None,
     ) -> PrepareStoreOutput | None:
         args: list[Any] = [[bytes(k) for k in keys], tag]
-        if whole or held:
+        # The optional arguments are positional on the wire, so naming tails
+        # sends the two before it as well. A server that predates them reads the
+        # ones it knows and ignores the rest.
+        if whole or held or tails:
             args.append(whole)
-        if held:
-            args.append(True)
+        if held or tails:
+            args.append(held)
+        if tails:
+            args.append(tails)
         try:
             result = self._call_soft(P.OP_PREPARE_STORE_TAGGED, args)
         except ConnectionError:

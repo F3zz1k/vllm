@@ -346,6 +346,12 @@ def _cpu_store_output(keys, req_context=None):
                               evicted_keys=[])
 
 
+def _takes_every_key(keys, tag, whole=False, held=False, tails=None):
+    """A pool that allocates a row for every key the store offered, whatever
+    else the call named (see ``prepare_store_run``)."""
+    return _cpu_store_output(keys)
+
+
 @pytest.mark.parametrize("forced", [False, True])
 def test_a_boundary_state_is_stored_while_the_gate_is_closed(forced):
     # A boundary state exists only in its hand-off (the band cannot offer
@@ -1188,7 +1194,7 @@ def _answer_tail_offer(
     for group_idx, block_ids in blocks.items():
         assert scheduler.answer_tail_store.store_tail(handoff, group_idx, block_ids)
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
+        side_effect=_takes_every_key
     )
     if pool_refused:
         # No side effect: a mock's side effect wins over its return value, and
@@ -1231,6 +1237,21 @@ def test_an_offered_answer_tail_becomes_one_store_in_its_run():
     assert scheduler._tail_counts["tail_offered"] == 1
     assert scheduler._tail_counts["tail_stored"] == 1
     assert all(scheduler._tail_run[key] == tag for key in tail_keys)
+
+
+def test_a_tail_store_names_its_parent_and_length_with_its_rows():
+    """The pool keeps rows, not turns: a tail key hashes the finished turn's
+    tokens, so neither the parent it is chained on nor the length it covers can
+    be read back off the row it was stored under. The store names both, because
+    an engine that starts after this one has nothing else to ask with."""
+    scheduler, handoff, blocks = _answer_tail_offer()
+
+    scheduler._build_answer_tail_store_jobs()
+
+    (_, _), kwargs = scheduler.manager.prepare_store_run.call_args
+    assert kwargs["tails"] == {
+        bytes(key): (b"", handoff.length) for key in _tail_keys(handoff, sorted(blocks))
+    }
 
 
 def test_a_tail_store_waits_for_the_step_that_may_still_own_its_blocks():
@@ -1370,7 +1391,7 @@ def test_a_queued_tail_keeps_its_request_alive_until_the_pool_makes_room():
 
     # Step N+1: the pool has room, and the tail's own retry stores into it.
     scheduler.manager.prepare_store_run.side_effect = (
-        lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
+        lambda keys, tag, whole=False, held=False, tails=None: _cpu_store_output(keys)
     )
     meta = scheduler.build_connector_meta(_finished_step(set()))
     _assert_one_row_per_key(scheduler, meta.store_jobs)
@@ -1595,8 +1616,8 @@ def test_a_window_row_the_pool_already_holds_is_not_stored_twice():
     # is the block three places before that one.
     resident = _window_row_key(scheduler, 4)
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(
-            [key for key in keys if key != resident]
+        side_effect=lambda keys, tag, whole=False, held=False, tails=None: (
+            _cpu_store_output([key for key in keys if key != resident])
         )
     )
     jobs = scheduler._build_answer_tail_store_jobs()
@@ -2034,6 +2055,10 @@ def test_a_tail_another_engine_stored_is_granted_over_the_rows_its_key_names():
     looked_up = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
     assert all(row in looked_up for row in rows)
     assert scheduler._tail_row_keys[b"tail"] == rows
+    # The pool view is marked as well, on the arena's own answer. Without it the
+    # next request of the same conversation is answered from a record of rows
+    # this process never stored, which is to say: not at all.
+    assert all(row in scheduler._pool_has for row in rows)
 
 
 def test_a_tail_another_engine_named_is_refused_when_the_arena_lacks_a_row():
@@ -2057,6 +2082,7 @@ def test_a_tail_another_engine_named_is_refused_when_the_arena_lacks_a_row():
     assert scheduler._tail_counts["tail_restore_refused"] == 1
     assert scheduler._tail_counts["tail_restore_granted"] == 0
     assert b"tail" not in scheduler._tail_row_keys
+    assert not scheduler._pool_has
 
 
 def test_the_tier_answers_for_a_tail_this_process_never_stored():
@@ -2151,7 +2177,7 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
 
     offer()
     scheduler.manager.prepare_store_run = MagicMock(
-        side_effect=lambda keys, tag, whole=False, held=False: _cpu_store_output(keys)
+        side_effect=_takes_every_key
     )
     jobs = scheduler._build_answer_tail_store_jobs()
     _assert_one_row_per_key(scheduler, jobs)
@@ -2394,8 +2420,8 @@ class MarkerPool:
             keys, client, None
         )
         manager.prepare_store_run = (
-            lambda keys, tag, whole=False, held=False: self._prepare_store(
-                keys, client, bytes(tag), whole, held
+            lambda keys, tag, whole=False, held=False, tails=None: self._prepare_store(
+                keys, client, bytes(tag), whole, held, tails
             )
         )
         manager.complete_store = lambda keys, ctx, success=True: (
@@ -2423,13 +2449,14 @@ class MarkerPool:
     def row_of(self, key: OffloadKey) -> int:
         return self.cls.index[bytes(key)].row
 
-    def _prepare_store(self, keys, client, tag, whole=False, held=False):
+    def _prepare_store(self, keys, client, tag, whole=False, held=False, tails=None):
         out = self.arena.prepare_store(
             client,
             [bytes(k) for k in keys],
             tag if tag is not None else client.name,
             whole=whole,
             held=held,
+            tails=tails,
         )
         if out is None:
             return None

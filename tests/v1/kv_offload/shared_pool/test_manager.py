@@ -378,6 +378,45 @@ def test_a_pool_that_never_heard_of_tails_is_asked_once(server):
     assert manager.lookup(key(1), CTX) == LookupResult.HIT
 
 
+def test_a_tail_store_names_its_parent_and_length(server):
+    """Neither fact can be read back off a row keyed on the finished turn's
+    tokens, and the store that wrote the rows is the only side that still knows
+    the turn, so it names them with its keys. The two arguments before are
+    carried along because the optional ones are positional on the wire."""
+    manager = manager_of(make_spec(server.sock_path, engine_id="e1"))
+
+    manager.prepare_store_run([key(1)], key(9), tails={key(1): (b"parent", 12)})
+
+    assert server.calls[-1] == (
+        P.OP_PREPARE_STORE_TAGGED,
+        [
+            [bytes(key(1))],
+            bytes(key(9)),
+            False,
+            False,
+            {bytes(key(1)): (b"parent", 12)},
+        ],
+    )
+
+
+def test_a_store_that_names_no_tails_sends_what_it_always_sent(server):
+    """An old server reads the arguments it knows and ignores the rest, so a
+    store with no tails may not change the list at all."""
+    manager = manager_of(make_spec(server.sock_path, engine_id="e1"))
+
+    manager.prepare_store_run([key(1)], key(9))
+    manager.prepare_store([key(2)], CTX)
+
+    assert server.calls[-2] == (
+        P.OP_PREPARE_STORE_TAGGED,
+        [[bytes(key(1))], bytes(key(9))],
+    )
+    assert server.calls[-1] == (
+        P.OP_PREPARE_STORE_TAGGED,
+        [[bytes(key(2))], "e1/r"],
+    )
+
+
 # --- running without the pool ---
 
 
