@@ -2072,6 +2072,74 @@ def test_a_resume_is_refused_unless_the_arena_holds_every_chunk_below_it():
     assert req_status.tail_resume is None
 
 
+def test_a_resume_the_arena_is_still_filling_is_probed_again_next_step():
+    """A RETRY for a chunk under a resume is the arena asking to be asked
+    again, not a chunk it will never hold, so the resume is granted on a later
+    step instead of being forfeited by the first transient answer."""
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=99, prompt_tokens=100
+    )
+    filling = req_status.group_states[1].offload_keys[5]
+    answers = {filling: LookupResult.RETRY}
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: answers.get(
+        key, LookupResult.HIT
+    )
+
+    # The lookup is deferred, not refused: nothing is claimed and nothing is
+    # counted against the resume, and the record stays to be probed again.
+    assert scheduler._lookup(req_status) is None
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
+    assert req_status.req.tail_resume is record
+
+    # The arena filled the chunk: the next probe reaches the resume.
+    answers.clear()
+    assert scheduler._lookup(req_status) == record.resume_token
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+
+
+def test_a_resume_the_arena_has_lost_a_chunk_below_is_refused_for_good():
+    # A MISS is the arena's last word about a chunk, so it is refused on the
+    # spot and once: the record goes with the chunk, and a request that comes
+    # back later does not ask for a row the arena has said it does not hold.
+    scheduler, req_status, _ = _tail_resume_layout(resume_token=99, prompt_tokens=100)
+    missing = req_status.group_states[1].offload_keys[5]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.MISS if key == missing else LookupResult.HIT
+    )
+
+    assert scheduler._lookup(req_status) == 92
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_retried"] == 0
+    assert req_status.req.tail_resume is None
+
+    # A later step takes the shorter hit it was offered and asks nothing again.
+    assert scheduler._lookup(req_status) == 92
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_retried"] == 0
+
+
+def test_a_resume_the_arena_never_fills_is_refused_when_its_probes_run_out():
+    # Waiting for a row that never lands would hold the request in the waiting
+    # queue for nothing, so the re-probe is bounded the way a refused store is:
+    # after the budget the resume is refused and counted like any other.
+    scheduler, req_status, _ = _tail_resume_layout(resume_token=99, prompt_tokens=100)
+    late = req_status.group_states[1].offload_keys[5]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.RETRY if key == late else LookupResult.HIT
+    )
+
+    for _ in range(sched_mod._TAIL_RESUME_RETRIES):
+        assert scheduler._lookup(req_status) is None
+    assert scheduler._lookup(req_status) == 92
+
+    retries = sched_mod._TAIL_RESUME_RETRIES
+    assert scheduler._tail_counts["tail_restore_retried"] == retries
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.req.tail_resume is None
+
+
 def test_a_tail_whose_window_needs_more_rows_than_a_resume_fills_is_refused():
     # A windowed group's tail costs the window's worth of rows, and a resume has
     # one destination block for a group. Half a window is the wrong state to

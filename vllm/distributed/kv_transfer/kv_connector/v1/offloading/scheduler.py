@@ -135,6 +135,11 @@ _TAIL_KEYS_MAX = 1 << 14
 # state exists only in the hand-off that named it, so unlike a chunk it cannot
 # be re-offered later: after this the rows are given up on and counted.
 _TAIL_STORE_RETRIES = 3
+# Steps a resume is probed again after the arena answered RETRY for a chunk
+# under it. A RETRY is the arena asking to be asked again, so the request waits
+# and the lookup is deferred; after this the resume is refused and counted like
+# any other, because a row that never arrives must not hold a request.
+_TAIL_RESUME_RETRIES = 3
 # How often the pool's record of the tails it holds is re-read (see
 # _pool_tail_lengths). A tail finished by another engine is invisible until the
 # next read, which costs that conversation one resume.
@@ -572,6 +577,9 @@ class RequestOffloadState:
     # accepted by the connector's fence at the lookup that reached no further.
     # Consumed when the load that fills the boundary is scheduled.
     tail_resume: AnswerTailHit | None = None
+    # Times this request's resume has been probed after the arena answered
+    # RETRY for it, bounded by ``_TAIL_RESUME_RETRIES``.
+    tail_resume_probes: int = 0
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
@@ -2734,7 +2742,16 @@ class OffloadingConnectorScheduler:
         # It competes with the aligned boundary below rather than replacing it:
         # a tail resumes wherever the finished turn ended, which is not always
         # deeper than the last boundary the request's own chunks prove.
-        resume = self._fence_tail_resume(req_status, complete_boundary, ceiling)
+        resume, reprobe = self._fence_tail_resume(
+            req_status, complete_boundary, ceiling
+        )
+        if reprobe:
+            # The arena is still filling a chunk under this resume, so it asked
+            # to be asked again and the record stays on the request. The
+            # request waits for the deeper answer instead of being scheduled on
+            # the shallower one, which is what a RETRY in its own chunks
+            # already makes it do.
+            return None
 
         # The aligned route confirms one row per group at the boundary it picks
         # and nothing between that and the chunks the request proved, so it
@@ -2792,8 +2809,12 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         complete_boundary: int,
         ceiling: int,
-    ) -> AnswerTailHit | None:
-        """The tail a restore may be granted for, or None and a count.
+    ) -> tuple[AnswerTailHit | None, bool]:
+        """The tail a restore may be granted for, and whether to probe it again.
+
+        The second answer says the arena has not finished answering for this
+        resume: the record stays on the request and the caller defers the
+        lookup, so a later step probes it again.
 
         The core probed the tier when its own registry came up short and left
         the record on the request. This is where the connector decides it can
@@ -2827,17 +2848,17 @@ class OffloadingConnectorScheduler:
         """
         record = req_status.req.tail_resume
         if record is None:
-            return None
+            return None, False
         if not self._cache_is_current(record.generation):
             return self._refuse_tail_resume(
                 req_status,
                 record.resume_token,
                 "the prefix cache it was recorded against has been reset",
-            )
+            ), False
         if req_status.req.is_finished():
             return self._refuse_tail_resume(
                 req_status, record.resume_token, "the request is gone"
-            )
+            ), False
         rows = self._tail_row_keys.get(bytes(record.tail_key))
         if not rows:
             # A tail this process never stored, which is the normal case for a
@@ -2849,28 +2870,37 @@ class OffloadingConnectorScheduler:
                     req_status,
                     record.resume_token,
                     "the band never recorded the rows this tail was stored as",
-                )
+                ), False
         if len({get_offload_group_idx(key) for key in rows}) != len(rows):
             return self._refuse_tail_resume(
                 req_status,
                 record.resume_token,
                 "a windowed group's rows need more destination blocks than a "
                 "resume fills",
-            )
+            ), False
         if not complete_boundary < record.resume_token <= ceiling:
             return self._refuse_tail_resume(
                 req_status,
                 record.resume_token,
                 "the resume position is past what this load can reach",
-            )
+            ), False
         detail = self._confirm_tail_rows(rows, req_status.req_context)
         if detail is not None:
-            return self._refuse_tail_resume(req_status, record.resume_token, detail)
-        detail = self._confirm_intervening_rows(
+            refusal = self._refuse_tail_resume(req_status, record.resume_token, detail)
+            return refusal, False
+        refused = self._confirm_intervening_rows(
             req_status, complete_boundary, record.resume_token
         )
-        if detail is not None:
-            return self._refuse_tail_resume(req_status, record.resume_token, detail)
+        if refused is not None:
+            detail, answer = refused
+            if answer is LookupResult.RETRY and self._retry_tail_resume(req_status):
+                # The arena is on its way to holding that chunk, so this is not
+                # a refusal yet: the record stays and the caller is asked to
+                # probe again, the way a store the pool refused is offered
+                # again until its retries run out.
+                return None, True
+            refusal = self._refuse_tail_resume(req_status, record.resume_token, detail)
+            return refusal, False
         if bytes(record.tail_key) not in self._tail_row_keys:
             # The arena holds them, so which rows they are is now known here as
             # well as there, and the record is taken on the way a store takes
@@ -2886,7 +2916,7 @@ class OffloadingConnectorScheduler:
             self._note_tail_keys(req_status, rows)
             self._tail_row_keys[bytes(record.tail_key)] = rows
             self._note_in_pool(rows)
-        return record
+        return record, False
 
     def _confirm_tail_rows(
         self, rows: Sequence[OffloadKey], req_context: ReqContext
@@ -2922,10 +2952,10 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         complete_boundary: int,
         resume_token: int,
-    ) -> str | None:
+    ) -> tuple[str, LookupResult] | None:
         """Ask the arena for the whole chunks between the boundary a request's
-        own lookup proved and a resume deeper than it, or None when it holds
-        the lot.
+        own lookup proved and a resume deeper than it, or the answer that
+        refused and what to make of it, or None when it holds the lot.
 
         A tail row is the state at a position, not the KV below it: everything
         from the proved boundary to the resume position is loaded as ordinary
@@ -2936,6 +2966,10 @@ class OffloadingConnectorScheduler:
         destination blocks are not allocated yet, so which of those rows the
         load reads is not known here, and a resume granted on half a check is a
         wrong state that nothing reports.
+
+        The answer that refused comes back with the reason because a RETRY is
+        the arena asking to be asked again about a chunk it is still filling,
+        while a MISS is its last word about one it does not hold.
         """
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
@@ -2954,9 +2988,12 @@ class OffloadingConnectorScheduler:
             ):
                 if result is not LookupResult.HIT:
                     return (
-                        f"the arena answered {result.name} for the chunk at "
-                        f"{(first_chunk + offset) * tokens_per_chunk} of group "
-                        f"{group_config.group_idx}"
+                        (
+                            f"the arena answered {result.name} for the chunk at "
+                            f"{(first_chunk + offset) * tokens_per_chunk} of "
+                            f"group {group_config.group_idx}"
+                        ),
+                        result,
                     )
         return None
 
@@ -3791,6 +3828,22 @@ class OffloadingConnectorScheduler:
             detail,
         )
         return None
+
+    def _retry_tail_resume(self, req_status: RequestOffloadState) -> bool:
+        """Hold a resume the arena has not answered for yet for another probe.
+
+        The mirror of ``_retry_tail_offer`` on the restore side: a store the
+        pool refused is offered again for a few steps because the rows can still
+        arrive, and a chunk the arena answers RETRY for is a chunk it is still
+        filling, so the resume is probed again the same way and for the same
+        reason. The budget ends the same way too: the give-up is counted, here
+        as the refusal that ends the store's retries.
+        """
+        if req_status.tail_resume_probes >= _TAIL_RESUME_RETRIES:
+            return False
+        req_status.tail_resume_probes += 1
+        self._count_tail_event("tail_restore_retried")
+        return True
 
     def bind_answer_tail_store(self, kv_cache_manager: Any) -> None:
         """Give the engine core's answer tail the connector's notifier.
