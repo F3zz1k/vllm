@@ -14,6 +14,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheGroupRole,
     KVCacheSpec,
@@ -44,6 +45,23 @@ def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
         if group.role is KVCacheGroupRole.HISPARSE_INDEXER
+    )
+
+
+def get_tail_only_group_ids(
+    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
+) -> tuple[int, ...]:
+    """Groups transferred only as part of an answer tail: a circular buffer
+    (the QSA ring) is not prefix cacheable, so it has no chunk keys, but a tail
+    resumed without it reads a wrong ring. The worker registers them after the
+    offloading groups, so existing row offsets are unchanged."""
+    if not getattr(vllm_config.cache_config, "enable_answer_tail_offload", False):
+        return ()
+    return tuple(
+        group_id
+        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group_id not in get_offloading_group_ids(kv_cache_config)
+        and any(isinstance(s, CircularBufferSpec) for s in iter_layer_specs(group.kv_cache_spec))
     )
 
 

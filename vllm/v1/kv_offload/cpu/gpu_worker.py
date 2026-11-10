@@ -824,12 +824,17 @@ class SingleDirectionOffloadingHandler:
         # extract group_sizes from the GPU spec
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
         assert isinstance(gpu_spec, GPULoadStoreSpec)
-        group_sizes = gpu_spec.group_sizes
-        assert len(group_sizes) == len(self.layer_refs_per_group)
+        # Tail-only groups follow the offloading groups; a spec that does not
+        # transfer them leaves them out.
+        num_groups = len(self.layer_refs_per_group)
+        group_sizes = list(gpu_spec.group_sizes)
+        group_sizes += [0] * (num_groups - len(group_sizes))
+        assert len(group_sizes) == num_groups
 
         # extract block indices from the GPU spec
-        block_indices = gpu_spec.block_indices
-        assert len(block_indices) == len(self.layer_refs_per_group)
+        block_indices = list(gpu_spec.block_indices)
+        block_indices += [0] * (num_groups - len(block_indices))
+        assert len(block_indices) == num_groups
 
         if self._staged_refs is not None:
             return self._transfer_staged(

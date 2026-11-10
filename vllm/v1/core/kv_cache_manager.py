@@ -149,6 +149,7 @@ class KVCacheManager:
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
         enable_mamba_finish_checkpoint: bool = False,
+        enable_answer_tail_offload: bool = False,
         caching_hash_fn: Callable[[Any], bytes] = sha256,
     ) -> None:
         self.max_model_len = max_model_len
@@ -204,6 +205,7 @@ class KVCacheManager:
                 self.coordinator.block_pool,
                 caching_hash_fn,
                 len(kv_cache_config.kv_cache_groups),
+                tier_candidates=enable_answer_tail_offload,
             )
             if enable_mamba_finish_checkpoint
             else None

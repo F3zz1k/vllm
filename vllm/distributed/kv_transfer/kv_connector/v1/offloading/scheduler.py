@@ -22,6 +22,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     b70_offload as _b70,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+    get_tail_only_group_ids,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
     OffloadingEventGroupSpec,
     OffloadingEventsTracker,
@@ -85,6 +88,8 @@ def _b70_tag(key) -> str | None:
 # pool only through the band, so the pool converges on holding what the GPU
 # does not.
 WRITE_BACK = os.environ.get("VLLM_KV_WRITE_BACK", "0") == "1"
+# Longest a request waits for an answer-tail row still being written.
+_TAIL_PENDING_WAIT_SEC = 10.0
 # A restore leaves out the last chunk of an EAGLE/MTP drafter group (its KV may
 # have been written under a rejected speculation). The store side already never
 # writes that chunk while a request decodes, and a stale drafter chunk only
@@ -260,6 +265,11 @@ class SchedulerOffloadConfig(NamedTuple):
     offload_prompt_only: bool
     supports_partial_tail: bool
     alignment_tokens: int | None = None
+    # Answer tails ride the write-back band and the request's load
+    # (enable_answer_tail_offload); tail-only groups follow the offloading
+    # groups in every transfer spec.
+    answer_tail_offload: bool = False
+    tail_only_group_ids: tuple[int, ...] = ()
     retention_interval: int | None = None
     dcp_world_size: int = 1
 
@@ -393,6 +403,23 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.parallel_config.decode_context_parallel_size == 1
         )
 
+        # A tail sits in the same block index of every group, so its rows need
+        # one block per chunk and one block size.
+        tail_flag = getattr(vllm_config.cache_config, "enable_answer_tail_offload", False)
+        answer_tail_offload = (
+            tail_flag
+            and spec.blocks_per_chunk == 1
+            and len(group_block_sizes) == 1
+            and vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+        if tail_flag and not (
+            answer_tail_offload and WRITE_BACK
+        ):
+            logger.warning(
+                "KV offloading: answer tails are not offloaded: they need one "
+                "block per chunk, one block size, no DCP and VLLM_KV_WRITE_BACK=1."
+            )
+
         if retention_interval is not None:
             if retention_interval < 0:
                 raise ValueError(
@@ -417,6 +444,12 @@ class SchedulerOffloadConfig(NamedTuple):
             tokens_per_hash=spec.tokens_per_hash,
             offload_prompt_only=spec.offload_prompt_only,
             supports_partial_tail=supports_partial_tail,
+            answer_tail_offload=answer_tail_offload,
+            tail_only_group_ids=(
+                get_tail_only_group_ids(vllm_config, kv_cache_config)
+                if answer_tail_offload
+                else ()
+            ),
             alignment_tokens=alignment_tokens,
             retention_interval=retention_interval,
             dcp_world_size=vllm_config.parallel_config.decode_context_parallel_size,
@@ -459,6 +492,9 @@ class RequestOffloadState:
     # Fine-grained token boundary selected beyond the last complete offload
     # chunk. It is consumed when the corresponding load is scheduled.
     partial_tail_boundary: int | None = None
+    # The answer tail that boundary resumes from: its rows are loaded under the
+    # tail's hash rather than the block hash at the boundary.
+    tail_key: BlockHash | None = None
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
@@ -766,6 +802,13 @@ class OffloadingConnectorScheduler:
             config.group_idx: idx
             for idx, config in enumerate(self.config.kv_group_configs)
         }
+        # Tail-only groups follow the offloading groups in transfer specs.
+        for idx, group_id in enumerate(self.config.tail_only_group_ids):
+            self._config_idx_by_group[group_id] = len(self.config.kv_group_configs) + idx
+        self._num_transfer_groups = len(self._config_idx_by_group)
+        # Answer-tail keys of recorded runs -> the resume position they hold.
+        self._tail_pos: dict[OffloadKey, int] = {}
+        self._run_tails: dict[OffloadKey, list[OffloadKey]] = {}
         # Boundary block hash -> state groups the pool holds there.
         self._state_sets: "OrderedDict[bytes, set[int]]" = OrderedDict()
         # Keys known to have reached the pool (bounded; for accounting).
@@ -1105,9 +1148,7 @@ class OffloadingConnectorScheduler:
         if tag is None or tag in self._wb_pinned:
             return
         pool = self._gpu_block_pool
-        chain = self._restore_chain(
-            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k)
-        )
+        chain = self._finished_chain(req_status, by_group)[0]
         pins = []  # (key, block): a lookup-only alias block may carry no hash
         for key in chain:
             if key in self._pool_has or key in self._wb_inflight:
@@ -1158,10 +1199,14 @@ class OffloadingConnectorScheduler:
         if not WRITE_BACK:
             return
         extras: set = set()
-        chain = self._restore_chain(
-            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k), extras=extras
-        )
+        chain, tail_pos = self._finished_chain(req_status, by_group, extras)
         self._drop_run(tag)
+        if tail_pos:
+            self._tail_pos.update(tail_pos)
+            self._run_tails[tag] = list(tail_pos)
+            self._wb_counts["tail_runs"] += 1
+        elif self.config.answer_tail_offload and req_status.req.answer_tail:
+            self._wb_counts["tail_not_held"] += 1
         if not chain:
             # Nothing a restore could read (no boundary with every state
             # group stored): never offered, so never refused every step.
@@ -1183,7 +1228,70 @@ class OffloadingConnectorScheduler:
         while len(self._run_keys) > WRITE_BACK_MAX_RUNS:
             self._drop_run(next(iter(self._run_keys)))
 
+    def _finished_chain(
+        self,
+        req_status: "RequestOffloadState",
+        by_group: list[list[OffloadKey]],
+        extras: set | None = None,
+    ) -> tuple[list[OffloadKey], dict[OffloadKey, int]]:
+        """What a restore of a finished request's conversation reads, and the
+        answer-tail keys in it with their resume position. The tail the core
+        registered at the turn's end is the run's deepest restore point: its
+        rows plus the chunks below it, merged into the aligned chain."""
+        have = lambda k: k in self._pool_has or self._gpu_has(k)  # noqa: E731
+        chain = self._restore_chain(by_group, have=have, extras=extras)
+        tail = req_status.req.answer_tail if self.config.answer_tail_offload else None
+        if tail is None:
+            return chain, {}
+        tail_hash, resume = tail
+        span = self._tail_span(by_group, 0, resume, tail_hash)
+        if span is None or not all(have(k) for k in span):
+            return chain, {}
+        seen = set(chain)
+        chain = chain + [k for k in span if k not in seen]
+        return chain, dict.fromkeys(self._tail_keys(tail_hash), resume)
+
+    def _tail_keys(self, tail_hash: BlockHash) -> list[OffloadKey]:
+        """One row per group under the tail's own hash, tail-only groups last."""
+        return [make_offload_key(tail_hash, g) for g in self._config_idx_by_group]
+
+    def _tail_span(
+        self,
+        by_group: list[list[OffloadKey]],
+        first_token: int,
+        resume: int,
+        tail_hash: BlockHash,
+    ) -> list[OffloadKey] | None:
+        """The keys a resume at ``resume`` reads above ``first_token``: the
+        whole chunks below the tail's block (a window's worth for a sliding
+        window group, none for a state group) and the tail's own rows, which
+        hold the block at ``resume`` in every group. None when the request does
+        not key those chunks. Both the band's chain and the lookup use it, so
+        what is stored is what a restore asks for."""
+        keys: list[OffloadKey] = []
+        for idx, config in enumerate(self.config.kv_group_configs):
+            tpc = config.tokens_per_chunk
+            tail_idx = (resume - 1) // tpc
+            if len(by_group[idx]) < tail_idx:
+                return None
+            if isinstance(config.kv_cache_spec, MambaSpec):
+                continue
+            first = first_token // tpc
+            spec = config.kv_cache_spec
+            if isinstance(spec, SlidingWindowSpec):
+                # The blocks the allocator keeps for a resume here
+                # (SlidingWindowManager.get_num_skipped_tokens).
+                skipped = resume - spec.sliding_window + 1 - spec.extra_retained_tokens
+                first = max(first, skipped // tpc)
+            elif config.sliding_window_size_in_chunks is not None:
+                window = config.load_window_size_in_chunks(resume) or tail_idx + 1
+                first = max(first, tail_idx + 1 - window)
+            keys.extend(by_group[idx][first:tail_idx])
+        return keys + self._tail_keys(tail_hash)
+
     def _drop_run(self, tag: OffloadKey) -> None:
+        for key in self._run_tails.pop(tag, ()):
+            self._tail_pos.pop(key, None)
         old = self._run_keys.pop(tag, None)
         self._run_by_group.pop(tag, None)
         self._run_extras.pop(tag, None)
@@ -1474,6 +1582,9 @@ class OffloadingConnectorScheduler:
         free = block.ref_cnt == 0 or (
             block.ref_cnt == 1 and block.block_id in self._wb_pinned_ids
         )
+        tail_pos = self._tail_pos.get(key)
+        if tail_pos is not None:
+            return (block, config_idx, tail_pos) if free else None
         if (not free or not num_tokens
                 or num_tokens % self.config.kv_group_configs[config_idx].tokens_per_chunk):
             return None
@@ -1793,7 +1904,7 @@ class OffloadingConnectorScheduler:
         """One store job copying ``members`` (key, block, config_idx, chunk),
         ordered by group as GPULoadStoreSpec requires."""
         members = sorted(members, key=lambda m: m[2])
-        num_groups = len(self.config.kv_group_configs)
+        num_groups = self._num_transfer_groups
         group_sizes = [0] * num_groups
         for m in members:
             group_sizes[m[2]] += 1
@@ -1808,6 +1919,7 @@ class OffloadingConnectorScheduler:
         self._wb_inflight.update(keys)
         self._wb_submitted[job_id] = (now, len(members))
         self._wb_counts["blocks_submitted"] += len(members)
+        self._wb_counts["tail_rows_copied"] += sum(m[0] in self._tail_pos for m in members)
         # blocks_per_chunk == 1: block_indices only offsets a partial first
         # chunk, which a whole-block copy never has.
         job = TransferJob(
@@ -2351,6 +2463,19 @@ class OffloadingConnectorScheduler:
     ) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
         req_status.partial_tail_boundary = None
+        req_status.tail_key = None
+        if (
+            complete_hit is not None
+            and self.config.answer_tail_offload
+            and req_status.req.tail_candidates
+        ):
+            granted, pending = self._lookup_answer_tail(
+                req_status, complete_hit, max_num_new_tokens
+            )
+            if pending:
+                return None
+            if granted is not None:
+                return granted
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
@@ -2404,6 +2529,62 @@ class OffloadingConnectorScheduler:
         if pending and complete_hit == 0:
             return None
         return complete_hit
+
+    def _lookup_answer_tail(
+        self,
+        req_status: RequestOffloadState,
+        complete_hit: int,
+        max_num_new_tokens: int | None,
+    ) -> tuple[int | None, bool]:
+        """Tokens a stored answer tail lets this request load, deepest first
+        among the tails the core named, all of its rows or none; and whether
+        the deepest reachable one is still being written (wait for it)."""
+        req = req_status.req
+        local = req_status.num_locally_computed_tokens
+        reached = local + complete_hit
+        ceiling = req.num_prompt_tokens - 1
+        if max_num_new_tokens is not None:
+            ceiling = min(ceiling, local + max_num_new_tokens)
+        if req_status.max_load_tokens is not None:
+            ceiling = min(ceiling, local + req_status.max_load_tokens)
+        cands = [
+            (resume, tail_hash)
+            for resume, tail_hash in req.tail_candidates or ()
+            if reached < resume <= ceiling
+        ]
+        if not cands:
+            return None, False
+        # One row per candidate in one call: most stop tokens end a message
+        # that is not a stored turn, and they miss here.
+        first_group = next(iter(self._config_idx_by_group))
+        probes = self._lookup_results(
+            [make_offload_key(h, first_group) for _, h in cands],
+            req_status.req_context,
+            False,
+        )
+        by_group = [gs.offload_keys for gs in req_status.group_states]
+        waited = req_status.deferred_lookup_start_time
+        may_wait = waited is None or time.monotonic() - waited < _TAIL_PENDING_WAIT_SEC
+        for (resume, tail_hash), (_, probe) in zip(cands, list(probes)):
+            if probe is LookupResult.MISS:
+                continue
+            keys = self._tail_span(by_group, local, resume, tail_hash)
+            if keys is None:
+                continue
+            results = [r for _, r in self._lookup_results(keys, req_status.req_context, True)]
+            if len(results) < len(keys) or LookupResult.MISS in results:
+                continue
+            if any(r is not LookupResult.HIT for r in results):
+                # A row still being written or read back: wait for the deepest
+                # tail, but never for longer than the bound, so a write that
+                # never completes costs one recompute, not a stuck request.
+                if may_wait:
+                    return None, True
+                continue
+            req_status.partial_tail_boundary = resume
+            req_status.tail_key = tail_hash
+            return resume - local, False
+        return None, False
 
     def _maybe_register_shared_prefix_junction(
         self, req_status: RequestOffloadState, num_hit_tokens: int
@@ -2644,11 +2825,8 @@ class OffloadingConnectorScheduler:
                 group_keys_to_load = offload_keys[start_chunk_idx:end_chunk_idx]
                 if partial_tail_boundary is not None:
                     group_keys_to_load.append(
-                        self._make_boundary_key(
-                            request,
-                            group_config.group_idx,
-                            partial_tail_boundary,
-                            req_status.req_context,
+                        self._boundary_load_key(
+                            req_status, group_config.group_idx, partial_tail_boundary
                         )
                     )
                 keys_to_load.extend(group_keys_to_load)
@@ -2682,6 +2860,19 @@ class OffloadingConnectorScheduler:
             # chunks (including hits) are offloaded.
             if req_status.offloading_context.policy == OffloadPolicy.CHUNK_LEVEL:
                 group_state.next_stored_chunk_idx = num_chunks
+
+        if req_status.tail_key is not None:
+            self._wb_counts["tail_restored"] += 1
+            for group_id in self.config.tail_only_group_ids:
+                ring = blocks.blocks[group_id]
+                assert len(ring) == 1 and not ring[0].is_null
+                keys_to_load.append(
+                    self._boundary_load_key(req_status, group_id, num_cached_tokens)
+                )
+                dst_block_ids.append(ring[0].block_id)
+                group_sizes.append(1)
+                block_indices.append(0)
+                self._current_batch_allocated_block_ids.add(ring[0].block_id)
 
         src_spec = self.manager.prepare_load(keys_to_load, req_status.req_context)
         dst_spec = GPULoadStoreSpec(
@@ -2721,6 +2912,20 @@ class OffloadingConnectorScheduler:
         if self._chunks_being_loaded is not None:
             self._chunks_being_loaded.update(keys_to_load)
         req_status.partial_tail_boundary = None
+        req_status.tail_key = None
+
+    def _boundary_load_key(
+        self, req_status: RequestOffloadState, group_idx: int, boundary: int
+    ) -> OffloadKey:
+        """The key the block at a partial boundary loads from: the answer
+        tail's own row when the boundary is a tail, else the block hash there."""
+        if req_status.tail_key is None:
+            return self._make_boundary_key(
+                req_status.req, group_idx, boundary, req_status.req_context
+            )
+        key = make_offload_key(req_status.tail_key, group_idx)
+        req_status.req_context.set_offload_key_position(key, boundary)
+        return key
 
     def _update_req_states(self, scheduler_output: SchedulerOutput) -> None:
         """Update request states from the Scheduler's output."""
@@ -3902,6 +4107,7 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_chunk_idx = 0
             status.transfer_jobs.clear()
             status.partial_tail_boundary = None
+            status.tail_key = None
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter

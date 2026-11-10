@@ -288,3 +288,18 @@ def test_reset_prefix_cache_clears_the_tail_registry():
     assert not hashes and not lengths
     for group_id in range(len(held)):
         assert pool.get_cached_block(tail, [group_id]) is None
+
+
+def test_a_follow_up_names_the_finished_turns_tail_for_the_tier():
+    """With the GPU registry gone, the follow-up's own stop token names the
+    tail the finished turn stored, by the same hash."""
+    manager = _manager()
+    manager.answer_tail.tier_candidates = True
+    finished = make_request("a", PROMPT, BLOCK, sha256)
+    answer = OUTPUT[:-1] + [100]  # ends on the request's EOS
+    _run_to_finish(manager, finished, answer)
+    tail_hash, resume = finished.answer_tail
+    assert manager.reset_prefix_cache()
+    follow = make_request("b", PROMPT + answer + [7, 8, 9], BLOCK, sha256)
+    manager.get_computed_blocks(follow)
+    assert follow.tail_candidates[0] == (resume, tail_hash)

@@ -200,6 +200,11 @@ class CacheConfig:
     prompt tail. Off by default; only takes effect with `mamba_cache_mode`
     "align", EAGLE on the Mamba group, and a prefix match unit smaller than the
     Mamba block size."""
+    enable_answer_tail_offload: bool = False
+    """Also keep finished turns' tails in the offloading connector's CPU tier:
+    the write-back band copies a tail's blocks when the GPU is about to reuse
+    them, and a follow-up request repeating the turn restores it from there.
+    Requires `enable_mamba_finish_checkpoint` and the OffloadingConnector."""
     enable_mamba_finish_checkpoint: bool = False
     """Keep the Mamba "align" state of a request that finishes on an EOS, stop
     token or length limit, so that a follow-up request repeating the whole
@@ -308,6 +313,7 @@ class CacheConfig:
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
             "enable_mamba_finish_checkpoint",
+            "enable_answer_tail_offload",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",

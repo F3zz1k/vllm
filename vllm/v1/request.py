@@ -204,6 +204,12 @@ class Request:
         # in the (sparse) prefix cache; 0 means none. Set at admission for
         # hybrid/Mamba models when a shared prefix is detected (Marconi-style).
         self.shared_prefix_boundary = 0
+        # Answer tail (see vllm/v1/core/answer_tail.py): the (tail hash,
+        # resume position) this request registered when it finished, and the
+        # (resume position, tail hash) pairs it could resume from, deepest
+        # first, named for the offloading tier when the GPU holds no tail.
+        self.answer_tail: tuple[BlockHash, int] | None = None
+        self.tail_candidates: list[tuple[int, BlockHash]] | None = None
         # DeepSeek-V4.1 only: SWA bounded replay. The request holds no
         # sliding-window KV below this position; 0 when nothing replays.
         self.replay_start = 0

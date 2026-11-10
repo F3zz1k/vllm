@@ -353,6 +353,7 @@ class Scheduler(SchedulerInterface):
             enable_mamba_finish_checkpoint=(
                 self.cache_config.enable_mamba_finish_checkpoint
             ),
+            enable_answer_tail_offload=self.cache_config.enable_answer_tail_offload,
             caching_hash_fn=get_hash_fn_by_name(
                 self.cache_config.prefix_caching_hash_algo
             ),

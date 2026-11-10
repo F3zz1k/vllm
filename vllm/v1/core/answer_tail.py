@@ -139,11 +139,15 @@ class AnswerTail:
         block_pool: "BlockPool",
         caching_hash_fn: Callable[[Any], bytes],
         num_kv_cache_groups: int,
+        tier_candidates: bool = False,
     ) -> None:
         self.coordinator = coordinator
         self.block_pool = block_pool
         self.caching_hash_fn = caching_hash_fn
         self.num_kv_cache_groups = num_kv_cache_groups
+        # Name the tails a request could resume from for the offloading tier
+        # when the GPU holds none of them (``enable_answer_tail_offload``).
+        self.tier_candidates = tier_candidates
         self.validate_groups(coordinator)
 
     @staticmethod
@@ -295,6 +299,9 @@ class AnswerTail:
                 blocks[(num_tokens - 2) // manager.block_size],
                 tail,
             )
+        # The connector's band stores the tail under these keys as the deepest
+        # restore point of the conversation's run.
+        request.answer_tail = (tail_hash, num_tokens - 1)
         logger.debug(
             "Registered the final state of request %s at %d tokens.",
             request.request_id,
@@ -328,6 +335,44 @@ class AnswerTail:
         group and ends one token before the finished request's last token, which
         the key covers, so it skips the EAGLE drop.
         """
+        request.tail_candidates = None
+        hit = self._find_gpu_tail_hit(request, max_cache_hit_length, num_computed_tokens)
+        if hit is None and self.tier_candidates:
+            request.tail_candidates = self._tier_candidates(request, num_computed_tokens)
+        return hit
+
+    def _tier_candidates(
+        self, request: Request, num_computed_tokens: int
+    ) -> list[tuple[int, BlockHash]] | None:
+        """``(resume, tail_hash)`` of every tail this prompt could resume from,
+        deepest first. A finished turn ends on a stop token, which the next
+        prompt repeats, so each stop token past the local hit names one: the
+        tail through it (a stop) and the tail just before it (a length cap).
+        Uncapped: the connector probes them all in one call, and recomputed on
+        every probe, so nothing here can run out."""
+        params = request.sampling_params
+        stops = None if params is None else finish_stop_token_ids(params)
+        tokens = request.prompt_token_ids
+        if not stops or tokens is None:
+            return None
+        stop_set = set(stops)
+        hash_block_size = self.block_pool.hash_block_size
+        found: list[tuple[int, BlockHash]] = []
+        for idx in range(len(tokens) - 1, num_computed_tokens, -1):
+            if tokens[idx] not in stop_set:
+                continue
+            for end in (idx + 1, idx):
+                if end - 1 > num_computed_tokens:
+                    start = round_down(end - 1, hash_block_size)
+                    found.append(
+                        (end - 1, self._finish_tail_hash(request, start, end))
+                    )
+        return found or None
+
+    def _find_gpu_tail_hit(
+        self, request: Request, max_cache_hit_length: int, num_computed_tokens: int
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        """The deepest tail registered on the GPU that ``request`` repeats."""
         coordinator = self.coordinator
         assert isinstance(coordinator, HybridKVCacheCoordinator)
         lengths_by_parent = self.block_pool.answer_tail.lengths_by_parent
@@ -438,6 +483,15 @@ class AnswerTail:
 
 def validate_mamba_finish_checkpoint(vllm_config: "VllmConfig") -> None:
     """Validate `enable_mamba_finish_checkpoint` against the rest of the config."""
+    if vllm_config.cache_config.enable_answer_tail_offload and not (
+        vllm_config.cache_config.enable_mamba_finish_checkpoint
+        and vllm_config.kv_transfer_config is not None
+        and vllm_config.kv_transfer_config.kv_connector == "OffloadingConnector"
+    ):
+        raise ValueError(
+            "--enable-answer-tail-offload needs --enable-mamba-finish-checkpoint "
+            "and the OffloadingConnector."
+        )
     if not vllm_config.cache_config.enable_mamba_finish_checkpoint:
         return
 

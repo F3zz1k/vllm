@@ -201,8 +201,10 @@ def test_swa_offload_window_covers_unaligned_hit(
 
 def _make_partial_tail_scheduler(
     recurrent_only: bool = False,
+    answer_tail: bool = False,
 ) -> OffloadingConnectorScheduler:
     vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
+    vllm_config.cache_config.enable_answer_tail_offload = answer_tail
     vllm_config.cache_config.prefix_match_unit = None if recurrent_only else 4
     vllm_config.speculative_config = None
     vllm_config.kv_events_config = KVEventsConfig(
@@ -461,6 +463,54 @@ def test_partial_lookup_returns_exact_boundary_and_group_load_keys():
     assert dst_spec.group_sizes == [2, 1]
     assert dst_spec.block_indices == [0, 1]
     assert req_status.partial_tail_boundary is None
+
+
+def _answer_tail_lookup(lookup):
+    scheduler = _make_partial_tail_scheduler(answer_tail=True)
+    request = _make_partial_tail_request(scheduler)
+    request.tail_candidates = [(27, BlockHash(b"tail"))]
+    req_status = scheduler._req_status["req"]
+    req_status.num_locally_computed_tokens = 0
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.side_effect = lookup
+    return scheduler, request, req_status
+
+
+def test_answer_tail_resume_loads_the_chunks_below_and_every_tail_row():
+    scheduler, request, req_status = _answer_tail_lookup(
+        lambda key, ctx: LookupResult.HIT
+    )
+    assert scheduler._lookup(req_status) == 27
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+            )
+        ),
+        num_external_tokens=27,
+    )
+    [(job_id, load_job)] = scheduler._current_batch_load_jobs.items()
+    tail = BlockHash(b"tail")
+    assert scheduler._jobs[job_id].keys == {
+        req_status.group_states[0].offload_keys[0],
+        make_offload_key(tail, 0),
+        make_offload_key(tail, 1),
+    }
+    assert load_job.dst_spec.block_ids.tolist() == [31, 32, 41]
+    assert load_job.dst_spec.group_sizes == [2, 1]
+    assert req_status.tail_key is None
+
+
+def test_answer_tail_missing_a_row_falls_back_to_the_ordinary_lookup():
+    scheduler, _, req_status = _answer_tail_lookup(
+        lambda key, ctx: LookupResult.MISS
+        if key == make_offload_key(BlockHash(b"tail"), 1)
+        else LookupResult.HIT
+    )
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.tail_key is None
 
 
 def test_lookup_cap_stops_at_authoritative_prefix_boundary():

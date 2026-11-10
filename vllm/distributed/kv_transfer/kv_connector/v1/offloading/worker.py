@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     get_offloading_group_ids,
+    get_tail_only_group_ids,
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import (
@@ -70,7 +71,9 @@ class OffloadingConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
-        selected_group_ids = get_offloading_group_ids(kv_cache_config)
+        selected_group_ids = get_offloading_group_ids(
+            kv_cache_config
+        ) + get_tail_only_group_ids(self.vllm_config, kv_cache_config)
         selected_groups = tuple(
             kv_cache_config.kv_cache_groups[group_id] for group_id in selected_group_ids
         )
