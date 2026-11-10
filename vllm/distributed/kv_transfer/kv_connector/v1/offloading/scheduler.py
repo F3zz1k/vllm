@@ -1709,7 +1709,18 @@ class OffloadingConnectorScheduler:
         ]
         if tail_resume is not None:
             reach = tail_resume if limit is None else min(tail_resume, limit)
-            chain += self._intervening_row_keys(by_group, depth, reach)
+            # The drafter group's widened chunk and the span a tail reads both
+            # start at the chain's boundary, so the span can name a key the
+            # chain already carries. Its consumers take the chain as unique
+            # keys: a key held twice is pinned twice, which leaves its block
+            # neither storable-free nor a member while the pin is held, and it
+            # reaches one store twice. Keep the first, where it already sits.
+            carried = set(chain)
+            chain += [
+                key
+                for key in self._intervening_row_keys(by_group, depth, reach)
+                if key not in carried
+            ]
         if WRITE_BACK_KEEP_POINTS > 0:
             seen = set(chain)
             kept = 0

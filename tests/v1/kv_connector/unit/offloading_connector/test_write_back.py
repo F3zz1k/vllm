@@ -709,6 +709,66 @@ def test_prompt_boundary_is_a_chunk_earlier_with_a_drafter_group(band):
     assert request.shared_prefix_boundary == (30 - 1) // tpc * tpc - tpc
 
 
+def _hashed_chunk_blocks(
+    keys: list[OffloadKey], group_idx: int, tpc: int
+) -> FakeGPUPool:
+    """A GPU pool holding ``keys`` as free, hashed, chunk-aligned blocks: what
+    the band finds when it looks a conversation's chunk keys up."""
+    blocks = []
+    for i, key in enumerate(keys):
+        block = KVCacheBlock(i + 1)
+        block.set_block_hash(
+            make_block_hash_with_group_id(BlockHash(bytes(key)[:-4]), group_idx),
+            (i + 1) * tpc,
+        )
+        blocks.append(block)
+    return FakeGPUPool(blocks)
+
+
+def test_the_eagle_chunk_and_the_intervening_span_share_one_key_once(band):
+    """The drafter group's widened chunk and the span a tail resume reads start
+    at the same chunk, so the chain has to hold that key once. Its consumers
+    take uniqueness as given: a key carried twice is pinned twice, which leaves
+    its block neither storable-free nor a member while the pin is held, and is
+    named twice to one store."""
+    scheduler, _, _ = band
+    scheduler._has_state_groups = True
+    configs, attn, state = _groups(scheduler)
+    configs = list(configs)
+    configs[attn] = configs[attn]._replace(is_eagle_group=True)
+    scheduler.config = scheduler.config._replace(kv_group_configs=configs)
+    tpc = configs[attn].tokens_per_chunk
+    by_group = [[_hkey(i, c.group_idx) for i in range(6)] for c in configs]
+    for s in state:                       # the one stored boundary, at chunk 1
+        scheduler._note_state_stored(by_group[s][1])
+    resume = 4 * tpc                       # the tail two chunks above it
+    # The chain stops at the stored boundary, two chunks down, and the drafter
+    # group's widened chunk is the one the span starts on: chunk 2.
+    key = by_group[attn][2]
+
+    chain = scheduler._restore_chain(by_group, tail_resume=resume)
+    assert chain.count(key) == 1
+    assert len(chain) == len(set(chain))
+
+    # The pin side: the block behind that key is touched once, so the run can
+    # still be offered it while pinned, and the offer names it once.
+    scheduler.bind_gpu_block_pool(
+        _hashed_chunk_blocks(by_group[attn], configs[attn].group_idx, tpc)
+    )
+    status = _finished(scheduler, by_group)
+    scheduler._finished_tail_resume = lambda _s: resume
+    scheduler._pin_finished(status)
+    tag = scheduler._run_tag(by_group)
+    pins = [block for _, block in scheduler._wb_pinned[tag][1]]
+    assert len(pins) == len({block.block_id for block in pins})
+    cfg_by_group = scheduler._config_idx_by_group
+    assert scheduler._storable_free_block(key, cfg_by_group) is not None
+    scheduler._record_run(status)
+    members = scheduler._run_members(tag, cfg_by_group)
+    offer = scheduler._offer_keys(tag, members)
+    assert offer.count(key) <= 1
+
+
 def test_keys_a_store_evicted_leave_the_band_view(band):
     """H1: the pool's own evictions (returned by a store) are forgotten, so the
     band rewrites those blocks when the GPU drops them instead of assuming
