@@ -34,6 +34,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
 )
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -831,7 +832,11 @@ def test_a_member_leaving_the_gpu_makes_its_run_newest_in_the_pool(band):
 def _pin_chain(scheduler, monkeypatch, chain):
     monkeypatch.setattr(scheduler, "_run_tag", lambda by_group: chain[-1])
     monkeypatch.setattr(scheduler, "_restore_chain", lambda by_group, **kw: chain)
-    scheduler._pin_finished(SimpleNamespace(group_states=[]))
+    # The pin asks the turn what its tail resumes at, so the state it is handed
+    # carries the request as well as the groups it reads its keys from.
+    scheduler._pin_finished(
+        SimpleNamespace(group_states=[], req=MagicMock(request_id="req"))
+    )
 
 
 def test_a_finished_run_is_pinned_until_the_band_copies_it(band, monkeypatch):
@@ -2460,6 +2465,233 @@ def test_the_tier_answers_for_a_tail_this_process_never_stored():
     assert hit is not None
     assert hit.generation == scheduler._cache_generation
     assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups[:1]) is None
+
+
+# --- the producer above the state boundary: a tail takes the chunks under it ---
+#
+# functional-test-5d refused a resume a fresh engine had earned. A finished
+# turn's tail sits above the deepest boundary whose state the band carries, and
+# the restore chain is trimmed at that boundary, so the whole chunks between it
+# and the chunk the tail fills were offered to no store route at all: the fence
+# asked the arena for a row nobody had ever handed it, and refused rightly. The
+# four tests below take that shape at CPU scale: a turn of six keyed chunks,
+# its last stored state at the end of chunk 3, and its tail one token before
+# its end, so chunk 4 lies between the chain and the tail and a resume there
+# reads it as an ordinary chunk of its own.
+
+_TAIL_TURN_CHUNKS = 6
+_TAIL_TURN_STATE_CHUNK = 3
+
+
+def _pool_taking_what_it_lacks(scheduler: OffloadingConnectorScheduler):
+    """A pool that allocates a row for every key it lacks and none for one it
+    already holds, so an offer that carries a resident key reads as what it is."""
+
+    def take(keys, tag, whole=False, held=False, tails=None):
+        new = [k for k in keys if k not in scheduler._pool_has]
+        return PrepareStoreOutput(
+            keys_to_store=new,
+            store_spec=CPULoadStoreSpec(list(range(len(new)))),
+            evicted_keys=[],
+        )
+
+    return take
+
+
+def _turn_with_its_tail_above_the_state(
+    monkeypatch, tail: bool = True, partial_tail_offload: bool = True
+):
+    """A finished turn of six keyed chunks, its last stored state ending at
+    chunk 3, its attention blocks still free and hashed on the GPU, and its tail
+    offered the way the engine core offers one.
+
+    ``tail=False`` is the same turn with no tail offered, which is what tells a
+    row the tail is owed from one the conversation always carried. With the
+    offload flag off the offer is queued and nothing more happens to it, as in a
+    deployment whose core never brings a tail here at all."""
+    monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_SCAN", 64)
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_MAX_HELD", 64)
+    monkeypatch.setattr(sched_mod, "WRITE_BACK_FREE_SHARE", 1.0)
+    scheduler = _make_partial_tail_scheduler(
+        partial_tail_offload=partial_tail_offload
+    )
+    chunk = scheduler.config.kv_group_configs[0].tokens_per_chunk
+    request = _make_partial_tail_request(
+        scheduler, num_prompt_tokens=_TAIL_TURN_CHUNKS * chunk
+    )
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    by_group = [gs.offload_keys for gs in req_status.group_states]
+    assert [len(keys) for keys in by_group] == [_TAIL_TURN_CHUNKS] * len(by_group)
+    # The turn's dense blocks, where the band finds them: free, hashed and
+    # chunk-aligned. A recurrent group needs none, because its row at the
+    # boundary is the hand-off's and reaches the arena that way.
+    blocks: dict[OffloadKey, KVCacheBlock] = {}
+    for group, keys in zip(scheduler.config.kv_group_configs, by_group):
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            continue
+        for i, key in enumerate(keys):
+            block = KVCacheBlock(len(blocks) + 1)
+            block.set_block_hash(
+                make_block_hash_with_group_id(
+                    BlockHash(bytes(key)[:-4]), group.group_idx
+                ),
+                (i + 1) * chunk,
+            )
+            blocks[key] = block
+    scheduler.bind_gpu_block_pool(FakeGPUPool(list(blocks.values())))
+    scheduler.manager.pool_free_fraction = MagicMock(return_value=0.0)
+    scheduler.manager.pool_evicted = MagicMock(return_value=([], False))
+    scheduler.manager.prepare_store_run = MagicMock(
+        side_effect=_pool_taking_what_it_lacks(scheduler)
+    )
+    # The one boundary every state group is stored at: what trims the chain
+    # there, and leaves chunk 4 above it.
+    for group, keys in zip(scheduler.config.kv_group_configs, by_group):
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            scheduler._note_state_stored(keys[_TAIL_TURN_STATE_CHUNK])
+    resume = request.num_tokens - 1
+    handoff = AnswerTailHandoff(
+        request_id="req",
+        tail_hash=BlockHash(b"tail"),
+        parent=None,
+        length=chunk,
+        resume_token=resume,
+    )
+    if tail:
+        for group in scheduler.config.partial_tail_groups:
+            assert scheduler.answer_tail_store.store_tail(
+                handoff, group.group_idx, [300 + group.group_idx]
+            )
+    return SimpleNamespace(
+        scheduler=scheduler,
+        req_status=req_status,
+        by_group=by_group,
+        blocks=blocks,
+        chunk=chunk,
+        resume=resume,
+        state=by_group[1][_TAIL_TURN_STATE_CHUNK],
+    )
+
+
+def _stored_turn(monkeypatch, tail: bool = True, partial_tail_offload: bool = True):
+    """The turn above, stored: the tail drained, the run recorded at the step's
+    end and the band given its step, as ``build_connector_meta`` orders them.
+
+    Gains ``keys``, the keys that one whole-run store offered the pool in offer
+    order, and ``sources``, the GPU blocks its copy job would read."""
+    turn = _turn_with_its_tail_above_the_state(
+        monkeypatch, tail=tail, partial_tail_offload=partial_tail_offload
+    )
+    tail_jobs = turn.scheduler._build_answer_tail_store_jobs()
+    assert bool(tail_jobs) == (tail and partial_tail_offload)
+    turn.scheduler._record_run(turn.req_status)
+    jobs = turn.scheduler._build_write_back_jobs()
+    run_stores = [
+        c
+        for c in turn.scheduler.manager.prepare_store_run.call_args_list
+        if c.kwargs["whole"]
+    ]
+    assert len(run_stores) == 1
+    turn.keys = list(run_stores[0].args[0])
+    turn.sources = _src_blocks(jobs)
+    turn.tail_rows = len(tail_jobs)
+    return turn
+
+
+def test_a_tail_above_the_state_boundary_offers_the_chunks_under_it(monkeypatch):
+    """The rows between the chain and the tail are the resume's own chunks, so
+    the band has to be asked to write them: the fence asks the arena for every
+    one of them, and a row nobody offered is a row nobody can hold."""
+    turn = _stored_turn(monkeypatch)
+    tag = turn.by_group[0][-1]
+    # The chain stops at the state boundary and the tail fills the chunk the
+    # resume sits in; everything between is a whole chunk of a dense group.
+    between = turn.by_group[0][
+        _TAIL_TURN_STATE_CHUNK + 1 : cdiv(turn.resume, turn.chunk) - 1
+    ]
+    assert between == [turn.by_group[0][_TAIL_TURN_STATE_CHUNK + 1]]
+    assert all(key in turn.keys for key in between)
+    # Owned by the run, so a block of it triggers the store like any other
+    # member, and the one job that store builds copies it.
+    assert all(turn.scheduler._key_run[key] == tag for key in between)
+    assert all(key in turn.scheduler._run_keys[tag] for key in between)
+    assert all(turn.blocks[key].block_id in turn.sources for key in between)
+    # The chunk the tail fills stays the tail's own: its row there is keyed by
+    # the tail, and a dense row beside it is one no load reads.
+    assert turn.by_group[0][cdiv(turn.resume, turn.chunk) - 1] not in turn.keys
+
+
+def test_a_tail_above_the_state_boundary_moves_no_state_row(monkeypatch):
+    """A tail makes the positions above the boundary resumable; it puts no state
+    at any of them. What it is owed is what the dense groups write chunk by
+    chunk, so the state groups' offer is the one thing that must not move."""
+    with_tail = _stored_turn(monkeypatch)
+    without = _stored_turn(monkeypatch, tail=False)
+    state = with_tail.scheduler._state_group_ids
+
+    offered = [k for k in with_tail.keys if get_offload_group_idx(k) in state]
+    plain = [k for k in without.keys if get_offload_group_idx(k) in state]
+    assert offered == plain == [with_tail.state]
+    assert set(with_tail.keys) - set(without.keys) == {
+        with_tail.by_group[0][_TAIL_TURN_STATE_CHUNK + 1]
+    }
+    assert set(without.keys) - set(with_tail.keys) == set()
+
+
+def test_a_flag_off_engine_offers_no_rows_for_a_tail_it_was_offered(monkeypatch):
+    """Flag off, no core brings a tail here; should one be queued anyway, the
+    store route is inert and so is the chain: rows no resume can be granted for
+    are rows no flag-off engine should spend a row of the arena on."""
+    offered = _stored_turn(monkeypatch, partial_tail_offload=False)
+    plain = _stored_turn(monkeypatch, tail=False, partial_tail_offload=False)
+
+    assert offered.keys == plain.keys
+    assert offered.by_group[0][_TAIL_TURN_STATE_CHUNK + 1] not in offered.keys
+    assert dict(offered.scheduler._tail_counts) == {}
+    assert not offered.scheduler._tail_row_keys and not offered.scheduler._run_tails
+
+
+def _engine_over_the_turn(dense_rows: int):
+    """A brand-new engine for the turn above: the request has computed the state
+    boundary at chunk 3 for itself, the arena holds the first ``dense_rows``
+    chunk rows of the dense group and the tail's own rows, and nothing else."""
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=95,
+        prompt_tokens=96,
+        locally_computed_tokens=64,
+        scheduler=_make_partial_tail_scheduler(partial_tail_offload=True),
+    )
+    rows = tuple(
+        make_offload_key(b"tail", group.group_idx)
+        for group in scheduler.config.partial_tail_groups
+    )
+    arena = set(req_status.group_states[0].offload_keys[:dense_rows]) | set(rows)
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.HIT if key in arena else LookupResult.MISS
+    )
+    return scheduler, req_status, record
+
+
+def test_a_fresh_engine_resumes_where_the_producer_stored_the_chunks_under_its_tail():
+    """The 5d refusal and the grant this fix is for, on one geometry. The arena
+    holds the conversation's chunk rows down to the state boundary and the tail's
+    own rows; the row between is the one the producer's chain now carries. With
+    it absent the fence refuses and the request recomputes; with it held, the
+    first request of a brand-new engine is granted at the resume. The fence did
+    not move: it asks for these rows today and gets a MISS because no store
+    route was ever offered them."""
+    scheduler, req_status, record = _engine_over_the_turn(_TAIL_TURN_STATE_CHUNK + 1)
+    assert scheduler._lookup(req_status) == 0
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert req_status.tail_resume is None
+
+    scheduler, req_status, record = _engine_over_the_turn(_TAIL_TURN_STATE_CHUNK + 2)
+    assert scheduler._lookup(req_status) == record.resume_token - 64
+    assert req_status.partial_tail_boundary == record.resume_token
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
 
 
 def _only_attention_group(scheduler: OffloadingConnectorScheduler) -> int:
