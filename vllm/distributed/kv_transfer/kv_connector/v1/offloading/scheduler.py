@@ -1237,19 +1237,36 @@ class OffloadingConnectorScheduler:
         """What a restore of a finished request's conversation reads, and the
         answer-tail keys in it with their resume position. The tail the core
         registered at the turn's end is the run's deepest restore point: its
-        rows plus the chunks below it, merged into the aligned chain."""
+        rows plus the chunks below it, merged into the aligned chain. Rows the
+        conversation's previous record still owes the pool (busy on the GPU
+        when it was stored, e.g. a tail the next turn was reading) are carried
+        as older restore points, so a re-record never drops them."""
         have = lambda k: k in self._pool_has or self._gpu_has(k)  # noqa: E731
         chain = self._restore_chain(by_group, have=have, extras=extras)
+        tail_pos: dict[OffloadKey, int] = {}
         tail = req_status.req.answer_tail if self.config.answer_tail_offload else None
-        if tail is None:
-            return chain, {}
-        tail_hash, resume = tail
-        span = self._tail_span(by_group, 0, resume, tail_hash)
-        if span is None or not all(have(k) for k in span):
-            return chain, {}
-        seen = set(chain)
-        chain = chain + [k for k in span if k not in seen]
-        return chain, dict.fromkeys(self._tail_keys(tail_hash), resume)
+        if tail is not None:
+            tail_hash, resume = tail
+            span = self._tail_span(by_group, 0, resume, tail_hash)
+            if span is not None and all(have(k) for k in span):
+                seen = set(chain)
+                chain = chain + [k for k in span if k not in seen]
+                tail_pos = dict.fromkeys(self._tail_keys(tail_hash), resume)
+        tag = self._run_tag(by_group)
+        if self.config.answer_tail_offload and tag is not None:
+            seen = set(chain)
+            carried = [
+                k
+                for k in self._run_keys.get(tag, ())
+                if k not in seen and k not in self._pool_has and self._gpu_has(k)
+            ]
+            chain = chain + carried
+            if extras is not None:
+                extras.update(carried)
+            tail_pos.update(
+                (k, self._tail_pos[k]) for k in carried if k in self._tail_pos
+            )
+        return chain, tail_pos
 
     def _tail_keys(self, tail_hash: BlockHash) -> list[OffloadKey]:
         """One row per group under the tail's own hash, tail-only groups last."""
@@ -2573,6 +2590,17 @@ class OffloadingConnectorScheduler:
                 continue
             results = [r for _, r in self._lookup_results(keys, req_status.req_context, True)]
             if len(results) < len(keys) or LookupResult.MISS in results:
+                if self._b70_trace:
+                    i = min(
+                        results.index(LookupResult.MISS)
+                        if LookupResult.MISS in results else len(results),
+                        len(keys) - 1,
+                    )
+                    _b70.log(
+                        "answer-tail miss req=%s resume=%d row=%d/%d group=%d",
+                        req.request_id, resume, i, len(keys),
+                        get_offload_group_idx(keys[i]),
+                    )
                 continue
             if any(r is not LookupResult.HIT for r in results):
                 # A row still being written or read back: wait for the deepest
