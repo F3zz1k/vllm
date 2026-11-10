@@ -1602,6 +1602,11 @@ class OffloadingConnectorScheduler:
         tail_pos = self._tail_pos.get(key)
         if tail_pos is not None:
             return (block, config_idx, tail_pos) if free else None
+        if block.block_hash is None or bytes(block.block_hash) != bytes(key):
+            # A lookup-only alias (the answer tail's in-window blocks): an
+            # offload key names a whole chunk, so the block it reaches is full.
+            tpc = self.config.kv_group_configs[config_idx].tokens_per_chunk
+            return (block, config_idx, tpc) if free else None
         if (not free or not num_tokens
                 or num_tokens % self.config.kv_group_configs[config_idx].tokens_per_chunk):
             return None
