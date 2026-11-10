@@ -1997,9 +1997,10 @@ def _tail_resume_layout(
     row of a group that stores every chunk, the checkpoint row only of a group
     that stores at checkpoints, and HIT for any key that is not one of this
     request's chunk rows, since what an earlier turn left at a boundary is not
-    what these tests are about. The rows are marked in the band's mirror as a
-    deployment that mirrors the pool would have them; a test that wants one
-    without the other says so itself.
+    what these tests are about. The tail is recorded the way the store records
+    one, and named in the pool's own record of its tails, which is what the
+    probe is answered from; a test that wants one without the other says so
+    itself.
     """
     if scheduler is None:
         scheduler = _make_drafter_partial_tail_scheduler(True)
@@ -2017,7 +2018,7 @@ def _tail_resume_layout(
             for group in scheduler.config.partial_tail_groups
         )
     scheduler._tail_row_keys[b"tail"] = rows
-    scheduler._note_in_pool(rows)
+    scheduler._pool_tail_keys = {b"tail"}
     record = AnswerTailHit(
         tail_key=BlockHash(b"tail"),
         resume_token=resume_token,
@@ -2514,9 +2515,9 @@ def test_a_tail_another_engine_stored_is_granted_over_the_rows_its_key_names():
     looked_up = [call.args[0] for call in scheduler.manager.lookup.call_args_list]
     assert all(row in looked_up for row in rows)
     assert scheduler._tail_row_keys[b"tail"] == rows
-    # The pool view is marked as well, on the arena's own answer. Without it the
-    # next request of the same conversation is answered from a record of rows
-    # this process never stored, which is to say: not at all.
+    # The pool view is marked as well, on the arena's own answer: the band's
+    # accounting of what the arena holds is what the write-back band paces
+    # itself on, and a row it never learns about is a row it may rewrite.
     assert all(row in scheduler._pool_has for row in rows)
 
 
@@ -2560,6 +2561,83 @@ def test_the_tier_answers_for_a_tail_this_process_never_stored():
     assert hit is not None
     assert hit.generation == scheduler._cache_generation
     assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups[:1]) is None
+
+
+def test_a_tail_this_engine_stored_is_held_where_the_band_does_not_write_back():
+    """The pool owns the answer "this tail is here", so the engine that wrote a
+    tail is answered for it exactly as one that only heard of it. The completion
+    path marks the band's mirror of the pool only where a deployment writes
+    back, while the store records the tail's rows either way: on the default
+    deployment the mirror is empty, and asking it answered "not held" for the
+    one tail this engine had certainly written, while a tail another engine
+    stored was answered from the pool's own record."""
+    scheduler, handoff, blocks = _answer_tail_offer()
+    named: dict[bytes, tuple[bytes, int]] = {}
+
+    def take_run(keys, tag, whole=False, held=False, tails=None):
+        # The pool keeps the tail facts the store names its rows with, and its
+        # record of its tails is built from nothing else.
+        named.update(tails or {})
+        return _takes_every_key(keys, tag, whole=whole, held=held)
+
+    def tails_held():
+        by_parent: dict[bytes, set[tuple[int, bytes]]] = {}
+        for key, (parent, length) in named.items():
+            by_parent.setdefault(parent, set()).add((length, bytes(key)[:-4]))
+        return {parent: tuple(sorted(rows)) for parent, rows in by_parent.items()}
+
+    scheduler.manager.prepare_store_run = MagicMock(side_effect=take_run)
+    scheduler.manager.tail_index = MagicMock(side_effect=tails_held)
+
+    jobs = scheduler._build_answer_tail_store_jobs()
+    [job_id] = jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    assert scheduler._tail_counts["tail_stored"] == 1
+    assert not scheduler._pool_has        # nothing mirrors the pool here
+    # The core's candidate walk asks the tier what it holds under each parent,
+    # and the probe reads the copy that question leaves behind.
+    assert scheduler._pool_tail_lengths([None]) == {None: (handoff.length,)}
+    groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
+    hit = scheduler.answer_tail_store.lookup_tail(handoff.tail_hash, groups)
+    assert hit is not None
+    assert (
+        scheduler.answer_tail_store.lookup_tail(handoff.tail_hash, groups[:1])
+        is None
+    )
+
+
+def test_the_band_mirror_still_answers_a_probe_where_the_band_is_on(monkeypatch):
+    """Where a deployment does mirror the pool, that mirror is written by the
+    completion path and drained by the eviction feed under the same flag, so it
+    is the freshest view there is and the probe may read it: the pool's own
+    record is only replaced once a refresh at a time, and a tail whose copy just
+    completed is held already."""
+    monkeypatch.setattr(sched_mod, "WRITE_BACK", True)
+    scheduler, handoff, blocks = _answer_tail_offer()
+    scheduler.manager.tail_index = MagicMock(return_value=None)  # keeps no record
+
+    jobs = scheduler._build_answer_tail_store_jobs()
+    [job_id] = jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+
+    rows = _tail_keys(handoff, sorted(blocks))
+    assert all(key in scheduler._pool_has for key in rows)
+    groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
+    hit = scheduler.answer_tail_store.lookup_tail(handoff.tail_hash, groups)
+    assert hit is not None
 
 
 # --- the producer above the state boundary: a tail takes the chunks under it ---

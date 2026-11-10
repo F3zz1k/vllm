@@ -1590,9 +1590,13 @@ class OffloadingConnectorScheduler:
         The whole tail goes with it: a restore reads every row the store wrote,
         so one row the arena dropped is a tail no restore can be granted over.
         This is the primitive for the arena dropping a row; an ownership move
-        keeps the record, see _move_tail_key.
+        keeps the record, see _move_tail_key. The pool's copy of its own tail
+        record goes with it, since the pool reported the row gone on its own
+        channel: the next refresh would drop it anyway, and a probe that went on
+        answering yes for it costs the caller a fence that has to refuse.
         """
         self._tail_row_keys.pop(bytes(key)[:-4], None)
+        self._pool_tail_keys.discard(bytes(key)[:-4])
         owned = self._tail_run.pop(key, None)
         tails = self._run_tails.get(owned) if owned is not None else None
         if tails is not None:
@@ -5242,38 +5246,39 @@ class OffloadingConnectorScheduler:
     def _tail_is_held(self, tail_key: BlockHash, group_ids: Sequence[int]) -> bool:
         """Whether the arena holds every row of the tail this key names.
 
-        The fence a restore is granted behind, and the whole of it. A tail comes
-        back as one row per group under the tail's own key, except in a windowed
-        group, whose rows are keyed by the blocks they came from, so the tail key
-        names only the last of them: the rows recorded at the store are what a
-        restore reads, and a tail that would come back missing one is refused.
-        A restore that reads a wrong recurrent state, or a window with a row
-        gone, is reported nowhere: the resume is simply wrong.
+        The pool is the one owner of that answer, and this is the pre-filter that
+        decides whether a probe is worth putting at all: the fence a restore is
+        granted behind asks the arena for every row itself, and takes the hold a
+        HIT comes with, so nothing here can hand a load a row that is not ready.
 
-        A tail whose rows were never recorded is answered from the pool's own
-        record of the tails it holds, which is how a turn finished by another
-        engine is answered at all; the fence still asks the arena for every row
-        before it grants. A tail in neither record is not held, which covers one
-        the pool evicted (``_forget_tail_key`` drops the record) and one nobody
-        has written down.
+        The answer comes from the pool's own record of the tails it holds, read
+        from the copy ``_pool_tail_lengths`` keeps: it names a turn finished by
+        another engine as readily as one this process stored, and it is replaced
+        whole at every refresh, so a tail the pool dropped leaves the answer with
+        nothing to drain first. ``_forget_tail_key`` drops the copy's entry as
+        soon as the pool's eviction feed names the row gone, rather than waiting
+        for the next refresh to say it.
+
+        The band's mirror of the pool answers only where the band is on, and then
+        only to confirm a tail this process stored. That mirror is written by the
+        completion path and drained by the eviction feed under the same flag, so
+        there it is the freshest view there is, and a tail whose copy just
+        completed is held before the record above is refreshed. Where the band is
+        off nothing drains it, and reading it first answered "not held" for the
+        one tail this engine had certainly written, for rows the pool was ready to
+        answer for, while a tail another engine stored was answered.
         """
         if not self.config.enable_partial_tail_offload:
             return False
-        rows = self._tail_row_keys.get(bytes(tail_key))
-        if not rows:
-            return bytes(tail_key) in self._pool_tail_keys and (
-                self._partial_tail_group_ids.issubset(group_ids)
-            )
-        tail_groups = {
-            get_offload_group_idx(key)
-            for key in rows
-            if get_offload_group_idx(key) in self._partial_tail_group_ids
-        }
-        if not tail_groups.issubset(group_ids):
+        if not self._partial_tail_group_ids.issubset(group_ids):
             # A group the probe left out is a group whose row the resume would
             # not read, which is not the state at the tail.
             return False
-        return all(key in self._pool_has for key in rows)
+        if WRITE_BACK:
+            rows = self._tail_row_keys.get(bytes(tail_key))
+            if rows and all(key in self._pool_has for key in rows):
+                return True
+        return bytes(tail_key) in self._pool_tail_keys
 
     def _cache_is_current(self, generation: int) -> bool:
         """Whether a record made against the prefix cache still names the cache
