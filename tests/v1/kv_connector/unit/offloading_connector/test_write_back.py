@@ -2117,6 +2117,79 @@ def test_a_granted_resume_is_loaded_under_the_tail_key_into_its_own_block():
     assert req_status.partial_tail_boundary is None
 
 
+def test_a_grant_no_allocation_followed_dies_with_the_next_lookup():
+    """A grant lives exactly one lookup. The core breaks between the lookup that
+    grants a resume and the allocation that spends it (a transfer pending, the
+    prefills deferred, a step that reached no new token, an allocation that came
+    back short), and its next probe drops the record it left on the request
+    first: unless the connector drops its own copy at that next lookup too, the
+    later step is left holding a resume nobody granted."""
+    scheduler, req_status, record = _tail_resume_layout()
+    assert scheduler._lookup(req_status) == record.resume_token
+    assert req_status.tail_resume is record
+
+    # The request was deferred rather than allocated, and the core's next probe
+    # found no tail to leave behind.
+    req_status.req.tail_resume = None
+    assert scheduler._lookup(req_status) == 28
+    assert req_status.tail_resume is None
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+
+
+def test_a_grant_no_allocation_followed_loads_no_tail_row_at_a_later_boundary():
+    """The consequence of a grant that outlives its lookup is a load, not stale
+    bookkeeping: the aligned route sets the boundary, and the key the row at it
+    is loaded under comes from the surviving grant, so the request resumes at
+    the boundary holding the state from the deeper position and the count
+    reports a restore nobody asked for."""
+    scheduler, req_status, record = _tail_resume_layout()
+    assert scheduler._lookup(req_status) == record.resume_token
+
+    # The core called update_state_after_alloc for a load that carried no
+    # external tokens, which returns before anything is spent, and then probed
+    # again with no tail to find.
+    scheduler.update_state_after_alloc(req_status.req, KVCacheBlocks(([], [], [])), 0)
+    req_status.req.tail_resume = None
+    assert scheduler._lookup(req_status) == 28
+
+    scheduler.update_state_after_alloc(
+        req_status.req,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32)],
+                [KVCacheBlock(0, is_null=True), KVCacheBlock(41)],
+                [KVCacheBlock(51), KVCacheBlock(52)],
+            )
+        ),
+        num_external_tokens=28,
+    )
+
+    [job] = scheduler._jobs.values()
+    tail_rows = [
+        make_offload_key(b"tail", group.group_idx)
+        for group in scheduler.config.partial_tail_groups
+    ]
+    assert not set(tail_rows) & job.keys
+    # The boundary the request proved for itself, under the key its own block
+    # owns, which is the row an aligned resume reads.
+    assert make_offload_key(BlockHash(b"h6"), 0) in job.keys
+    assert scheduler._tail_counts["tail_restored"] == 0
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+
+
+def test_a_refused_resume_leaves_no_grant_behind():
+    """A refusal is where a resume attempt ends, so it is where both copies of
+    the record go: the core's on the request, which went, and the connector's
+    grant, which is the one that names the tail's key at a later boundary."""
+    scheduler, req_status, record = _tail_resume_layout()
+    assert scheduler._lookup(req_status) == record.resume_token
+
+    scheduler._refuse_tail_resume(req_status, record.resume_token, "a row is gone")
+
+    assert req_status.tail_resume is None
+    assert req_status.req.tail_resume is None
+
+
 def test_a_resume_that_fills_no_destination_row_is_not_counted_as_a_restore():
     # A tail group whose block at the resume position the GPU already holds
     # fills no destination row, so that group's row never reaches the load. The

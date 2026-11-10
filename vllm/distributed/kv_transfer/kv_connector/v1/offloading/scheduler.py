@@ -575,7 +575,10 @@ class RequestOffloadState:
     partial_tail_boundary: int | None = None
     # The tail the core found in the tier when its own registry came up short,
     # accepted by the connector's fence at the lookup that reached no further.
-    # Consumed when the load that fills the boundary is scheduled.
+    # One lookup's long: the scheduler can break between that lookup and the
+    # allocation that spends it, and the next lookup drops a grant no load was
+    # built on, because the row at a later boundary would be named by this
+    # tail's key rather than by the block the boundary belongs to.
     tail_resume: AnswerTailHit | None = None
     # Times this request's resume has been probed after the arena answered
     # RETRY for it, bounded by ``_TAIL_RESUME_RETRIES``.
@@ -2802,7 +2805,13 @@ class OffloadingConnectorScheduler:
         rows a completed load measured.
         """
         complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
+        # A grant lives exactly one lookup. The scheduler can break between this
+        # answer and the allocation that spends it, and the core nulls the record
+        # it left on the request at its next probe, so a grant kept past here is
+        # one no load was ever built on: the next boundary would be named by the
+        # tail's key rather than the block's, and counted as a restore.
         req_status.partial_tail_boundary = None
+        req_status.tail_resume = None
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
@@ -3943,8 +3952,14 @@ class OffloadingConnectorScheduler:
         things: a refused store leaves a tail unwritten, a refused restore
         leaves a conversation to recompute its own tail. Both counts go through
         the one flag-off predicate.
+
+        Both copies of the record end here. The core's is the one the probe
+        leaves on the request and the connector's grant is what names the tail's
+        key at a boundary, so a refusal that cleared only the first would leave
+        a later step to load the tail's row for a resume it had just turned down.
         """
         req_status.req.tail_resume = None
+        req_status.tail_resume = None
         if not self._count_tail_event("tail_restore_refused"):
             return None
         logger.info_once(
