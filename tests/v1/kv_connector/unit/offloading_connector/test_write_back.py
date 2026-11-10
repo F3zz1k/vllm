@@ -2150,6 +2150,14 @@ def test_a_granted_resume_is_loaded_under_the_tail_key_into_its_own_block():
     assert req_status.partial_tail_boundary is None
 
 
+def _the_arena_holds_the_request_chunks(scheduler) -> None:
+    """The arena answers for every row this request's own chunks name, so the
+    aligned route reaches the boundary one block past them: the answer a resume
+    has to beat, and the one the next step falls back to without it."""
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+
+
 def test_a_grant_no_allocation_followed_dies_with_the_next_lookup():
     """A grant lives exactly one lookup. The core breaks between the lookup that
     grants a resume and the allocation that spends it (a transfer pending, the
@@ -2158,6 +2166,7 @@ def test_a_grant_no_allocation_followed_dies_with_the_next_lookup():
     first: unless the connector drops its own copy at that next lookup too, the
     later step is left holding a resume nobody granted."""
     scheduler, req_status, record = _tail_resume_layout()
+    _the_arena_holds_the_request_chunks(scheduler)
     assert scheduler._lookup(req_status) == record.resume_token
     assert req_status.tail_resume is record
 
@@ -2176,6 +2185,7 @@ def test_a_grant_no_allocation_followed_loads_no_tail_row_at_a_later_boundary():
     the boundary holding the state from the deeper position and the count
     reports a restore nobody asked for."""
     scheduler, req_status, record = _tail_resume_layout()
+    _the_arena_holds_the_request_chunks(scheduler)
     assert scheduler._lookup(req_status) == record.resume_token
 
     # The core called update_state_after_alloc for a load that carried no
