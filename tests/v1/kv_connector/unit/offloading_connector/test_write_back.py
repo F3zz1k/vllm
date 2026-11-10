@@ -2696,6 +2696,9 @@ def test_the_tier_answers_for_a_tail_this_process_never_stored():
     group the tail carries is still no."""
     scheduler, _, record = _tail_resume_layout()
     scheduler._tail_row_keys.clear()
+    # What a brand-new connector has to go on: neither the rows nor the pool's
+    # record of its tails, which is the one the probe is answered from now.
+    scheduler._pool_tail_keys.clear()
     groups = [group.group_idx for group in scheduler.config.partial_tail_groups]
 
     assert scheduler.answer_tail_store.lookup_tail(record.tail_key, groups) is None
