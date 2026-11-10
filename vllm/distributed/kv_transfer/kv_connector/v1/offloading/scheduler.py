@@ -4229,10 +4229,13 @@ class OffloadingConnectorScheduler:
             # read. The count rides on the same answer: a tail whose rows the
             # arena would not confirm is one no restore can be granted for, and
             # counting it as stored would report a tail the band does not hold.
+            # It is a refusal, and it is counted as one, because a tail that
+            # became resumable for nobody is otherwise a store with no number.
             if self._confirm_tail_rows(keys, req_status.req_context) is None:
                 self._note_in_pool(keys)
                 self._count_tail_event("tail_stored")
-            return None
+                return None
+            return TailStoreRefusal("rows_unconfirmed")
         # No KV event here, unlike the aligned tail stores: a self-describing
         # event describes the hash-aligned prefix of one physical block, and an
         # answer tail is neither aligned nor a prefix of anything. A tail key is

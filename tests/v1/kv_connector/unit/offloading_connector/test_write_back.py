@@ -1427,6 +1427,32 @@ def test_a_tail_store_is_offered_again_until_its_retries_run_out():
     _assert_nothing_half_built(scheduler)
 
 
+def test_a_tail_the_arena_would_not_confirm_counts_its_refusal():
+    """A store the pool took no keys back for is still a store when the arena
+    confirms the rows: nothing to copy, and the tail is held. When it will not
+    confirm them nobody holds the tail, and that outcome used to leave no number
+    at all, neither ``tail_stored`` nor a refusal, so a tail that never became
+    resumable was invisible on /metrics."""
+    scheduler, handoff, blocks = _answer_tail_offer()
+    rows = _tail_keys(handoff, sorted(blocks))
+    scheduler.manager.prepare_store_run = MagicMock(
+        return_value=PrepareStoreOutput(
+            keys_to_store=[], store_spec=CPULoadStoreSpec([]), evicted_keys=[]
+        )
+    )
+    lost = rows[-1]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.MISS if key == lost else LookupResult.HIT
+    )
+
+    assert not scheduler._build_answer_tail_store_jobs()
+
+    assert scheduler._tail_counts["tail_stored"] == 0
+    assert scheduler._tail_counts["rows_unconfirmed"] == 1
+    assert not scheduler._pool_has
+    _assert_nothing_half_built(scheduler)
+
+
 def _tail_gpu_blocks(handoff, blocks: dict[int, list[int]]) -> dict[int, KVCacheBlock]:
     """The GPU as a retried offer sees a one-row-per-group layout: one block
     per group, cached under that group's tail key, which is what the retry is
@@ -3155,10 +3181,12 @@ def test_a_replayed_turn_relearns_a_tail_the_arena_still_holds(monkeypatch):
     assert not scheduler._build_answer_tail_store_jobs()
     assert scheduler._tail_row_keys[bytes(handoff.tail_hash)] == rows
     assert not scheduler._pool_has
-    # And it is not counted either: the mirror was left unmarked, so no restore
-    # can be granted over this tail, and a store counted here would be a tail
-    # reported as held that the arena refused to confirm.
+    # And it is not counted as a store: the mirror was left unmarked, so no
+    # restore can be granted over this tail, and a store counted here would be a
+    # tail reported as held that the arena refused to confirm. It is counted for
+    # what it is instead, a store that wrote nothing.
     assert scheduler._tail_counts["tail_stored"] == 2
+    assert scheduler._tail_counts["rows_unconfirmed"] == 1
     request.tail_resume = AnswerTailHit(
         tail_key=BlockHash(b"tail"),
         resume_token=29,
