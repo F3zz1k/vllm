@@ -1158,6 +1158,41 @@ def test_a_tail_leaves_when_its_run_leaves():
     assert not scheduler._tail_row_keys
 
 
+def test_a_tail_leaves_when_a_break_trims_its_run(band_with_tails):
+    # A break re-trims a run to the deepest boundary a restore can still read.
+    # That recomputation carries no tail, so the rows between the boundary and
+    # the tail leave the run with it, and a tail kept would be one whose fence
+    # asks the arena for rows no store route of this run will ever write. The
+    # ownership and the rows it was written as go together, as they do when the
+    # run is dropped: the eviction feed reaches a tail only through _tail_run.
+    scheduler, _, _ = band_with_tails
+    scheduler._has_state_groups = True
+    configs, attn, state = _groups(scheduler)
+    by_group = [[_hkey(i, c.group_idx) for i in range(6)] for c in configs]
+    for s in state:                        # the one stored boundary, at chunk 1
+        scheduler._note_state_stored(by_group[s][1])
+    tpc = configs[attn].tokens_per_chunk
+    resume = 4 * tpc                       # the tail two chunks above it
+    span = by_group[attn][2:cdiv(resume, tpc) - 1]
+    tail = _hkey(7, configs[state[0]].group_idx)
+    status = _finished(scheduler, by_group)
+    scheduler._note_tail_keys(status, [tail])
+    scheduler._tail_row_keys[bytes(tail)[:-4]] = (tail,)
+    scheduler._finished_tail_resume = lambda _s: resume
+    scheduler._record_run(status)
+    tag = by_group[attn][-1]
+    assert all(key in scheduler._run_keys[tag] for key in span)
+    assert scheduler._run_tails[tag] == [tail]
+    # The pool holds the chain but lost the span: the run breaks.
+    scheduler._note_in_pool([k for k in scheduler._run_keys[tag] if k not in span])
+    assert scheduler._run_members(tag, scheduler._config_idx_by_group) == []
+    assert scheduler._wb_counts["run_broken_trimmed"] == 1
+    assert not set(span) & set(scheduler._run_keys[tag])
+    assert tag not in scheduler._run_tails
+    assert tail not in scheduler._tail_run
+    assert bytes(tail)[:-4] not in scheduler._tail_row_keys
+
+
 def test_a_tail_the_pool_evicted_is_counted_and_forgotten(band_with_tails):
     # A tail has no GPU hash to be re-offered from, so the pool's eviction feed
     # is the only way the band learns the arena dropped it.

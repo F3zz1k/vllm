@@ -1490,6 +1490,14 @@ class OffloadingConnectorScheduler:
             self._run_extras[tag] = trimmed_extras
             for key in chain:
                 self._key_run[key] = tag
+            # A re-trim carries no tail. The rows between the boundary and a
+            # tail come from the resume the chain was extended for, and this
+            # recomputation cannot ask what a tail resumes at (a tail key
+            # records no position), so the run no longer owns a store for them.
+            # A tail left behind would be a fence the band has promised and
+            # cannot keep, so it goes with the span, as it does with the run.
+            for key in self._run_tails.pop(tag, ()):
+                self._forget_tail_key(key)
         self._wb_counts["run_broken_dropped"] += 1
         if self._b70_trace:
             self._b70_log_drop("broken", tag, missing)
