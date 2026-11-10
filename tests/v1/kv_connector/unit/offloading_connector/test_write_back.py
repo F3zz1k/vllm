@@ -752,9 +752,8 @@ def test_the_eagle_chunk_and_the_intervening_span_share_one_key_once(band):
 
     # The pin side: the block behind that key is touched once, so the run can
     # still be offered it while pinned, and the offer names it once.
-    scheduler.bind_gpu_block_pool(
-        _hashed_chunk_blocks(by_group[attn], configs[attn].group_idx, tpc)
-    )
+    gpu = _hashed_chunk_blocks(by_group[attn], configs[attn].group_idx, tpc)
+    scheduler.bind_gpu_block_pool(gpu)
     status = _finished(scheduler, by_group)
     scheduler._finished_tail_resume = lambda _s: resume
     scheduler._pin_finished(status)
@@ -767,6 +766,14 @@ def test_the_eagle_chunk_and_the_intervening_span_share_one_key_once(band):
     members = scheduler._run_members(tag, cfg_by_group)
     offer = scheduler._offer_keys(tag, members)
     assert offer.count(key) <= 1
+
+    # The free order the pin leaves behind is the chain's, end first, the way
+    # vLLM frees a request's blocks. Chain order is all the dedup can move, so
+    # this is where keep-first is visible: keeping the first occurrence leaves
+    # the shared key at the chain body's end, and the unpin frees the run in
+    # the order the chain names.
+    scheduler._unpin(tag)
+    assert _queue_ids(gpu)[-len(pins):] == [b.block_id for b in reversed(pins)]
 
 
 def test_keys_a_store_evicted_leave_the_band_view(band):
