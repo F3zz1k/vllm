@@ -2459,6 +2459,44 @@ def test_a_resume_the_arena_never_fills_is_refused_when_its_probes_run_out():
     assert req_status.req.tail_resume is None
 
 
+def test_a_fresh_tail_record_gets_its_own_probe_budget():
+    """Three probes is one resume attempt's budget, not the request's lifetime:
+    a request that waited out a tail the arena was still filling was refused
+    outright over every later tail, and paid for a recompute it never had to.
+    The give-up does still stand for the tail it was earned on."""
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=99, prompt_tokens=100
+    )
+    late = req_status.group_states[0].offload_keys[5]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.RETRY if key == late else LookupResult.HIT
+    )
+    for _ in range(sched_mod._TAIL_RESUME_RETRIES):
+        assert scheduler._lookup(req_status) is None
+    assert scheduler._lookup(req_status) == 92
+    retries = sched_mod._TAIL_RESUME_RETRIES
+    assert scheduler._tail_counts["tail_restore_retried"] == retries
+
+    # The same tail again: that attempt ended, and the arena has not changed its
+    # answer, so the request is refused without spending probes on it again.
+    req_status.req.tail_resume = record
+    assert scheduler._lookup(req_status) == 92
+    assert scheduler._tail_counts["tail_restore_retried"] == retries
+
+    # A different tail the arena is still filling is a fresh attempt: it is
+    # probed again, not refused on the strength of the last one.
+    req_status.req.tail_resume = AnswerTailHit(
+        tail_key=BlockHash(b"other"),
+        resume_token=99,
+        group_block_ids={},
+        num_tokens=100,
+        generation=scheduler._cache_generation,
+    )
+    assert scheduler._lookup(req_status) is None
+    assert scheduler._tail_counts["tail_restore_retried"] == retries + 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 2
+
+
 def test_a_resume_deeper_than_a_recurrent_group_s_checkpoint_is_granted():
     """A brand-new engine's first resume was refused by a row nothing writes. The
     confirmation asked every group for the whole chunks between the boundary the

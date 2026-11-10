@@ -580,9 +580,13 @@ class RequestOffloadState:
     # built on, because the row at a later boundary would be named by this
     # tail's key rather than by the block the boundary belongs to.
     tail_resume: AnswerTailHit | None = None
-    # Times this request's resume has been probed after the arena answered
-    # RETRY for it, bounded by ``_TAIL_RESUME_RETRIES``.
+    # Times this request's tail record has been probed after the arena answered
+    # RETRY for it, bounded by ``_TAIL_RESUME_RETRIES``: one record's budget, and
+    # a different tail record starts a fresh one.
     tail_resume_probes: int = 0
+    # The tail the probe budget above belongs to, so that a request which waited
+    # one tail out is not refused every later tail it could have resumed from.
+    tail_resume_probed: BlockHash | None = None
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
@@ -2939,6 +2943,12 @@ class OffloadingConnectorScheduler:
         record = req_status.req.tail_resume
         if record is None:
             return None, False
+        if req_status.tail_resume_probed != record.tail_key:
+            # A tail this request has not waited on yet: the budget is one
+            # attempt's, and the attempt the arena ran it out on was another
+            # tail's.
+            req_status.tail_resume_probed = record.tail_key
+            req_status.tail_resume_probes = 0
         if not self._cache_is_current(record.generation):
             return self._refuse_tail_resume(
                 req_status,
