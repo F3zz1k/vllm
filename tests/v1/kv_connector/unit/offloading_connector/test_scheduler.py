@@ -386,6 +386,7 @@ def _make_flash_next_scheduler(**kwargs) -> OffloadingConnectorScheduler:
 def _make_windowed_tail_scheduler(
     sliding_window: int = _FN_WINDOW,
     block_size: int = _FN_BLOCK,
+    retention_interval: int | None = None,
 ) -> OffloadingConnectorScheduler:
     """The store shape of a Flash-Next tail: two full-attention groups and one
     sliding-window group, all at ``block_size`` tokens per block.
@@ -396,8 +397,11 @@ def _make_windowed_tail_scheduler(
     group roles, the row counts and the keys all come from the real specs. The
     layout-wide ``_partial_tail_block_size`` stays as the closed gate leaves it
     because the store route reads its geometry per group, not from it.
+    ``retention_interval`` is the engine's checkpoint cadence, which decides how
+    sparse a windowed group's store mask is.
     """
     vllm_config = _make_flash_next_vllm_config()
+    vllm_config.cache_config.prefix_cache_retention_interval = retention_interval
     kv_cache_config = KVCacheConfig(
         num_blocks=8,
         kv_cache_tensors=[],

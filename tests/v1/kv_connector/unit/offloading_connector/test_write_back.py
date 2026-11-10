@@ -32,6 +32,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
+    RequestOffloadState,
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
@@ -1616,6 +1617,67 @@ def _window_row_key(scheduler, block_idx: int, group_idx: int = 2) -> OffloadKey
     )
 
 
+def _windowed_tail_request(
+    scheduler: OffloadingConnectorScheduler,
+) -> RequestOffloadState:
+    """A request long enough that a windowed group's rows all sit inside its
+    table, with its chunk keys built: what the fence confirms a resume against."""
+    _make_partial_tail_request(scheduler, num_prompt_tokens=12_000)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    return req_status
+
+
+def _windowed_demand_at_retention(retention_interval: int | None) -> None:
+    """One retention interval's answer: what the store writes for a windowed
+    group's chunk interior, and what the fence asks the arena for."""
+    scheduler = _make_windowed_tail_scheduler(retention_interval=retention_interval)
+    req_status = _windowed_tail_request(scheduler)
+    windowed = scheduler.config.kv_group_configs[2]
+    first_chunk, last_chunk = 5, 6
+    mask = scheduler._reachable_store_block_mask(
+        group_config=windowed,
+        start_chunk_idx=first_chunk,
+        end_chunk_idx=last_chunk,
+        final_segment_end_chunk_idx=None,
+        reachable_boundaries=(),
+    )
+    if retention_interval == 0:
+        assert mask is not None and not any(mask)
+    else:
+        assert mask is None
+    assert scheduler._demands_intervening_rows(windowed, first_chunk, last_chunk)
+
+    # Demanded in the fence as well as in the predicate: the interior row is
+    # asked for, and the arena not holding it refuses the resume.
+    interior = req_status.group_states[2].offload_keys[first_chunk]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.MISS if key == interior else LookupResult.HIT
+    )
+    refused = scheduler._confirm_intervening_rows(req_status, 8000, 11_000)
+    assert refused is not None
+    detail, result = refused
+    assert result is LookupResult.MISS
+    assert "group 2" in detail
+
+
+def test_a_windowed_group_stays_demanded_though_its_rows_sit_at_checkpoints():
+    """The sliding-window decision, pinned at both retentions.
+
+    At the retention interval this rig runs, a windowed group's store mask keeps
+    the window at a segment boundary and the proven junctions only, so it writes
+    no row for the chunk interior. That is the shape the recurrent groups have
+    and the reason the fence stopped demanding their rows, and a windowed group
+    is demanded anyway: the row at a position for a windowed group is its whole
+    window, the load reads every chunk row of it, and one tail row cannot fill
+    it, which is why the fence refuses a windowed tail by name. At a dense
+    retention the store writes every chunk and it is demanded on the store
+    argument too, so the answer does not move with the interval.
+    """
+    for retention_interval in (0, None):
+        _windowed_demand_at_retention(retention_interval)
+
+
 def test_a_windowed_group_costs_its_window_of_rows_in_the_store():
     # A resume at the tail reads the whole window of a windowed group, so the
     # store takes a row for every block that window spans and pairs each with
@@ -1777,28 +1839,78 @@ def test_the_restore_of_a_tail_is_refused_by_name():
 # --- the restore route: the core records a tail, the connector fences it ---
 
 
+def _tail_resume_absent_rows(
+    scheduler: OffloadingConnectorScheduler, req_status: RequestOffloadState
+) -> set[OffloadKey]:
+    """The chunk rows this request's arena does not hold, group by group.
+
+    The layout's answer to a lookup, modelled from the store side rather than
+    asked of the code under test. A group whose store route writes a row for
+    every chunk holds the request's whole chunk set. A group whose rows exist at
+    checkpoint positions only, the align-mode recurrent group among them, holds
+    the row at the boundary the request proved and nothing between that and a
+    resume: the band store skips an align-mode group outright, and a sparse
+    retention interval writes at a segment boundary alone. Answering HIT for
+    those interior rows as well is what kept the fence's demand for them
+    invisible on CPU.
+    """
+    absent: set[OffloadKey] = set()
+    blocks_per_chunk = scheduler.config.blocks_per_chunk
+    for group_config, group_state in zip(
+        scheduler.config.kv_group_configs, req_status.group_states
+    ):
+        keys = list(group_state.offload_keys)
+        if not group_config.requires_cow_source:
+            mask = group_config.manager_cls.reachable_block_mask(
+                start_block=0,
+                end_block=len(keys) * blocks_per_chunk,
+                alignment_tokens=scheduler.config.alignment_tokens,
+                kv_cache_spec=group_config.kv_cache_spec,
+                use_eagle=group_config.is_eagle_group,
+                retention_interval=scheduler.config.retention_interval,
+                dcp_world_size=scheduler.config.dcp_world_size,
+            )
+            if mask is None or all(mask):
+                continue
+        proved = req_status.num_locally_computed_tokens // group_config.tokens_per_chunk
+        if 0 < proved <= len(keys):
+            # The row at the boundary the request proved is the checkpoint the
+            # hand-off wrote, and the one row of that group the arena holds.
+            keys.pop(proved - 1)
+        absent.update(keys)
+    return absent
+
+
 def _tail_resume_layout(
     resume_token: int = 29,
     rows: tuple[OffloadKey, ...] | None = None,
     generation: int | None = None,
     scheduler: OffloadingConnectorScheduler | None = None,
     prompt_tokens: int = 32,
+    locally_computed_tokens: int = 0,
 ):
     """A request whose own chunks stop at the last proved boundary, and the tail
     the tier answered for the token beyond it: the scheduler, its request state,
     the record the core left, and the rows a restore has to read.
 
-    The arena answers HIT for every key, and the rows are marked in the band's
-    mirror as a deployment that mirrors the pool would have them. A test that
-    wants one without the other says so itself.
+    The arena answers per group the way a store would have left it: every chunk
+    row of a group that stores every chunk, the checkpoint row only of a group
+    that stores at checkpoints, and HIT for any key that is not one of this
+    request's chunk rows, since what an earlier turn left at a boundary is not
+    what these tests are about. The rows are marked in the band's mirror as a
+    deployment that mirrors the pool would have them; a test that wants one
+    without the other says so itself.
     """
     if scheduler is None:
         scheduler = _make_drafter_partial_tail_scheduler(True)
     request = _make_partial_tail_request(scheduler, num_prompt_tokens=prompt_tokens)
     req_status = scheduler._req_status["req"]
-    req_status.num_locally_computed_tokens = 0
+    req_status.num_locally_computed_tokens = locally_computed_tokens
     req_status.update_offload_keys()
-    scheduler.manager.lookup.return_value = LookupResult.HIT
+    absent = _tail_resume_absent_rows(scheduler, req_status)
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.MISS if key in absent else LookupResult.HIT
+    )
     if rows is None:
         rows = tuple(
             make_offload_key(b"tail", group.group_idx)
@@ -2016,10 +2128,12 @@ def test_a_resume_record_of_a_cache_that_is_gone_is_refused():
     # A reset wipes the prefix cache without asking the tier, and every key the
     # record names went with it. Honouring one would read rows under keys that
     # now belong to a different conversation.
-    scheduler, req_status, record = _tail_resume_layout()
+    scheduler, req_status, record = _tail_resume_layout(locally_computed_tokens=16)
     scheduler._forget_local_cache()
 
-    assert scheduler._lookup(req_status) == 28
+    # The aligned boundary at 28, one hash step past the checkpoint the request
+    # proved, stands: the answer is the 12 tokens beyond the 16 it has.
+    assert scheduler._lookup(req_status) == 28 - 16
     assert scheduler._tail_counts["tail_restore_refused"] == 1
     assert req_status.tail_resume is None
 
@@ -2028,9 +2142,12 @@ def test_a_resume_past_what_the_load_can_reach_is_refused():
     # A resume the chunks below cannot reach leaves a hole the request believes
     # computed. The last token of the prompt has to be recomputed for the
     # logprobs, so no answer from the arena can put a resume there.
-    scheduler, req_status, _ = _tail_resume_layout(resume_token=32)
+    scheduler, req_status, _ = _tail_resume_layout(
+        resume_token=32, locally_computed_tokens=16
+    )
 
-    assert scheduler._lookup(req_status) == 28
+    # The aligned boundary at 28 it falls back to, less the local checkpoint.
+    assert scheduler._lookup(req_status) == 28 - 16
     assert scheduler._tail_counts["tail_restore_refused"] == 1
     assert req_status.tail_resume is None
 
@@ -2059,9 +2176,11 @@ def test_a_resume_is_refused_unless_the_arena_holds_every_chunk_below_it():
     # resume deeper than the proved boundary reads the chunks between as well.
     # One of them absent reaches prepare_load as a key that is not ready, which
     # ends the engine, so the whole resume is refused rather than the part of it
-    # above the hole.
+    # above the hole. The full-attention group is the one to ask: its store
+    # route writes every chunk, so its row inside a chunk is a row the load
+    # reads and the confirmation demands.
     scheduler, req_status, _ = _tail_resume_layout(resume_token=99, prompt_tokens=100)
-    missing = req_status.group_states[1].offload_keys[5]
+    missing = req_status.group_states[0].offload_keys[5]
     scheduler.manager.lookup.side_effect = lambda key, _ctx: (
         LookupResult.MISS if key == missing else LookupResult.HIT
     )
@@ -2079,7 +2198,7 @@ def test_a_resume_the_arena_is_still_filling_is_probed_again_next_step():
     scheduler, req_status, record = _tail_resume_layout(
         resume_token=99, prompt_tokens=100
     )
-    filling = req_status.group_states[1].offload_keys[5]
+    filling = req_status.group_states[0].offload_keys[5]
     answers = {filling: LookupResult.RETRY}
     scheduler.manager.lookup.side_effect = lambda key, _ctx: answers.get(
         key, LookupResult.HIT
@@ -2104,7 +2223,7 @@ def test_a_resume_the_arena_has_lost_a_chunk_below_is_refused_for_good():
     # spot and once: the record goes with the chunk, and a request that comes
     # back later does not ask for a row the arena has said it does not hold.
     scheduler, req_status, _ = _tail_resume_layout(resume_token=99, prompt_tokens=100)
-    missing = req_status.group_states[1].offload_keys[5]
+    missing = req_status.group_states[0].offload_keys[5]
     scheduler.manager.lookup.side_effect = lambda key, _ctx: (
         LookupResult.MISS if key == missing else LookupResult.HIT
     )
@@ -2125,7 +2244,7 @@ def test_a_resume_the_arena_never_fills_is_refused_when_its_probes_run_out():
     # queue for nothing, so the re-probe is bounded the way a refused store is:
     # after the budget the resume is refused and counted like any other.
     scheduler, req_status, _ = _tail_resume_layout(resume_token=99, prompt_tokens=100)
-    late = req_status.group_states[1].offload_keys[5]
+    late = req_status.group_states[0].offload_keys[5]
     scheduler.manager.lookup.side_effect = lambda key, _ctx: (
         LookupResult.RETRY if key == late else LookupResult.HIT
     )
@@ -2140,17 +2259,109 @@ def test_a_resume_the_arena_never_fills_is_refused_when_its_probes_run_out():
     assert req_status.req.tail_resume is None
 
 
+def test_a_resume_deeper_than_a_recurrent_group_s_checkpoint_is_granted():
+    """A brand-new engine's first resume was refused by a row nothing writes. The
+    confirmation asked every group for the whole chunks between the boundary the
+    request proved and the resume, and an align-mode recurrent group stores its
+    state at a checkpoint only, so its row inside a chunk is a MISS that never
+    turns into a HIT. That group's own load is the tail row at the resume
+    position, which the tail confirmation already covers, so the resume is
+    granted on the groups whose store route writes every chunk."""
+    # Three chunks keyed, the request computed up to the checkpoint that ends
+    # chunk 0, and the tail resumes two chunks deeper: chunk 1 lies between.
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=45, prompt_tokens=48, locally_computed_tokens=16
+    )
+    full_chunk = req_status.group_states[0].offload_keys[1]
+    recurrent_chunk = req_status.group_states[1].offload_keys[1]
+
+    # The arena answers per group and those two rows are the whole question: the
+    # full-attention group's chunk row is held, the recurrent group's is not and
+    # nothing will ever write it.
+    assert scheduler.manager.lookup(full_chunk, req_status.req_context) is (
+        LookupResult.HIT
+    )
+    assert scheduler.manager.lookup(recurrent_chunk, req_status.req_context) is (
+        LookupResult.MISS
+    )
+
+    # The answer is the tokens beyond the 16 the request computed for itself.
+    assert scheduler._lookup(req_status) == record.resume_token - 16
+    assert req_status.partial_tail_boundary == record.resume_token
+    assert scheduler._tail_counts["tail_restore_granted"] == 1
+    assert scheduler._tail_counts["tail_restore_refused"] == 0
+
+
+def test_a_granted_resume_loads_no_interior_row_of_a_checkpoint_group():
+    # The confirmation may skip a group's interior rows only because the load
+    # never reads them: an align-mode group is allocated null blocks across the
+    # span and one real block at the resume position, so the keys it asks for
+    # are the tail's own rows beside the full group's chunk row.
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=45, prompt_tokens=48, locally_computed_tokens=16
+    )
+    assert scheduler._lookup(req_status) == record.resume_token - 16
+
+    scheduler.update_state_after_alloc(
+        req_status.req,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32), KVCacheBlock(33)],
+                [
+                    KVCacheBlock(0, is_null=True),
+                    KVCacheBlock(0, is_null=True),
+                    KVCacheBlock(41),
+                ],
+                [KVCacheBlock(51), KVCacheBlock(52), KVCacheBlock(53)],
+            )
+        ),
+        num_external_tokens=record.resume_token - 16,
+    )
+
+    [job] = scheduler._jobs.values()
+    assert req_status.group_states[1].offload_keys[1] not in job.keys
+    assert req_status.group_states[0].offload_keys[1] in job.keys
+    assert all(
+        make_offload_key(b"tail", group.group_idx) in job.keys
+        for group in scheduler.config.partial_tail_groups
+    )
+
+
+def test_a_resume_is_refused_when_a_group_that_stores_every_chunk_lacks_one():
+    # Leaving the checkpoint groups out of the demand does not soften it for the
+    # rest: a whole chunk of a group that writes one for every chunk is a row the
+    # load reads, so a MISS there still refuses the whole resume and leaves the
+    # boundary the request proved standing.
+    scheduler, req_status, _ = _tail_resume_layout(
+        resume_token=45, prompt_tokens=48, locally_computed_tokens=16
+    )
+    absent = _tail_resume_absent_rows(scheduler, req_status)
+    missing = req_status.group_states[0].offload_keys[1]
+    scheduler.manager.lookup.side_effect = lambda key, _ctx: (
+        LookupResult.MISS if key in absent or key == missing else LookupResult.HIT
+    )
+
+    # The aligned boundary at 28, one hash step past the checkpoint the request
+    # proved, is what it keeps.
+    assert scheduler._lookup(req_status) == 28 - 16
+    assert scheduler._tail_counts["tail_restore_refused"] == 1
+    assert scheduler._tail_counts["tail_restore_granted"] == 0
+    assert req_status.tail_resume is None
+    assert req_status.req.tail_resume is None
+
+
 def test_a_tail_whose_window_needs_more_rows_than_a_resume_fills_is_refused():
     # A windowed group's tail costs the window's worth of rows, and a resume has
     # one destination block for a group. Half a window is the wrong state to
     # hand back, so that layout is refused by name until a restore can size it.
     scheduler, req_status, _ = _tail_resume_layout(
-        rows=(make_offload_key(b"tail", 0), make_offload_key(b"other", 0))
+        rows=(make_offload_key(b"tail", 0), make_offload_key(b"other", 0)),
+        locally_computed_tokens=16,
     )
     scheduler._forget_in_pool([make_offload_key(b"other", 0)])
     scheduler._note_in_pool([make_offload_key(b"other", 0)])
 
-    assert scheduler._lookup(req_status) == 28
+    assert scheduler._lookup(req_status) == 28 - 16
     assert scheduler._tail_counts["tail_restore_refused"] == 1
 
 
@@ -2158,9 +2369,11 @@ def test_an_aligned_boundary_deeper_than_a_resume_is_kept_and_counts_nothing():
     # A tail is not a claim to be the deepest hit: where the request's own
     # chunks prove a boundary as deep, that route is taken and the record costs
     # nothing, so the counters say no restore happened.
-    scheduler, req_status, record = _tail_resume_layout(resume_token=28)
+    scheduler, req_status, record = _tail_resume_layout(
+        resume_token=28, locally_computed_tokens=16
+    )
 
-    assert scheduler._lookup(req_status) == 28
+    assert scheduler._lookup(req_status) == 28 - 16
     assert req_status.tail_resume is None
     assert scheduler._tail_counts["tail_restore_granted"] == 0
     assert scheduler._tail_counts["tail_restore_refused"] == 0
@@ -2170,10 +2383,10 @@ def test_a_resume_is_refused_for_a_request_that_is_gone():
     # The record is made while the request is being scheduled and the fence runs
     # whenever the lookup does; a request that has since finished has no
     # destination for the rows and no one to read them.
-    scheduler, req_status, _ = _tail_resume_layout()
+    scheduler, req_status, _ = _tail_resume_layout(locally_computed_tokens=16)
     req_status.req.is_finished.return_value = True
 
-    assert scheduler._lookup(req_status) == 28
+    assert scheduler._lookup(req_status) == 28 - 16
     assert scheduler._tail_counts["tail_restore_refused"] == 1
     assert req_status.tail_resume is None
 

@@ -2962,10 +2962,12 @@ class OffloadingConnectorScheduler:
         chunks under the keys the request already owns. A chunk the arena will
         not answer for reaches ``prepare_load`` as a key that is not ready,
         which ends the engine, so a resume reaches as deep as the chunks it
-        needs are held and no deeper. Asking every group is deliberate: the
-        destination blocks are not allocated yet, so which of those rows the
-        load reads is not known here, and a resume granted on half a check is a
-        wrong state that nothing reports.
+        needs are held and no deeper. What is asked for is what the load can
+        read: ``_demands_intervening_rows`` leaves out the groups whose rows
+        exist at checkpoint positions only and whose span the tail row covers,
+        because nothing writes the rows in between and the load asks for them
+        nowhere. For the groups that are asked the check stays all or nothing:
+        a resume granted on half of them is a wrong state that nothing reports.
 
         The answer that refused comes back with the reason because a RETRY is
         the arena asking to be asked again about a chunk it is still filling,
@@ -2979,6 +2981,10 @@ class OffloadingConnectorScheduler:
             # The tail fills the chunk the resume position sits in, so that
             # chunk is the last one the load reads a row for.
             last_chunk = cdiv(resume_token, tokens_per_chunk) - 1
+            if not self._demands_intervening_rows(
+                group_config, first_chunk, last_chunk
+            ):
+                continue
             for offset, (_, result) in enumerate(
                 self._lookup_results(
                     group_state.offload_keys[first_chunk:last_chunk],
@@ -2996,6 +3002,50 @@ class OffloadingConnectorScheduler:
                         result,
                     )
         return None
+
+    def _demands_intervening_rows(
+        self,
+        group_config: GroupOffloadConfig,
+        first_chunk: int,
+        last_chunk: int,
+    ) -> bool:
+        """Whether a resume's confirmation asks this group for the chunks between
+        ``first_chunk`` and ``last_chunk``.
+
+        A group's whole chunks are worth confirming where the band's own store
+        route writes a row for each of them, since those are the rows the arena
+        can hold under the keys the resuming request owns. Two policies leave a
+        group's rows at checkpoint positions only: an align-mode recurrent
+        group, which ``_build_store_jobs`` skips outright because its state
+        reaches the arena through the hand-off and the answer tail, and any
+        group under a sparse retention interval, which keeps the state or window
+        at a segment boundary and at the proven junctions and nothing in
+        between. A grant cannot back rows nothing writes, and the load does not
+        read them either: across a load region an align-mode group is allocated
+        null blocks but the one at the resume position, which the tail row fills
+        and ``_confirm_tail_rows`` has already confirmed.
+
+        A windowed group is its own case and stays demanded at any retention.
+        Its coverage at a position is the whole window rather than one row, so
+        the tail carries the window and the load reads every chunk row of it;
+        one tail row cannot stand in for the span. That case is out of reach
+        today, because ``supports_partial_tail`` keeps a windowed group out of
+        the offloaded set, and a layout that opens that gate has to answer for
+        those rows with a store behind them.
+        """
+        if group_config.requires_cow_source:
+            return False
+        mask = self._reachable_store_block_mask(
+            group_config=group_config,
+            start_chunk_idx=first_chunk,
+            end_chunk_idx=last_chunk,
+            final_segment_end_chunk_idx=None,
+            reachable_boundaries=(),
+        )
+        if mask is None or all(mask):
+            return True
+        tail_rows = group_config.tail_rows
+        return tail_rows is not None and tail_rows > 1
 
     def _maybe_register_shared_prefix_junction(
         self, req_status: RequestOffloadState, num_hit_tokens: int
