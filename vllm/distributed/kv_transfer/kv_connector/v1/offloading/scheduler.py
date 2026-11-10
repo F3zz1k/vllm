@@ -1315,7 +1315,9 @@ class OffloadingConnectorScheduler:
             return
         pool = self._gpu_block_pool
         chain = self._restore_chain(
-            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k)
+            by_group,
+            have=lambda k: k in self._pool_has or self._gpu_has(k),
+            tail_resume=self._finished_tail_resume(req_status),
         )
         pins = []  # (key, block): a lookup-only alias block may carry no hash
         for key in chain:
@@ -1368,7 +1370,10 @@ class OffloadingConnectorScheduler:
             return
         extras: set = set()
         chain = self._restore_chain(
-            by_group, have=lambda k: k in self._pool_has or self._gpu_has(k), extras=extras
+            by_group,
+            have=lambda k: k in self._pool_has or self._gpu_has(k),
+            extras=extras,
+            tail_resume=self._finished_tail_resume(req_status),
         )
         # The tails this request stored, wherever they were tagged: a step-path
         # tail was named after the attention key of its own step, and merge_tag
@@ -1613,6 +1618,7 @@ class OffloadingConnectorScheduler:
         limit: int | None = None,
         have: Callable[[OffloadKey], bool] | None = None,
         extras: set | None = None,
+        tail_resume: int | None = None,
     ) -> list[OffloadKey]:
         """The keys a restore of this conversation reads, root first.
 
@@ -1623,7 +1629,13 @@ class OffloadingConnectorScheduler:
         window ending at d and the state keys at d. Empty when no boundary
         has its state stored. ``have`` also accepts a boundary whose state keys
         it reports present (on the GPU or in the pool): the GPU keeps the state
-        of every cached boundary, so the band can copy it from there."""
+        of every cached boundary, so the band can copy it from there.
+
+        ``tail_resume`` is the position a tail of this conversation resumes at.
+        A tail makes a position above d resumable, and the trim that stops the
+        chain at d would otherwise leave the rows between it and the tail's own
+        chunk with no store route at all, so the chain carries them too (see
+        _intervening_row_keys)."""
         configs = self.config.kv_group_configs
         if not self._state_group_ids:
             if limit is not None:
@@ -1695,6 +1707,9 @@ class OffloadingConnectorScheduler:
             for first, end, idx in per_group
             if first <= i < end
         ]
+        if tail_resume is not None:
+            reach = tail_resume if limit is None else min(tail_resume, limit)
+            chain += self._intervening_row_keys(by_group, depth, reach)
         if WRITE_BACK_KEEP_POINTS > 0:
             seen = set(chain)
             kept = 0
@@ -1717,6 +1732,49 @@ class OffloadingConnectorScheduler:
                 if kept >= WRITE_BACK_KEEP_POINTS:
                     break
         return chain
+
+    def _intervening_row_keys(
+        self, by_group: list[list[OffloadKey]], boundary: int, resume_token: int
+    ) -> list[OffloadKey]:
+        """What a resume at ``resume_token`` reads between ``boundary`` and the
+        chunk the tail fills: the span ``_confirm_intervening_rows`` asks the
+        arena for, as the keys the conversation owns.
+
+        A tail row is the state at a position, not the KV below it, so a resume
+        above the chain's boundary reads the whole chunks between as ordinary
+        rows. The band offers what its chain holds, so a span the chain stops
+        short of is a span no store route was ever asked to write, and the fence
+        can only be told about rows the arena was offered. Carried here are the
+        groups whose store route writes a row for every chunk, and no others: a
+        group whose rows sit at checkpoint positions is left to the tail row
+        that covers its span, exactly as the confirmation leaves it."""
+        keys: list[OffloadKey] = []
+        for idx, config in enumerate(self.config.kv_group_configs):
+            tokens_per_chunk = config.tokens_per_chunk
+            first = boundary // tokens_per_chunk
+            # The tail fills the chunk the resume sits in, so that chunk is the
+            # last one a load reads a row for.
+            last = cdiv(resume_token, tokens_per_chunk) - 1
+            if self._demands_intervening_rows(config, first, last):
+                keys.extend(by_group[idx][first:last])
+        return keys
+
+    def _finished_tail_resume(self, req_status: "RequestOffloadState") -> int | None:
+        """Where a tail of this finishing turn resumes, or None when it has none.
+
+        The core registers a finished turn's tail one token before its last, so
+        the position is the turn's own length. The queue is what the connector
+        has before its store runs and the rows it recorded is what it has after,
+        the offer having been drained; either way a tail is the only thing that
+        makes a position above the chain's boundary resumable, so it is the
+        only reason to carry the rows up to it."""
+        if not self.config.enable_partial_tail_offload:
+            return None
+        if not self.answer_tail_store.has_offer_for(req_status.req.request_id):
+            keyed = {k for gs in req_status.group_states for k in gs.offload_keys}
+            if not any(owned in keyed for owned in self._tail_run.values()):
+                return None
+        return req_status.req.num_tokens - 1
 
     def _point_keys(self, by_group: list[list[OffloadKey]], boundary: int) -> list[OffloadKey]:
         """What a restore at ``boundary`` reads besides the attention prefix a
