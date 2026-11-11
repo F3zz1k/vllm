@@ -963,3 +963,47 @@ def test_mixed_traffic_keeps_every_invariant():
         assert all(e.refs == (1 if e.pinned else 0) for e in cls.index.values())
     assert big.counters["chunks_stored"] and small.counters["chunks_stored"]
     assert arena.counters["cross_class_runs_evicted"]
+
+
+def _whole(arena, c, keys, tag):
+    res = arena.prepare_store(c, keys, tag, whole=True)
+    assert res is not None
+    arena.complete_store(c, res[0], True)
+    return res
+
+
+def test_a_whole_store_splits_off_the_rows_it_stopped_offering_in_place():
+    clock = Clock()
+    arena, cls, a, _ = single(rows=6, clock=clock)
+    _whole(arena, a, [key(1), key(2), key(3)], b"X")
+    clock.t += 1
+    store(arena, a, [key(9)], b"O")
+    clock.t += 1
+    _whole(arena, a, [key(1), key(2), key(4)], b"X")
+    snap = next(r for r in arena.order if r.aging)
+    assert list(snap.keys) == [key(3)] and list(cls.runs[b"X"].keys) == [key(1), key(2), key(4)]
+    assert list(arena.order) == [snap, cls.runs[b"O"], cls.runs[b"X"]]
+    # The stale row ages from where the conversation was, ahead of newer runs.
+    res = arena.prepare_store(a, [key(5), key(6)], b"Z")
+    assert res is not None and res[2] == [key(3)]
+    check(arena)
+
+
+def test_a_touch_refreshes_only_the_newest_run_holding_the_key():
+    clock = Clock()
+    arena, cls, a, _ = single(rows=6, clock=clock)
+    store(arena, a, [key(1), key(2)], b"A")
+    clock.t += 1
+    store(arena, a, [key(1), key(3)], b"B")
+    clock.t += 1
+    store(arena, a, [key(5)], b"C")
+    arena.touch(a, [key(1)])
+    assert [r.tag for r in arena.order] == [b"A", b"C", b"B"]
+
+
+def test_no_split_when_the_rest_could_not_restore_alone():
+    arena, cls, a = hybrid()
+    _whole(arena, a, [key(1, ATT), key(1, ST1), key(1, ST2)], b"X")
+    _whole(arena, a, [key(2, ATT)], b"X")
+    assert not any(r.aging for r in arena.order) and len(cls.runs[b"X"].keys) == 4
+    assert cls.counters["split_skipped_unrestorable"] == 1

@@ -101,6 +101,8 @@ ADMIT_WALK_RUNS = 20000
 EVICTED_MAX = 1 << 18
 # Tag prefix of the run an unpinned chunk in no conversation gets.
 _ORPHAN = b"orphan:"
+# Rows a conversation's run stopped offering, split off to age by their own recency.
+_SNAPSHOT = b"snapshot:"
 MANIFEST = "manifest.json"
 # 2: one file per superpage, the manifest naming each file's keys.
 _MANIFEST_VERSION = 2
@@ -225,7 +227,8 @@ class Entry:
 class Run:
     """One run's chunks, evicted as a unit."""
 
-    __slots__ = ("cls", "tag", "keys", "_groups", "complete", "stored_at", "demoted_by", "tail_sp")
+    __slots__ = ("cls", "tag", "keys", "_groups", "complete", "stored_at", "demoted_by", "tail_sp",
+                 "aging")
 
     def __init__(self, cls: "LayoutClass", tag: bytes, now: float) -> None:
         self.cls = cls
@@ -240,6 +243,9 @@ class Run:
         # there first, so a run's rows share superpages and evicting it frees
         # them (rows of many runs interleaved, and an eviction freed none).
         self.tail_sp: int | None = None
+        # Stale rows split off a conversation's run (Arena.split_stale): they age
+        # in place by recency and are never treated as dead.
+        self.aging = False
 
     @property
     def restorable(self) -> bool:
@@ -987,7 +993,7 @@ class Arena:
         return run
 
     def _sync(self, run: Run) -> None:
-        if run.restorable:
+        if run.restorable or run.aging:
             self.unrestorable.pop(run, None)
         else:
             self.unrestorable.setdefault(run, None)
@@ -1371,6 +1377,8 @@ class Arena:
         if run is None:
             run = self.get_run(cls, tag)
         else:
+            if whole:
+                run = self.split_stale(cls, run, offered)
             self.refresh(run)
         for key in offered:
             entry = cls.index.get(key)
@@ -1408,6 +1416,44 @@ class Arena:
         if held:
             self.hold(run, client)
         return new_keys, rows, evicted
+
+    def split_stale(self, cls: LayoutClass, run: Run, offered: list[bytes]) -> Run:
+        """A whole store of a conversation: rows its run holds that the store
+        no longer offers, and that were not stored since the run's last store,
+        are stale (older restore points, earlier answer tails, a branch that
+        moved on). They stay where the run was in the order, with its age, as
+        a snapshot run; the conversation continues in a new run that takes the
+        rest and becomes newest. Shared rows stay in every run that holds them,
+        so evicting the snapshot frees only its stale rows, and a branch that
+        is resumed re-offers its rows and takes them back. No split when the
+        rest could not restore on its own: it would be evicted first."""
+        offered_set = set(offered)
+        stale = [k for k in run.keys
+                 if k not in offered_set and cls.index[k].stored_at <= run.stored_at]
+        if not stale:
+            return run
+        stale_set = set(stale)
+        keep = [k for k in run.keys if k not in stale_set]
+        if cls.state_groups and not Run(cls, run.tag, 0.0).restorable_with(keep + offered):
+            cls.counters["split_skipped_unrestorable"] += 1
+            return run
+        tag = run.tag
+        del cls.runs[tag]
+        run.tag = _SNAPSHOT + tag + time.time_ns().to_bytes(8, "big")
+        cls.runs[run.tag] = run
+        run.aging = True
+        self.unhold(run)
+        live = self.get_run(cls, tag)
+        live.tail_sp = run.tail_sp
+        for key in keep:
+            entry = cls.index[key]
+            entry.runs.discard(run)
+            run.discard(key)
+            self.join(live, key, entry)
+        self._sync(run)
+        cls.counters["runs_split"] += 1
+        cls.counters["rows_split_stale"] += len(stale)
+        return live
 
     def merge_tag(self, client: ClientState, src: bytes, dst: bytes) -> int:
         """Move every key of run src into run dst (the conversation). An
@@ -1462,8 +1508,13 @@ class Arena:
             if entry is None:
                 continue
             entry.last_use = now
+            # Only the newest run holding the key is the conversation's live
+            # one: refreshing every run sharing a deep prefix key kept older
+            # runs and their stale rows newest for the conversation's life.
+            newest = max(entry.runs, key=lambda r: r.stored_at, default=None)
+            if newest is not None:
+                self.order.move_to_end(newest)
             for run in entry.runs:
-                self.order.move_to_end(run)
                 self.unhold(run, client)
 
     def release_client(self, client: ClientState) -> None:
@@ -1855,7 +1906,7 @@ class SpillStore:
         by_sp: dict[int, list[tuple[int, bytes]]] = {}
         for run in reversed(arena.order) if self.max_bytes > 0 else ():
             cls = run.cls
-            if not run.restorable:
+            if not run.restorable or run.aging:
                 continue
             entries = [(k, cls.index[k]) for k in run.keys if (cls, k) not in picked]
             if any(not e.ready or e.moving is not None or e.promoting for _, e in entries):
