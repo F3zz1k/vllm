@@ -195,6 +195,22 @@ class TestShouldSkipWeight:
             "model.layers.0.mlp.experts.200.gate_proj.weight_packed", self.local_ids
         )
 
+    def test_local_qweight_expert_not_skipped(self):
+        assert not should_skip_weight(
+            "model.layers.0.mlp.experts.10.down_proj.qweight", self.local_ids
+        )
+
+    def test_remote_qweight_expert_skipped(self):
+        assert should_skip_weight(
+            "model.layers.0.mlp.experts.200.down_proj.qweight", self.local_ids
+        )
+
+    def test_remote_qzeros_and_scales_not_skipped(self):
+        for suffix in ("qzeros", "scales"):
+            assert not should_skip_weight(
+                f"model.layers.0.mlp.experts.200.down_proj.{suffix}", self.local_ids
+            )
+
     def test_remote_expert_scale_not_skipped(self):
         assert not should_skip_weight(
             "model.layers.0.mlp.experts.200.gate_proj.weight_scale", self.local_ids

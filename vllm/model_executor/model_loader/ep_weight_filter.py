@@ -80,6 +80,8 @@ def should_skip_weight(
     # Only skip heavy weight tensors, never scale/metadata tensors.
     # Scale tensors are tiny and some backends need them from ALL experts
     # (e.g. FlashInfer NVFP4 computes a global max of activation scales).
-    if not weight_name.endswith((".weight", ".weight_packed")):
+    # ``.qweight`` is the packed int weight of GPTQ / AutoRound / AWQ-style
+    # checkpoints; their ``.qzeros`` / ``.scales`` stay, like other scales.
+    if not weight_name.endswith((".weight", ".weight_packed", ".qweight")):
         return False
     return eid not in local_expert_ids
