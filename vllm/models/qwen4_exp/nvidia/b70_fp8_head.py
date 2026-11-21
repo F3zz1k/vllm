@@ -23,6 +23,51 @@ class B70Fp8Head:
         return out.reshape(*shape[:-1], -1)
 
 
+class B70Int8Head:
+    """B70-IP-H1: the lm_head shard as INT8 W8A8 (one scale per vocab row, activations int8 per token), native int8
+    DPAS through B70-IP-W1's opaque op (Triton int8 at decode M, oneDNN int8_scaled_mm above). Per-row int8 is ~4x
+    more accurate than e4m3 on embedding-like rows (PLE study: 0.66 % vs 2.66 % rel-L2) and the math stays int8."""
+
+    def __init__(self, wq: torch.Tensor, scale: torch.Tensor, triton_max_m: int) -> None:
+        self.wq, self.scale, self.triton_max_m = wq, scale, triton_max_m
+
+    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        import vllm.model_executor.layers.b70_dense_int8  # noqa: F401  (registers the op)
+
+        shape = x.shape
+        out = torch.ops.vllm.b70_int8_dense_mm(
+            x.reshape(-1, shape[-1]), self.wq, self.scale, bias, self.triton_max_m
+        )
+        return out.reshape(*shape[:-1], -1)
+
+
+def b70_int8_head_of(lm_head) -> "B70Int8Head | None":
+    """INT8 copy of an lm_head shard (built chunked, BF16 moved to host first so the two never coexist in VRAM)."""
+    head8 = getattr(lm_head, "_b70_int8_head", None)
+    weight = getattr(lm_head, "weight", None)
+    if head8 is not None:
+        return head8
+    if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16 or weight.numel() == 0:
+        return None
+    rows, k = weight.shape
+    device = weight.device
+    src = weight.data.to("cpu")
+    weight.data = torch.empty((0, k), dtype=weight.dtype, device=device)
+    wq = torch.empty((rows, k), dtype=torch.int8, device=device)
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=device)
+    step = 8192
+    for i in range(0, rows, step):
+        chunk = src[i : i + step].to(device).float()
+        sc = (chunk.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
+        wq[i : i + step] = torch.round(chunk / sc).clamp(-127, 127).to(torch.int8)
+        scale[i : i + step] = sc
+        del chunk
+    del src
+    head8 = B70Int8Head(wq, scale, int(os.environ.get("B70_DENSE_INT8_TRITON_MAX_M", "64")))
+    lm_head._b70_int8_head = head8
+    return head8
+
+
 def b70_fp8_head_of(lm_head, release_bf16: bool = False) -> "B70Fp8Head | None":
     """The FP8 copy of an lm_head shard, cached on the module. release_bf16: the BF16 weight goes to host memory and
     is released on the device before the FP8 copy is built (the two never coexist in VRAM)."""
@@ -61,7 +106,8 @@ def maybe_prepare_head_fp8(lm) -> None:
     lm._b70_head_fp8_checked = True
     from vllm.platforms import current_platform
 
-    if os.environ.get("B70_HEAD_FP8", "0") != "1" or not current_platform.is_xpu():
+    want_int8 = os.environ.get("B70_HEAD_INT8", "0") == "1"
+    if (os.environ.get("B70_HEAD_FP8", "0") != "1" and not want_int8) or not current_platform.is_xpu():
         return
     if torch.xpu.is_current_stream_capturing():
         lm._b70_head_fp8_checked = False
@@ -73,6 +119,18 @@ def maybe_prepare_head_fp8(lm) -> None:
     weight = head.weight
     released = weight.numel() * weight.element_size()
     alloc0 = torch.accelerator.memory_allocated(weight.device)
+    if want_int8:
+        # B70-IP-H1: INT8 W8A8 head wins over B70_HEAD_FP8 when both are set.
+        head_i8 = b70_int8_head_of(head)
+        if head_i8 is None:
+            logger.warning("B70 head INT8: no BF16 lm_head weight; off")
+            return
+        head.quant_method = head_i8
+        alloc1 = torch.accelerator.memory_allocated(weight.device)
+        logger.info("B70-IP-H1 head INT8: target lm_head %d x %d as INT8 W8A8 (%.0f MB), BF16 shard released "
+                    "(%.0f MB); torch allocated %.2f -> %.2f GiB", head_i8.wq.shape[0], head_i8.wq.shape[1],
+                    head_i8.wq.numel() / 1e6, released / 1e6, alloc0 / 2**30, alloc1 / 2**30)
+        return
     head8 = b70_fp8_head_of(head, release_bf16=True)
     if head8 is None:
         logger.warning("B70 head FP8: no BF16 lm_head weight; off")

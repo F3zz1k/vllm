@@ -485,6 +485,7 @@ class MoERunner(MoERunnerInterface):
         states: torch.Tensor,
         trunc_size: int | None,
         output_is_reduced: bool | None = None,
+        states_owned: bool = False,
     ) -> torch.Tensor:
         """All-reduce the combined output if needed.
 
@@ -512,7 +513,15 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            if states_owned:
+                # B70-V2-AR: ``states`` is this call's fresh shared + routed sum.
+                from vllm.distributed.communication_op import (
+                    tensor_model_parallel_all_reduce_owned,
+                )
+
+                states = tensor_model_parallel_all_reduce_owned(states)
+            else:
+                states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -791,7 +800,10 @@ class MoERunner(MoERunnerInterface):
             result = fused_output
 
         result = self._maybe_reduce_final_output(
-            result, og_hidden_dim_post_xform, fused_output_is_reduced
+            result,
+            og_hidden_dim_post_xform,
+            fused_output_is_reduced,
+            states_owned=shared_output is not None,
         )
 
         return self._maybe_add_zero_expert_output(result)

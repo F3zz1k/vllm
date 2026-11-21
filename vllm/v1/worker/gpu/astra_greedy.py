@@ -115,6 +115,11 @@ def eligible(runner, batch, grammar):
         return False
     if np.any(sampler.needs_logits_processing[idx]):
         return False
+    # B70-CJK: the greedy head bypasses the logits; masked rows take the
+    # ordinary path.
+    cjk_mask = getattr(sampler, "cjk_mask", None)
+    if cjk_mask is not None and cjk_mask.any_flagged(idx):
+        return False
     if sampler.get_logprobs_dims(idx) is not None:
         return False
     lengths = np.diff(batch.cu_num_logits_np)

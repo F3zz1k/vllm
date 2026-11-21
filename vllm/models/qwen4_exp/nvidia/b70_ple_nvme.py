@@ -22,6 +22,12 @@ B70_PLE_INT8_PATH), B70_PLE_INT8_NVME_CACHE_GIB (total over ranks, default 8),
 B70_PLE_INT8_NVME_IO_THREADS, B70_PLE_INT8_NVME_READER, B70_PLE_INT8_NVME_STATS,
 B70_PLE_INT8_NVME_STATS_S, B70_PLE_INT8_NVME_BOOT_SAMPLE, PLE_TABLE_PATH (BF16
 cross-check, optional), B70_PLE_INT8_CROSSCHECK, B70_PLE_INT8_MAX_REL_ERR.
+
+B70-PLE-PRELOAD: B70_PLE_INT8_NVME_PRELOAD=1 (default 0) reads the rank's whole
+owned row range into the pinned cache at boot when the cache holds it
+(``ple_nvme.preload_cache``; B70_PLE_INT8_NVME_PRELOAD_THREADS,
+B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB); the boot sample rows are then compared
+byte for byte against the preloaded slab.
 """
 
 import json
@@ -66,6 +72,33 @@ def int8_dequantize(packed: torch.Tensor, logical_dim: int,
     return (values * scales).to(output_dtype)
 
 
+def bf16_crosscheck(read_rows, dim: int, org_vocab_size: int, path: str,
+                    label: str) -> float | None:
+    """Rel-L2 of dequantised INT8 rows vs the BF16 table (PLE_TABLE_PATH, 4096 rows).
+
+    ``read_rows(global_rows: np.ndarray) -> uint8 [n, dim + 4]``. Skipped (None)
+    without PLE_TABLE_PATH or with B70_PLE_INT8_CROSSCHECK=0; raises above
+    B70_PLE_INT8_MAX_REL_ERR (default 0.02; the 76427c71 table measures ~0.0066).
+    """
+    ref_path = os.environ.get("PLE_TABLE_PATH")
+    if not ref_path or os.environ.get("B70_PLE_INT8_CROSSCHECK", "1") != "1":
+        return None
+    ref = torch.load(ref_path, mmap=True, weights_only=True)
+    ref = ref["table"] if isinstance(ref, dict) else ref
+    g = torch.Generator().manual_seed(20260928)
+    rows = torch.randint(0, min(ref.shape[0], org_vocab_size), (4096,), generator=g)
+    picked = torch.from_numpy(np.ascontiguousarray(read_rows(rows.numpy())))
+    got = int8_dequantize(picked, dim, torch.float32)
+    want = ref.index_select(0, rows).to(torch.float32)
+    rel = float(torch.linalg.vector_norm(got - want)) / max(
+        float(torch.linalg.vector_norm(want)), 1e-30)
+    lim = float(os.environ.get("B70_PLE_INT8_MAX_REL_ERR", "0.02"))
+    logger.info("%s cross-check vs %s: rel L2 %.4f (limit %.3f)", label, ref_path, rel, lim)
+    if not rel <= lim:
+        raise ValueError(f"INT8 PLE {path} disagrees with {ref_path}: {rel:.4f} > {lim}")
+    return rel
+
+
 def safetensors_metadata(path: str) -> dict:
     with open(path, "rb") as f:
         (n,) = struct.unpack("<Q", f.read(8))
@@ -76,6 +109,9 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     """INT8 row-scale PLE rows from NVMe through a pinned row cache (B70 0013)."""
 
     host_prepared: ClassVar[bool] = True
+    # The env flag and log label of this storage mode (B70-PLE-RAM subclasses).
+    _flag: ClassVar[str] = "B70_PLE_INT8_NVME"
+    _label: ClassVar[str] = "B70 PLE NVMe"
 
     def __init__(self, num_embeddings: int, embedding_dim: int, *,
                  params_dtype: torch.dtype, padding_size: int, prefix: str,
@@ -84,22 +120,22 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
                  data_parallel_rank: int = 0, reduce_results: bool = True) -> None:
         bad = [n for n in CONFLICTING if os.environ.get(n, "0") == "1"]
         if bad:
-            raise ValueError(f"B70_PLE_INT8_NVME=1 conflicts with {bad}")
+            raise ValueError(f"{self._flag}=1 conflicts with {bad}")
         if not current_platform.is_xpu():
-            raise ValueError("B70_PLE_INT8_NVME=1 is XPU-only")
+            raise ValueError(f"{self._flag}=1 is XPU-only")
         if not isinstance(embedding_method, Qwen4ExpPLEUnquantizedEmbeddingMethod):
-            raise ValueError("B70_PLE_INT8_NVME=1 needs the unquantized (BF16) PLE method "
+            raise ValueError(f"{self._flag}=1 needs the unquantized (BF16) PLE method "
                              f"in the checkpoint, got {type(embedding_method).__name__}")
         config = get_current_vllm_config()
         if config.parallel_config.data_parallel_size != 1:
-            raise ValueError("B70_PLE_INT8_NVME=1 requires DP=1")
+            raise ValueError(f"{self._flag}=1 requires DP=1")
         Qwen4ExpPLEEmbedding.__init__(
             self, num_embeddings, embedding_dim, params_dtype=params_dtype,
             padding_size=padding_size, prefix=prefix, embedding_method=embedding_method,
             num_ngram_heads=num_ngram_heads, max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank, reduce_results=reduce_results)
         if self.etp_data_parallel_size != 1:
-            raise ValueError("B70_PLE_INT8_NVME=1 requires ETP = TP (no DP span)")
+            raise ValueError(f"{self._flag}=1 requires ETP = TP (no DP span)")
         self._stream_mod = torch.xpu
         self._out_dtype = params_dtype
         self._capacity = int(max_total_tokens)
@@ -111,7 +147,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._stage = torch.zeros(self._capacity, self._heads, self._storage,
                                   dtype=torch.uint8, device="cpu", pin_memory=True)
         if not self._stage.is_pinned():
-            raise RuntimeError("B70 PLE NVMe stage failed to pin")
+            raise RuntimeError(f"{self._label} stage failed to pin")
         self._stage_np = self._stage.numpy()
         self._server = None
         self._slab_np = None
@@ -141,7 +177,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
 
         from .ple_nvme import (PleNvmeRowStore, PleNvmeServer, PleNvmeStats,
                                PleRowCache, cache_rows_per_rank, owned_heads,
-                               safetensors_tensor_location)
+                               preload_cache, safetensors_tensor_location)
 
         if self._server is not None:
             raise RuntimeError("B70 PLE NVMe rejects reload")
@@ -160,27 +196,14 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             reader=os.environ.get("B70_PLE_INT8_NVME_READER", "py"))
         tp_start = self.shard_indices.org_vocab_start_index
         tp_end = self.shard_indices.org_vocab_end_index
-        ref_path = os.environ.get("PLE_TABLE_PATH")
-        if ref_path and os.environ.get("B70_PLE_INT8_CROSSCHECK", "1") == "1":
-            ref = torch.load(ref_path, mmap=True, weights_only=True)
-            ref = ref["table"] if isinstance(ref, dict) else ref
-            g = torch.Generator().manual_seed(20260928)
-            rows = torch.randint(0, min(ref.shape[0], self.org_vocab_size), (4096,), generator=g)
-            picked = torch.from_numpy(store.read_rows(rows.numpy()))
-            got = int8_dequantize(picked, dim, torch.float32)
-            want = ref.index_select(0, rows).to(torch.float32)
-            rel = float(torch.linalg.vector_norm(got - want)) / max(
-                float(torch.linalg.vector_norm(want)), 1e-30)
-            lim = float(os.environ.get("B70_PLE_INT8_MAX_REL_ERR", "0.02"))
-            logger.info("B70 PLE NVMe cross-check vs %s: rel L2 %.4f (limit %.3f)", ref_path, rel, lim)
-            if not rel <= lim:
-                raise ValueError(f"INT8 PLE {path} disagrees with {ref_path}: {rel:.4f} > {lim}")
-            del ref
+        bf16_crosscheck(store.read_rows, dim, self.org_vocab_size, path, self._label)
         sample = int(os.environ.get("B70_PLE_INT8_NVME_BOOT_SAMPLE", "65536"))
+        own = own_bytes = None
         if sample > 0 and tp_end > tp_start:
             g = torch.Generator().manual_seed(20260929 + tp_start)
             own = torch.unique(torch.randint(tp_start, tp_end, (sample,), generator=g)).numpy()
-            sc = torch.from_numpy(store.read_rows(own))[:, dim:].contiguous().view(torch.float32)
+            own_bytes = store.read_rows(own)
+            sc = torch.from_numpy(own_bytes)[:, dim:].contiguous().view(torch.float32)
             if not bool(torch.isfinite(sc).all()) or bool((sc < 0).any()):
                 raise ValueError(f"INT8 PLE {path}: non-finite or negative row scale")
         sizes = owner.ngram_heads_vocab_sizes.detach().cpu().numpy()
@@ -197,6 +220,18 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._slab_np = slab.numpy()
         cache = PleRowCache(tp_end - tp_start, capacity, self._storage, slab=self._slab_np)
         rank = get_tp_group().rank_in_group
+        preloaded = None
+        if os.environ.get("B70_PLE_INT8_NVME_PRELOAD", "0") == "1":
+            preloaded = preload_cache(
+                cache, store, tp_start, rank=rank,
+                threads=int(os.environ.get("B70_PLE_INT8_NVME_PRELOAD_THREADS", "4")),
+                chunk_bytes=int(float(os.environ.get(
+                    "B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB", "64")) * (1 << 20)))
+            # The O_DIRECT row reads of the boot sample vs the bulk preload.
+            if (preloaded is not None and own is not None
+                    and not np.array_equal(self._slab_np[own - tp_start], own_bytes)):
+                raise ValueError(f"INT8 PLE {path}: preloaded rows differ from row reads "
+                                 f"(rank {rank}, {own.shape[0]} sampled rows)")
         stats = PleNvmeStats(rank, float(os.environ.get("B70_PLE_INT8_NVME_STATS_S", "60")),
                              os.environ.get("B70_PLE_INT8_NVME_STATS", "0") == "1")
         self._server = PleNvmeServer(
@@ -205,18 +240,18 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             sizes=sizes, offsets=offsets, eos_token_id=owner.eos_token_id,
             heads_per_ngram=owner.heads_per_ngram, cache=cache, store=store, stats=stats)
         logger.info("B70 PLE NVMe ready (rank %d, %s): cache %d rows (%.2f GiB pinned), "
-                    "own heads %s, rows [%d, %d), stage %d tokens", rank, path, capacity,
+                    "own heads %s, rows [%d, %d), stage %d tokens%s", rank, path, capacity,
                     capacity * self._storage / 2**30, self._own_heads.tolist(), tp_start,
-                    tp_end, self._capacity)
+                    tp_end, self._capacity, ", preloaded" if preloaded is not None else "")
 
     # -- producer (host, before forward / FULL replay) ---------------------
     def _check_capacity(self, num_tokens: int) -> None:
         if not 0 <= num_tokens <= self._capacity:
-            raise ValueError(f"B70 PLE NVMe stage overflow: {num_tokens} > {self._capacity}")
+            raise ValueError(f"{self._label} stage overflow: {num_tokens} > {self._capacity}")
         if self._failed:
-            raise RuntimeError("B70 PLE NVMe stage is quarantined")
+            raise RuntimeError(f"{self._label} stage is quarantined")
         if self._stream_mod.is_current_stream_capturing():
-            raise RuntimeError("B70 PLE NVMe host preparation cannot run inside capture")
+            raise RuntimeError(f"{self._label} host preparation cannot run inside capture")
 
     def _wait_for_stage(self) -> None:
         if self._pending:
@@ -244,9 +279,9 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
                 num_tokens_padded: int, host_ids: np.ndarray | None = None) -> None:
         self._check_capacity(num_tokens_padded)
         if not 0 <= num_tokens <= num_tokens_padded:
-            raise ValueError("B70 PLE NVMe invalid actual/padded token counts")
+            raise ValueError(f"{self._label} invalid actual/padded token counts")
         if not self._lock.acquire(blocking=False):
-            raise RuntimeError("Concurrent B70 PLE NVMe stage preparation")
+            raise RuntimeError(f"Concurrent {self._label} stage preparation")
         try:
             stream = self._stream_mod.current_stream()
             thread = threading.get_ident()
@@ -257,13 +292,13 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             self._owner_stream, self._owner_thread = stream, thread
             if host_ids is not None:
                 if tuple(host_ids.shape) != (num_tokens, self._heads):
-                    raise ValueError("B70 PLE NVMe: host ids shape mismatch")
+                    raise ValueError(f"{self._label}: host ids shape mismatch")
                 self._fill_stage(host_ids, num_tokens, num_tokens_padded)
             elif ngram_ids is None:
                 self._fill_stage(None, 0, num_tokens_padded)
             else:
                 if tuple(ngram_ids.shape) != (num_tokens_padded, self._heads):
-                    raise ValueError("B70 PLE NVMe: dispatch ids shape mismatch")
+                    raise ValueError(f"{self._label}: dispatch ids shape mismatch")
                 ids = ngram_ids[:num_tokens].to("cpu", non_blocking=False).numpy()
                 self._fill_stage(ids, num_tokens, num_tokens_padded)
             if num_tokens_padded:
@@ -286,7 +321,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
     @eager_break_during_capture
     def _finalize_prefetch(self, prefetch_output, output) -> None:
         if self._failed or self._prepared_tokens != output.shape[0]:
-            raise RuntimeError("B70 PLE NVMe consumer has no matching prepared dispatch")
+            raise RuntimeError(f"{self._label} consumer has no matching prepared dispatch")
         packed = prefetch_output[: output.shape[0]]
         if self.tp_size > 1:
             packed = self.parallel_group.all_reduce(packed.view(torch.int8)).view(torch.uint8)

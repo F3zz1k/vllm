@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3_5 MTP model."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -111,10 +112,17 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         original_quant = vllm_config.quant_config
         if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
             hf_qc = getattr(model_config.hf_config, "quantization_config", None)
-            if isinstance(hf_qc, dict):
+            if os.environ.get("B70_MTP_BF16_DRAFT") == "1":
+                print(
+                    "[B70] MTP draft: forcing unquantized build "
+                    "(env B70_MTP_BF16_DRAFT=1)"
+                )
+                vllm_config.quant_config = None
+            elif isinstance(hf_qc, dict):
                 dynamic = hf_qc.get("dynamic", {})
                 if any(k.startswith("-:") and "mtp" in k for k in dynamic):
                     vllm_config.quant_config = None
+        # B70_MTP_NIGHTLY_DRAFT
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
@@ -297,6 +305,18 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
+        if os.environ.get("B70_DRAFT_LMHEAD_INT4") == "1" and not getattr(
+            self, "_b70_lmhead_int4_tp_blocked", False
+        ):
+            from vllm.model_executor.models.b70_draft_lmhead_int4 import (
+                build_draft_lmhead_int4,
+                draft_lmhead_int4_logits,
+            )
+
+            if getattr(self, "_b70_lmhead_int4", None) is None:
+                build_draft_lmhead_int4(self)
+            if getattr(self, "_b70_lmhead_int4", None) is not None:
+                return draft_lmhead_int4_logits(self, hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def is_unused_checkpoint_weight(self, name: str) -> bool:
@@ -316,7 +336,14 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        result = loader.load_weights(remap_weight_names(weights))
+        if os.environ.get("B70_DRAFT_MTP_INT4") == "1":
+            from vllm.model_executor.models.b70_draft_mtp_int4 import (
+                build_draft_mtp_int4,
+            )
+
+            build_draft_mtp_int4(self)
+        return result
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):

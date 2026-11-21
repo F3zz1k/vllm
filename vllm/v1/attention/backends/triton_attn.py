@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -18,7 +19,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.math_utils import cdiv, next_power_of_2
+from vllm.utils.math_utils import cdiv, next_power_of_2, round_up
 from vllm.utils.torch_utils import get_dtype_size, is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -47,6 +48,59 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+# B70-IP-PAD16: the one definition of the per-token-head slot half. Every
+# reader and writer of the inline layout (TRITON_ATTN, the QSA kernels and
+# fused writer, the B70-IP-D2 split views, the K4 dequant) derives its offsets
+# from this or from the cache tensor's content width, never from 2 * (D + 4).
+PTH_SCALE_BYTES = 4
+PTH_HALF_ALIGN = 16
+
+
+def pth_pad16_enabled() -> bool:
+    """B70_PTH_PAD16 (default 1): the vllm#62113 16-byte K/V halves. 0 packs
+    the halves tight again (data + scale), for an A/B of pool vs speed only."""
+    return os.environ.get("B70_PTH_PAD16", "1") != "0"
+
+
+def pth_half_bytes(
+    head_size: int,
+    dtype_size: int = 1,
+    kv_quant_mode: KVQuantMode = KVQuantMode.INT8_PER_TOKEN_HEAD,
+) -> int:
+    """Bytes of one K (or V) half of a per-token-head slot: the head's data,
+    its fp32 scale, then zero or more pad bytes. ``head_size`` is the logical
+    head size (INT4 packs two per byte)."""
+    data = (
+        head_size // 2
+        if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+        else (head_size * dtype_size)
+    )
+    align = 1
+    if kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD and pth_pad16_enabled():
+        align = PTH_HALF_ALIGN
+    return round_up(data + PTH_SCALE_BYTES, align)
+
+
+def pth_half_ok(half_bytes: int, data_bytes: int) -> bool:
+    """A cache's per-token-head half width fits a ``data_bytes`` head: room for
+    data + the fp32 scale, a 4-byte aligned scale, and no more padding than
+    either layout (tight or 16-B) produces."""
+    need = data_bytes + PTH_SCALE_BYTES
+    return (
+        need <= half_bytes < need + PTH_HALF_ALIGN
+        and half_bytes % PTH_SCALE_BYTES == 0
+        and data_bytes % PTH_SCALE_BYTES == 0
+    )
+
+
+def pth_check_half(half_bytes: int, data_bytes: int) -> None:
+    if not pth_half_ok(half_bytes, data_bytes):
+        raise ValueError(
+            f"per-token-head KV half {half_bytes} B does not fit a {data_bytes} B "
+            f"head + {PTH_SCALE_BYTES} B scale (tight or {PTH_HALF_ALIGN}-B padded)"
+        )
 
 
 # constants
@@ -237,6 +291,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
         )
+        from vllm.v1.attention.backends import b70_pth_fa as _b70_pth_fa
+
+        _b70_pth_fa.attach_host_lens(attn_metadata, common_attn_metadata)
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
             or self.softmax_segm_max.shape[0] < num_actual_tokens
@@ -283,15 +340,18 @@ class TritonAttentionBackend(AttentionBackend):
     @classmethod
     def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
         """Per-token-head modes pack inline fp32 scales after each head's
-        data, so the content is (data + one scale) per K/V side."""
+        data, so the content is (data + one scale) per K/V side. INT8/FP8
+        pad each side to 16 bytes so Triton can vectorize the K/V loads."""
         mode = spec.kv_quant_mode
         if spec.state_content_bytes is not None or not mode.is_per_token_head:
             return spec
-        hs_k, hs_v = spec.head_size, spec.head_size_v
-        if mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            hs_k, hs_v = hs_k // 2, hs_v // 2
-        scale_bytes = get_dtype_size(torch.float32)
-        content = (hs_k + hs_v) * get_dtype_size(spec.dtype) + 2 * scale_bytes
+        # B70-IP-PAD16: one definition (pth_half_bytes) for every reader;
+        # B70_PTH_PAD16=0 drops the 16-B pad (A/B only).
+        dtype_size = get_dtype_size(spec.dtype)
+        content = sum(
+            pth_half_bytes(hs, dtype_size, mode)
+            for hs in (spec.head_size, spec.head_size_v)
+        )
         return replace(spec, state_content_bytes=content)
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [
@@ -391,10 +451,10 @@ class TritonAttentionImpl(AttentionImpl):
         """Extract per-head scale views from the padded content dimension.
 
         The KV cache is packed as logical shape
-        ``(num_blocks, nkv, block_size, 2 * (hs + pad))`` where
-        ``pad = sizeof(float32) / sizeof(cache_dtype)``.  The content dim holds
+        ``(num_blocks, nkv, block_size, 2 * (hs + pad))``, ``pad`` set by
+        ``customize_spec``.  The content dim holds
         ``[K(hs) | K_scale(pad) | V(hs) | V_scale(pad)]`` per (head, slot); the
-        last ``pad`` elements of each half hold one float32 scale.  We create
+        first 4 bytes of each ``pad`` hold one float32 scale.  We create
         strided float32 views over those bytes.  ``kv_cache`` must be the
         packed logical tensor (call before any transpose), but may have HND or
         NHD physical strides.
@@ -403,13 +463,15 @@ class TritonAttentionImpl(AttentionImpl):
         """
         if self._k_scale_cache is not None:
             return
-        from vllm.utils.torch_utils import get_dtype_size
 
         num_blocks, nkv, block_size, content = kv_cache.shape
         dtype_sz = kv_cache.element_size()
-        scale_pad = get_dtype_size(torch.float32) // dtype_sz  # e.g. 4
         padded_hs = content // 2
-        hs = padded_hs - scale_pad
+        hs = self.head_size
+        if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            hs //= 2
+        # B70-IP-PAD16: the cache's half must fit this head (tight or padded).
+        pth_check_half(padded_hs * dtype_sz, hs * dtype_sz)
 
         raw = kv_cache.untyped_storage()
         base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
@@ -439,7 +501,6 @@ class TritonAttentionImpl(AttentionImpl):
             stride=(block_f32, slot_f32, head_f32),
             storage_offset=k_scale_off_f32,
         )
-        self._k_scale_cache.fill_(1.0)
 
         # V scales (second content half)
         self._v_scale_cache = torch.as_strided(
@@ -448,7 +509,6 @@ class TritonAttentionImpl(AttentionImpl):
             stride=(block_f32, slot_f32, head_f32),
             storage_offset=v_scale_off_f32,
         )
-        self._v_scale_cache.fill_(1.0)
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
@@ -530,6 +590,15 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        # B70-IP-K4: the int8 prefill scratch is sized to max_model_len; the
+        # config is current here (model construction), not at forward.
+        self._b70_max_model_len = None
+        if self._is_per_token_head_quant and current_platform.is_xpu():
+            from vllm.config import get_current_vllm_config_or_none
+
+            _cfg = get_current_vllm_config_or_none()
+            if _cfg is not None and _cfg.model_config is not None:
+                self._b70_max_model_len = _cfg.model_config.max_model_len
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel XPU).  The dead branch
@@ -620,6 +689,22 @@ class TritonAttentionImpl(AttentionImpl):
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
             q_descale = k_descale = v_descale = None
+            # B70-IP-K4: prefill over int8 per-token-head KV through the XPU
+            # FA kernel (dequant-to-bf16 scratch); decode stays below.
+            if current_platform.is_xpu():
+                from vllm.v1.attention.backends import b70_pth_fa
+
+                b70_pth_fa.ensure_scratch(self, kv_cache, query.dtype)
+                if b70_pth_fa.maybe_fa_prefill(
+                    self,
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    num_actual_tokens,
+                ):
+                    return output
         # FP8 per-tensor / auto path (original flow).
         else:
             kv_cache = kv_cache.transpose(1, 2)

@@ -208,6 +208,11 @@ def process_weights_after_loading(
     if model_config.quantization == "torchao":
         set_torchao_reload_attrs(model, model_config)
 
+    # B70-IP-W1: one summary line when B70_DENSE_INT8=1.
+    from vllm.model_executor.layers.b70_dense_int8 import report as _b70_int8_report
+
+    _b70_int8_report()
+
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):

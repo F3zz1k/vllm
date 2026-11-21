@@ -31,6 +31,8 @@ from ..common.ops.ple import ple_ngram_ids
 from .b70_disk import Qwen4ExpPLEDiskBF16Embedding
 from .b70_ple_nvme import Qwen4ExpPLEInt8NVMeEmbedding
 from .b70_ple_nvme import enabled as _b70_ple_int8_nvme
+from .b70_ple_ram import Qwen4ExpPLEInt8RAMEmbedding
+from .b70_ple_ram import enabled as _b70_ple_int8_ram
 
 logger = init_logger(__name__)
 
@@ -222,7 +224,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if os.environ.get("B70_PLE_DISK_BF16") == "1":
             embedding_cls = Qwen4ExpPLEDiskBF16Embedding
-        if _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
+        # PLE is either RAM native or on SSD; both flags set raises here.
+        if _b70_ple_int8_ram():  # B70-PLE-RAM (port of 0008): INT8 rows in pinned RAM
+            embedding_cls = Qwen4ExpPLEInt8RAMEmbedding
+        elif _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
             embedding_cls = Qwen4ExpPLEInt8NVMeEmbedding
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
@@ -310,6 +315,20 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         return b70_host_ngram_ids(input_ids, query_start_loc, ngram_context, consts[0], consts[1],
                                   consts[2], int(self.eos_token_id), int(self.heads_per_ngram),
                                   int(self.ngram_size))
+
+    def device_ngram_ids(self, input_ids, query_start_loc, ngram_context) -> torch.Tensor:
+        """B70-V7-PLEG: the fused Triton n-gram hash on any Triton device (the
+        stock dispatch below takes it on CUDA only and runs ~50 eager ops on XPU)."""
+        return ple_ngram_ids(
+            input_ids=input_ids.reshape(-1),
+            query_start_loc=query_start_loc,
+            ngram_context=ngram_context,
+            layer_multipliers=self.layer_multipliers,
+            ngram_heads_vocab_sizes=self.ngram_heads_vocab_sizes,
+            ngram_heads_offsets=self.ngram_heads_offsets,
+            eos_token_id=self.eos_token_id,
+            heads_per_ngram=self.heads_per_ngram,
+        )
 
     def compute_ngram_ids(
         self,
@@ -407,6 +426,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         """Return full embeddings or a token shard after combining vocabulary owners."""
         embedding = self.ngram_embedding
         if embedding.supports_prefetch:
+            if getattr(embedding, "_devgather", None) is not None:
+                # B70-V7-PLEG: the producer runs here, on the device (in-graph).
+                embedding.device_fill(
+                    self.device_ngram_ids(input_ids, query_start_loc, ngram_context),
+                    query_start_loc,
+                )
             # Prefetch contains full tokens even when hidden states are sharded.
             embeddings = embedding.finalize_prefetch(total_tokens=input_ids.shape[0])
         else:

@@ -22,6 +22,9 @@ Kernel keys and the fields each one reads:
 ``sparse_attn2_decode`` / ``sparse_attn2_prefill`` (B70_QSA_ATTN_IMPL=attn2)
                    block_n, num_dchunk (head_dim chunks), tiles_per_prog,
                    row_chunk, num_warps, num_stages, grf_mode
+``sparse_attn2_i8_decode`` / ``sparse_attn2_i8_prefill`` (B70-IP-K8: the
+                   same fields for the attn2 int8-dot launches, B70_QSA_I8DOT=1;
+                   ``sparse_attn2_i8pv_*`` for B70_QSA_I8DOT=2)
 ``merge``          num_warps, grf_mode (also the attn2 merge)
 ``expand``         column_block, num_warps, grf_mode
 
@@ -67,6 +70,43 @@ _KNOWN = {
         "grf_mode",
     },
     "sparse_attn2_prefill": {
+        "block_n",
+        "num_dchunk",
+        "tiles_per_prog",
+        "row_chunk",
+        "num_warps",
+        "num_stages",
+        "grf_mode",
+    },
+    # B70-IP-K8: the attn2 int8-dot (B70_QSA_I8DOT) launches tune separately.
+    "sparse_attn2_i8_decode": {
+        "block_n",
+        "num_dchunk",
+        "tiles_per_prog",
+        "row_chunk",
+        "num_warps",
+        "num_stages",
+        "grf_mode",
+    },
+    "sparse_attn2_i8_prefill": {
+        "block_n",
+        "num_dchunk",
+        "tiles_per_prog",
+        "row_chunk",
+        "num_warps",
+        "num_stages",
+        "grf_mode",
+    },
+    "sparse_attn2_i8pv_decode": {
+        "block_n",
+        "num_dchunk",
+        "tiles_per_prog",
+        "row_chunk",
+        "num_warps",
+        "num_stages",
+        "grf_mode",
+    },
+    "sparse_attn2_i8pv_prefill": {
         "block_n",
         "num_dchunk",
         "tiles_per_prog",

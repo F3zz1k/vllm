@@ -73,10 +73,16 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     rejection_sampler = SimpleNamespace(enable_adaptive_verification=True)
     runner = SimpleNamespace(
         adaptive_verification=manager,
+        speculator=None,
         rejection_sampler=rejection_sampler,
+        speculative_config=SimpleNamespace(),
+    )
+    budget_warmups = []
+    manager.warmup_budget_kernel = lambda: budget_warmups.append(
+        runner.adaptive_verification
     )
 
-    def run_steps(model_runner, execute, sample):
+    def run_steps(model_runner, execute, sample, greedy=False):
         assert model_runner.adaptive_verification is None
         assert not model_runner.rejection_sampler.enable_adaptive_verification
         if fail_warmup:
@@ -91,3 +97,36 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     assert runner.adaptive_verification is manager
     assert manager.cost_tables is None
     assert rejection_sampler.enable_adaptive_verification
+    # The budget kernel is warmed once, after the manager is restored.
+    assert budget_warmups == ([] if fail_warmup else [manager])
+
+
+# B70-V6x: the greedy round (#59260) is gated by B70_SPEC_GREEDY_WARMUP
+# (default off); with it set the upstream expectations hold unchanged.
+@pytest.mark.parametrize("greedy_warmup", [False, True])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_kernel_warmup_runs_same_rounds_on_every_pp_stage(
+    monkeypatch, speculative, greedy_warmup
+):
+    """PP receivers need a matching sender for every speculative warmup round."""
+    monkeypatch.setenv("B70_SPEC_GREEDY_WARMUP", "1" if greedy_warmup else "0")
+    rounds = []
+    monkeypatch.setattr(
+        warmup,
+        "_warmup_kernels",
+        lambda runner, execute, sample, greedy=False: rounds.append(greedy),
+    )
+    for is_last_pp_rank in (False, True):
+        rounds.clear()
+        runner = SimpleNamespace(
+            adaptive_verification=None,
+            speculator=None,
+            speculative_config=SimpleNamespace() if speculative else None,
+            rejection_sampler=(
+                SimpleNamespace(enable_adaptive_verification=False)
+                if is_last_pp_rank and speculative
+                else None
+            ),
+        )
+        warmup.warmup_kernels(runner, _fail, _fail)
+        assert rounds == ([False, True] if speculative and greedy_warmup else [False])

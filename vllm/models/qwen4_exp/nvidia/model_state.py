@@ -143,6 +143,11 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 raise ValueError("Disk BF16 PLE input length differs from dispatch")
             if num_tokens_padded == 0:
                 continue
+            emb = module.ngram_embedding
+            if getattr(emb, "_devgather", None) is not None and emb._pleg_checked:
+                # B70-V7-PLEG: the forward hashes and gathers on the device.
+                emb.prepare_device(num_tokens_padded)
+                continue
             if _B70_HOST_IDS and hasattr(module, "compute_ngram_ids_host"):
                 # B70-V32-03: one small D2H of the tokens + context, ids hashed on the host: the
                 # step's only host sync no longer waits behind ~50 eager hash kernels.
@@ -162,6 +167,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 )
                 _b70p.mark("ple-prep")
                 module.ngram_embedding.prepare(None, num_tokens, num_tokens_padded, host_ids=ids)
+                if getattr(emb, "_devgather", None) is not None and num_tokens > 0:
+                    # B70-V7-PLEG: first real step, the host path is the reference.
+                    emb._wait_for_stage()
+                    emb.check_device_gather(
+                        module.device_ngram_ids(
+                            input_batch.input_ids, query_start_loc, model_inputs["ngram_context"]),
+                        query_start_loc, num_tokens_padded)
                 continue
             # Existing GPU IDs use the authoritative committed context above.
             # This producer runs before FULL replay as well as ordinary forward.
@@ -175,6 +187,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 input_batch.num_tokens,
                 num_tokens_padded,
             )
+            if getattr(emb, "_devgather", None) is not None and input_batch.num_tokens > 0:
+                emb._wait_for_stage()
+                emb.check_device_gather(
+                    module.device_ngram_ids(
+                        input_batch.input_ids, query_start_loc, model_inputs["ngram_context"]),
+                    query_start_loc, num_tokens_padded)
         return model_inputs
 
     def prepare_dummy_inputs(

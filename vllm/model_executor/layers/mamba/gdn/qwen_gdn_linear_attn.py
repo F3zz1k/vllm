@@ -24,6 +24,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers import b70_i8_producer as b70_pq
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -476,6 +477,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         super().__init__(config, vllm_config, prefix)
 
         self._deterministic_prefill_gates = config.model_type == "qwen4_exp_text"
+        # B70-TC: opaque in_proj_ba op under torch.compile (B70_TORCH_COMPILE=1, XPU only).
+        self._b70_tc_name = None
+        if os.environ.get("B70_TORCH_COMPILE", "0") == "1" and current_platform.is_xpu():
+            from vllm.models.qwen4_exp.nvidia import b70_compile_ops
+
+            self._b70_tc_name = prefix
+            b70_compile_ops.register(prefix, self)
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -940,6 +948,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         The RMSNormGated + quant sequence is eligible for fusion
         by the compilation pass when fuse_norm_quant is enabled.
         """
+        if (
+            b70_pq.site_on("gdn_out")
+            and core_attn_out.dim() == 3
+            and core_attn_out.dtype == torch.bfloat16
+            and self.norm.norm_before_gate
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and self.norm.activation in ("silu", "swish", "sigmoid")
+            and core_attn_out.shape[-1] == self.norm.weight.numel()
+            and b70_pq.consumer_is_w1(self.out_proj)
+            and b70_pq.emits("gdn_out", core_attn_out.shape[0])
+        ):
+            # B70-K2: gated RMSNorm writes out_proj's int8 rows in the same kernel.
+            y, xq, xs = b70_pq.gated_rmsnorm_quant(
+                core_attn_out, z, self.norm.weight, self.norm.eps, self.norm.activation
+            )
+            output, _ = self.out_proj(b70_pq.attach(y, xq, xs, "gdn_out"))
+            return output
         core_attn_out = self.norm(core_attn_out, z)
         output, _ = self.out_proj(core_attn_out.flatten(-2))
         return output
@@ -1072,21 +1098,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        if (
-            self._deterministic_prefill_gates
-            and hidden_states.shape[0] > 8
-            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
-            and self.in_proj_ba.weight.dtype == torch.bfloat16
-            and self.in_proj_ba.bias is None
-        ):
-            # oneDNN's 85-row gate GEMM changes results for identical inputs.
-            # Fixed K order makes cached and fresh prefill reproducible.
-            from vllm.models.qwen4_exp.nvidia.b70_hc_gemm import ordered_hc_gemm
-
-            weight = self.in_proj_ba.weight
-            projected_states_ba = ordered_hc_gemm(hidden_states, weight, weight.shape[0])
+        if getattr(self, "_b70_tc_name", None) is not None and torch.compiler.is_compiling():
+            # B70-TC: keep the row-count gate dispatch out of the traced graph.
+            projected_states_ba = torch.ops.vllm.b70_gdn_in_proj_ba(
+                hidden_states, self.in_proj_ba.weight.shape[0], self._b70_tc_name
+            )
         else:
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = self._b70_in_proj_ba_eager(hidden_states)
 
         # ============================================================
         # Part 2: Core Attention
@@ -1110,6 +1128,23 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 3: Output Projection
         # ============================================================
         return self._output_projection(core_attn_out, z)
+
+    def _b70_in_proj_ba_eager(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (
+            self._deterministic_prefill_gates
+            and hidden_states.shape[0] > 8
+            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
+            and self.in_proj_ba.weight.dtype == torch.bfloat16
+            and self.in_proj_ba.bias is None
+        ):
+            # oneDNN's 85-row gate GEMM changes results for identical inputs.
+            # Fixed K order makes cached and fresh prefill reproducible.
+            from vllm.models.qwen4_exp.nvidia.b70_hc_gemm import ordered_hc_gemm
+
+            weight = self.in_proj_ba.weight
+            return ordered_hc_gemm(hidden_states, weight, weight.shape[0])
+        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_ba
 
     def forward_cpu(
         self,

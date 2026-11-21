@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# B70_ASYM_GPTQ
 
 
 import torch
@@ -79,10 +80,15 @@ class XPUwNa16LinearKernel(MPLinearKernel):
             )
 
         if self.config.zero_points:
-            # (FIXME): maybe zero points should also be transposed.
-            getattr(layer, self.w_zp_name).data = (
-                getattr(layer, self.w_zp_name).data.t().contiguous()
-            )
+            if getattr(layer, "_b70_gptq_asym_zp", False):
+                # B70_ASYM_GPTQ: asymmetric AutoGPTQ qzeros are already
+                # [K/G, N/8] packed along N; only that loader sets the flag.
+                pass
+            else:
+                # (FIXME): maybe zero points should also be transposed.
+                getattr(layer, self.w_zp_name).data = (
+                    getattr(layer, self.w_zp_name).data.t().contiguous()
+                )
         else:
             weight_zero_point = torch.Tensor([8]).to(torch.int8).to("xpu")
             setattr(

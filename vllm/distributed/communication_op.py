@@ -14,6 +14,11 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_all_reduce_owned(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce a tensor the caller owns (B70-V2-AR: in place if B70_AR_INPLACE=1)."""
+    return get_tp_group().all_reduce_owned(input_)
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:

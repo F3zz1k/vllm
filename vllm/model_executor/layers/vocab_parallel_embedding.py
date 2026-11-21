@@ -15,8 +15,8 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
+from vllm.distributed.communication_op import tensor_model_parallel_all_reduce_owned
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.determinism.batch_invariant import (
     linear_batch_invariant,
@@ -556,10 +556,11 @@ class VocabParallelEmbedding(PluggableLayer):
         if not self.use_fused_embedding:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         if self.reduce_results:
+            # B70-V2-AR: output_parallel is this call's fresh lookup (masked in place).
             output_parallel = (
-                self.parallel_group.all_reduce(output_parallel)
+                self.parallel_group.all_reduce_owned(output_parallel)
                 if self.parallel_group is not None
-                else tensor_model_parallel_all_reduce(output_parallel)
+                else tensor_model_parallel_all_reduce_owned(output_parallel)
             )
         return output_parallel.view(output_dtype)
 

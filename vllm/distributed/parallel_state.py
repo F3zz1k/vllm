@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import deque, namedtuple
@@ -193,6 +194,12 @@ def suspend_device_comms() -> None:
 def resume_device_comms() -> None:
     """Restore suspended device communicators (collective)."""
     _apply_to_device_comms(lambda comm: comm.resume())
+
+
+# B70-V2-AR: in-place all-reduce at owned call sites
+# (GroupCoordinator.all_reduce_owned). Default off.
+_B70_AR_INPLACE = os.environ.get("B70_AR_INPLACE", "0") == "1"
+_B70_AR_INPLACE_LOGGED = False
 
 
 def all_reduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
@@ -743,6 +750,29 @@ class GroupCoordinator:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
             return self._all_reduce_out_place(input_)
+
+    def all_reduce_owned(self, input_: torch.Tensor) -> torch.Tensor:
+        """B70-V2-AR (B70_AR_INPLACE=1): all-reduce a caller-owned tensor in place.
+
+        Owned = a fresh GEMM/add/embedding output that nothing else references or
+        reads again; saves the clone. Flag off, compile tracing, or a communicator
+        without the in-place path run ``all_reduce`` unchanged."""
+        if (
+            self.world_size == 1
+            or not _B70_AR_INPLACE
+            or torch.compiler.is_compiling()
+            or self.device_communicator is None
+            or not hasattr(self.device_communicator, "all_reduce_inplace")
+        ):
+            return self.all_reduce(input_)
+        global _B70_AR_INPLACE_LOGGED
+        if not _B70_AR_INPLACE_LOGGED:
+            _B70_AR_INPLACE_LOGGED = True
+            logger.info(
+                "B70-V2-AR: in-place all-reduce on caller-owned outputs "
+                "(B70_AR_INPLACE=1)"
+            )
+        return self.device_communicator.all_reduce_inplace(input_)
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:

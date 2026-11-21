@@ -370,6 +370,30 @@ class InputProcessor:
         else:
             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
 
+    def _b70_cjk_resolve(
+        self, sampling_params: SamplingParams, prompt_token_ids
+    ) -> None:
+        """B70-CJK: resolve the per-request Han-mask flag once, at admission.
+        Chat requests arrive resolved (system/user turns only); everything else
+        is decided here from the prompt tokens."""
+        from vllm.v1.sample import b70_cjk
+
+        if not b70_cjk.enabled():
+            return
+        extra = dict(sampling_params.extra_args or {})
+        explicit = extra.get(b70_cjk.XARG)
+        try:
+            if explicit is not None:
+                flag = b70_cjk.resolve(explicit, False)
+            else:
+                flag = not b70_cjk.prompt_has_han_tokens(
+                    self.tokenizer, prompt_token_ids
+                )
+        except ValueError as e:
+            raise VLLMValidationError(str(e), parameter=b70_cjk.XARG) from e
+        extra[b70_cjk.XARG] = flag
+        sampling_params.extra_args = extra
+
     def process_inputs(
         self,
         request_id: str,
@@ -492,6 +516,7 @@ class InputProcessor:
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
+            self._b70_cjk_resolve(sampling_params, prompt_token_ids)
             if sampling_params.trace_decode_token_ids:
                 self._normalize_trace_replay_params(sampling_params, prompt_len)
         else:

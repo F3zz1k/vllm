@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# B70_ASYM_GPTQ
 
 from copy import deepcopy
 from typing import Any
@@ -98,6 +99,7 @@ class AutoGPTQConfig(QuantizationConfig):
     # (num_bits, is_sym) -> quant_type
     TYPE_MAP = {
         (4, True): scalar_types.uint4b8,
+        (4, False): scalar_types.uint4,
         (8, True): scalar_types.uint8b128,
     }
 
@@ -314,10 +316,13 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         self.quant_type = self.quant_config.quant_type
 
         # Verify supported on platform.
-        verify_marlin_supported(
-            quant_type=self.quant_config.quant_type,
-            group_size=self.quant_config.group_size,
-        )
+        # B70_ASYM_GPTQ: asymmetric (sym=false) checkpoints skip the Marlin
+        # check; the mixed-precision kernel chooser validates them instead.
+        if self.quant_config.is_sym:
+            verify_marlin_supported(
+                quant_type=self.quant_config.quant_type,
+                group_size=self.quant_config.group_size,
+            )
 
     def create_weights(
         self,
@@ -343,7 +348,7 @@ class AutoGPTQLinearMethod(LinearMethodBase):
             weight_type=self.quant_config.quant_type,
             act_type=params_dtype if input_dtype is None else input_dtype,
             group_size=self.quant_config.group_size,
-            zero_points=False,
+            zero_points=not self.quant_config.is_sym,
         )
 
         kernel_type = choose_mp_linear_kernel(mp_linear_kernel_config)
@@ -436,6 +441,13 @@ class AutoGPTQLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from vllm.platforms import current_platform
+
+        if not self.quant_config.is_sym and current_platform.is_xpu():
+            # B70_ASYM_GPTQ: GPTQ v1 stores z-1 per nibble; the XPU kernel
+            # takes raw z, and its qzeros are already [K/G, N/8] (no transpose).
+            layer.qzeros.data += 0x11111111
+            layer._b70_gptq_asym_zp = True
         self.kernel.process_weights_after_loading(layer)
 
     def apply(

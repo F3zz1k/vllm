@@ -21,7 +21,8 @@ Per TP rank, per step:
      owned by this rank, or a padding token: nothing stored, stays zero).
 
 Env contract (read in ngram_embedding.py, documented here):
-  B70_PLE_INT8_NVME=1               enable (requires B70_PLE_INT8=1)
+  B70_PLE_INT8_NVME=1               enable (v0.30: with B70_PLE_INT8=1; 0.32: exclusive
+                                    with B70_PLE_INT8=1, the RAM-native b70_ple_ram path)
   B70_PLE_INT8_NVME_PATH            table file (default B70_PLE_INT8_PATH)
   B70_PLE_INT8_NVME_CACHE_GIB       row cache, TOTAL over the TP ranks (default 8)
   B70_PLE_INT8_NVME_IO_THREADS      reader threads per rank (default 16)
@@ -61,6 +62,19 @@ Env contract (read in ngram_embedding.py, documented here):
   B70_PLE_INT8_NVME_LOOKAHEAD_TOKENS
                                     tokens predicted per step (default: the
                                     scheduler's max_num_batched_tokens)
+
+Preload (B70-PLE-PRELOAD), default off:
+  B70_PLE_INT8_NVME_PRELOAD=1       at boot, when the rank's cache holds at
+                                    least its owned rows, read the whole owned
+                                    row range (one contiguous byte range of
+                                    the table) into the pinned slab with large
+                                    sequential O_DIRECT reads and mark every
+                                    owned row resident and pinned: steps then
+                                    hit the cache with zero NVMe reads. With
+                                    less capacity: one warning, normal cache.
+  B70_PLE_INT8_NVME_PRELOAD_THREADS reads in flight per rank (default 4)
+  B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB
+                                    bytes per read, MiB (default 64)
 """
 
 from __future__ import annotations
@@ -789,6 +803,8 @@ class PleNvmeRowStore:
 # --------------------------------------------------------------------------
 
 _EPOCH_FREE = np.iinfo(np.int64).min // 2
+# Epoch of a preloaded slot: above every step, so CLOCK never picks it.
+_EPOCH_PINNED = np.iinfo(np.int64).max // 2
 
 
 def _clock_alloc_py(n, hand, ref, epoch, min_epoch, step, out):
@@ -833,6 +849,12 @@ class PleRowCache:
     ``.numpy()`` view in the engine); None = bookkeeping only (SYNC_ONLY).
     Slot ids are int64 everywhere (slot * row_bytes exceeds 2^31 once
     C > 13,094,412 rows).
+
+    Preload (``mark_all_resident``): with C >= num_rows, row r sits in slot r
+    for every own row, those slots carry ``_EPOCH_PINNED`` (CLOCK skips them
+    for good) and ``lookup`` stops touching ref/epoch. Nothing can miss then;
+    if a miss ever reached ``install`` it would take a free tail slot
+    [num_rows, C) and never displace a preloaded row.
     """
 
     def __init__(self, num_rows: int, capacity: int, row_bytes: int,
@@ -855,6 +877,7 @@ class PleRowCache:
         self.hand = 0
         self.step = 0
         self._alloc_out = np.empty(0, dtype=np.int64)
+        self.all_resident = False
 
     def meta_bytes(self) -> int:
         return (self.row2slot.nbytes + self.slot2row.nbytes + self.ref.nbytes
@@ -867,6 +890,10 @@ class PleRowCache:
     def lookup(self, local_rows: np.ndarray) -> np.ndarray:
         """int64 slots of ``local_rows`` (-1 = miss); marks the hits used."""
         slots = self.row2slot[local_rows].astype(np.int64)
+        if self.all_resident:
+            # Preloaded: every slot is pinned, so the CLOCK marks carry no
+            # information (and must not overwrite the pinned epoch).
+            return slots
         hit = slots >= 0
         if hit.any():
             used = slots[hit]
@@ -908,6 +935,152 @@ class PleRowCache:
         self.slot2row[slots] = local_rows
         self.row2slot[local_rows] = slots.astype(np.int32)
         return slots
+
+    def mark_all_resident(self) -> None:
+        """Record that slab rows [0, num_rows) hold own rows [0, num_rows).
+
+        The caller has filled ``slab[:num_rows]`` (``preload_cache``). Row r
+        maps to slot r; slots [0, num_rows) are pinned; the tail is free.
+        """
+        n = self.num_rows
+        if n > self.capacity:
+            raise ValueError(f"PLE NVMe preload: {n} own rows > capacity {self.capacity}")
+        self.row2slot[:] = np.arange(n, dtype=np.int32)
+        self.slot2row[:n] = np.arange(n, dtype=np.int64)
+        self.slot2row[n:] = -1
+        self.ref[:n] = 1
+        self.ref[n:] = 0
+        self.epoch[:n] = _EPOCH_PINNED
+        self.epoch[n:] = _EPOCH_FREE
+        self.hand = n % self.capacity
+        self.all_resident = True
+
+
+# --------------------------------------------------------------------------
+# Preload (B70-PLE-PRELOAD)
+# --------------------------------------------------------------------------
+
+
+def preload_range(path: str, byte_start: int, out: np.ndarray, *, direct: bool = True,
+                  threads: int = 4, chunk_bytes: int = 64 << 20,
+                  preadv=None) -> bool:
+    """Fill ``out`` (C-contiguous uint8) with file bytes [byte_start, +out.nbytes).
+
+    Sequential page-aligned chunks of ``chunk_bytes`` (O_DIRECT when
+    ``direct`` and the filesystem takes it, buffered otherwise) go through
+    one page-aligned anonymous-mmap bounce per worker and are copied into
+    ``out``; ``threads`` workers take the chunks round-robin, so the reads
+    in flight stay adjacent in the file. A failed or short read is retried
+    as in ``PleNvmeRowStore`` (3 retries, then raise); nothing is zero-filled.
+    Returns whether O_DIRECT was used.
+    """
+    if out.dtype != np.uint8 or not out.flags.c_contiguous:
+        raise ValueError("PLE NVMe preload: out must be C-contiguous uint8")
+    total = int(out.nbytes)
+    if total == 0:
+        return direct
+    flat = out.reshape(-1)
+    chunk = max(PAGE, int(chunk_bytes) // PAGE * PAGE)
+    begin = int(byte_start)
+    end = begin + total
+    first = begin & ~(PAGE - 1)
+    starts = list(range(first, end, chunk))
+    fd = -1
+    if direct:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except OSError:
+            direct = False
+    if fd < 0:
+        fd = os.open(path, os.O_RDONLY)
+    size = os.fstat(fd).st_size
+    if end > size:
+        os.close(fd)
+        raise ValueError(f"{path}: preload range [{begin}, {end}) is past the file ({size} B)")
+    preadv = os.preadv if preadv is None else preadv
+    workers = max(1, min(int(threads), len(starts)))
+
+    def read_chunk(view: memoryview, pos: int, need: int) -> None:
+        length = -(-need // PAGE) * PAGE  # whole pages (O_DIRECT); EOF may cut it
+        got = 0
+        last_error = ""
+        attempt = 0
+        while got < need:
+            try:
+                n = preadv(fd, [view[got:length]], pos + got)
+                if n > 0:
+                    nxt = got + n
+                    if direct and nxt < need:
+                        nxt &= ~(PAGE - 1)  # O_DIRECT resumes on a page boundary
+                    if nxt > got:
+                        got = nxt
+                        continue
+                last_error = f"short read at {pos + got} ({n} B, {got} < {need} B)"
+            except OSError as exc:
+                last_error = f"errno {exc.errno} ({exc.strerror})"
+            if attempt >= len(RETRY_BACKOFF_S):
+                raise RuntimeError(
+                    f"PLE NVMe preload read failed after {len(RETRY_BACKOFF_S)} retries: "
+                    f"file offset {pos + got}, chunk at {pos}: {last_error} ({path})")
+            time.sleep(RETRY_BACKOFF_S[attempt])
+            attempt += 1
+
+    def work(w: int) -> None:
+        # On an exception the traceback still holds the views; the mmap is then
+        # unmapped by GC instead of close().
+        bounce = mmap.mmap(-1, chunk)
+        view = memoryview(bounce)
+        src = np.frombuffer(bounce, dtype=np.uint8)
+        for pos in starts[w::workers]:
+            lo = max(begin - pos, 0)
+            hi = min(chunk, end - pos)
+            read_chunk(view, pos, hi)
+            flat[pos + lo - begin: pos + hi - begin] = src[lo:hi]
+        del src
+        view.release()
+        bounce.close()
+
+    try:
+        if workers == 1:
+            work(0)
+        else:
+            with ThreadPoolExecutor(workers, thread_name_prefix="ple-preload") as pool:
+                for future in [pool.submit(work, w) for w in range(workers)]:
+                    future.result()
+    finally:
+        os.close(fd)
+    return direct
+
+
+def preload_cache(cache: PleRowCache, store: PleNvmeRowStore, tp_start: int, *,
+                  rank: int = 0, threads: int = 4, chunk_bytes: int = 64 << 20) -> dict | None:
+    """Read the rank's own rows [tp_start, tp_start + cache.num_rows) into the
+    cache slab and mark them all resident. None (one warning) when the cache
+    is smaller than the owned row range; the cache is then left untouched."""
+    rows = cache.num_rows
+    if cache.capacity < rows:
+        logger.warning(
+            "B70 PLE NVMe preload (rank %d) skipped: cache %d rows < %d owned rows "
+            "(raise B70_PLE_INT8_NVME_CACHE_GIB); normal row cache", rank, cache.capacity, rows)
+        return None
+    if cache.slab is None:
+        raise ValueError("PLE NVMe preload needs a cache slab")
+    if tp_start < 0 or tp_start + rows > store.num_rows:
+        raise ValueError(f"PLE NVMe preload: rows [{tp_start}, {tp_start + rows}) outside "
+                         f"the table [0, {store.num_rows})")
+    dest = cache.slab[:rows]
+    t0 = time.perf_counter()
+    direct = preload_range(store.path, store.data_start + tp_start * cache.row_bytes, dest,
+                           direct=store.direct, threads=threads, chunk_bytes=chunk_bytes)
+    seconds = time.perf_counter() - t0
+    cache.mark_all_resident()
+    nbytes = rows * cache.row_bytes
+    gbps = nbytes / max(seconds, 1e-9) / 1e9
+    logger.info(
+        "B70 PLE NVMe preload (rank %d): %d rows, %.2f GiB in %.1f s (%.2f GB/s%s); "
+        "all owned rows resident", rank, rows, nbytes / 2**30, seconds, gbps,
+        "" if direct else ", buffered")
+    return {"rows": rows, "bytes": nbytes, "seconds": seconds, "gbps": gbps, "direct": direct}
 
 
 # --------------------------------------------------------------------------
@@ -1410,6 +1583,8 @@ __all__ = [
     "PleNvmeStats",
     "PleRowCache",
     "cache_rows_per_rank",
+    "preload_cache",
+    "preload_range",
     "host_ngram_ids",
     "current_chunk_keys",
     "owned_heads",

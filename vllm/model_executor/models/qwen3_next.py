@@ -18,6 +18,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_reduce_scatter,
 )
+from vllm.model_executor.layers import b70_i8_producer as b70_pq
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
@@ -464,6 +465,21 @@ class Qwen3NextAttention(nn.Module):
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
         attn_output = self.attn(q, k, v)
         if gate is not None:
+            if (
+                b70_pq.site_on("attn_o")
+                and attn_output.dim() == 2
+                and attn_output.dtype == torch.bfloat16
+                and gate.shape == attn_output.shape
+                and gate.dtype == torch.bfloat16
+                and attn_output.stride(-1) == 1
+                and gate.stride(-1) == 1
+                and b70_pq.consumer_is_w1(self.o_proj)
+                and b70_pq.emits("attn_o", attn_output.shape[0])
+            ):
+                # B70-K2: sigmoid gate, multiply and o_proj's int8 quant in one kernel.
+                y, xq, xs = b70_pq.attn_gate_quant(attn_output, gate)
+                output, _ = self.o_proj(b70_pq.attach(y, xq, xs, "attn_o"))
+                return output
             attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
         return output

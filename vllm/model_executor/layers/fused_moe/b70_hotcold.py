@@ -987,8 +987,13 @@ class HotColdPlan:
             if min_tokens and hidden_states.shape[0] >= min_tokens:
                 logger.info_once("B70 hot/cold: graph capture at %d tokens reads cold experts over "
                                  "UVA (prefetch is eager-only)", hidden_states.shape[0])
-            cold.apply(output=output, hidden_states=hidden_states,
-                       topk_weights=topk_weights, topk_ids=topk_ids)
+            from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
+
+            # B70-IP-K: W4A8 reads the cold weights over UVA only on request (B70_MOE_W4A8_UVA=1)
+            if not (_w4a8.uva_enabled()
+                    and _w4a8.maybe_apply(cold, output, hidden_states, topk_weights, topk_ids)):
+                cold.apply(output=output, hidden_states=hidden_states,
+                           topk_weights=topk_weights, topk_ids=topk_ids)
             return
         import copy
 
@@ -996,8 +1001,11 @@ class HotColdPlan:
         staged = copy.copy(cold)
         staged.w13, staged.w2 = buf["w13"].view(torch.int8), buf["w2"].view(torch.int8)
         staged.gemm1_wei_scales, staged.gemm2_wei_scales = buf["w13_scales"], buf["w2_scales"]
-        staged.apply(output=output, hidden_states=hidden_states,
-                     topk_weights=topk_weights, topk_ids=topk_ids)
+        from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
+
+        if not _w4a8.maybe_apply(staged, output, hidden_states, topk_weights, topk_ids):
+            staged.apply(output=output, hidden_states=hidden_states,
+                         topk_weights=topk_weights, topk_ids=topk_ids)
         _PREFETCH.release_and_prefetch(self)
 
     def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids) -> bool:

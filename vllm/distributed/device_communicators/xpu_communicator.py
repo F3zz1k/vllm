@@ -69,6 +69,16 @@ class XpuCommunicator(DeviceCommunicatorBase):
         dist.all_reduce(output, group=self.device_group)
         return output
 
+    def all_reduce_inplace(self, input_: torch.Tensor) -> torch.Tensor:
+        """B70-V2-AR: the same XCCL all-reduce on ``input_`` itself (no clone).
+
+        Only for a buffer the caller owns and never reads again unreduced.
+        Batch-invariant mode keeps its gather."""
+        if envs.VLLM_BATCH_INVARIANT or not input_.is_contiguous():
+            return self.all_reduce(input_)
+        dist.all_reduce(input_, group=self.device_group)
+        return input_
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
 

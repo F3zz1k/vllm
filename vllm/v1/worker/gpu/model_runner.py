@@ -477,9 +477,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.vllm_config, self.req_states, self.is_pooling_model, config_processors
         )
         if self.is_last_pp_rank and not self.is_pooling_model:
-            # V2 bypasses TopKTopPSampler, which registers native warmups.
-            # ROCm only: on CUDA these warmups add ~2 min to every engine start.
-            if current_platform.is_rocm():
+            # Speculative verification uses native top-k/top-p masking even
+            # when target-only sampling can use FlashInfer's fused sampler.
+            if current_platform.is_rocm() or (
+                current_platform.is_cuda() and self.speculative_config is not None
+            ):
                 from vllm.v1.sample.ops.topk_topp_sampler import (
                     register_top_k_top_p_warmups,
                 )
@@ -999,6 +1001,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # top_k, top_p, and logprobs, using less GPU memory than what is possible
         # during actual execution.
         assert self.sampler is not None
+        if getattr(self.sampler, "cjk_mask", None) is not None:
+            self.sampler.cjk_mask.warmup(logits)  # B70-CJK: JIT before serving
         self.sampler(logits, dummy_input_batch)
 
     @torch.inference_mode()
@@ -1655,6 +1659,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.num_acceptable_drafts,
             )
 
+        # B70-CJK: Han mask in place on the target logits, before plain
+        # sampling and before every verification row of spec decode.
+        cjk_mask = getattr(self.sampler, "cjk_mask", None)
+        if cjk_mask is not None and logits.shape[0] > 0:
+            cjk_mask.apply(
+                logits, input_batch.expanded_idx_mapping, input_batch.idx_mapping_np
+            )
+
         sampler_output: SamplerOutput | None
         if input_batch.num_reqs == 0:
             # This rank owns no requests this step. It contributes an
@@ -1673,6 +1685,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
                 invalid_drafts,
+                getattr(
+                    getattr(self.speculator, "candidate_sampler", None),
+                    "cached_candidate_ids",
+                    None,
+                ),
             )
 
         if shard_metadata is not None:

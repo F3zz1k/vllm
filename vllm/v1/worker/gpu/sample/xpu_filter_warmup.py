@@ -19,6 +19,11 @@ def warmup_filter(runner):
     p = torch.full((1,), .95, device=runner.device, dtype=torch.float32)
     for topk, topp in ((k, p), (k, None), (None, p)):
         apply_top_k_top_p_triton(logits.clone(), topk, topp)
+    from vllm.v1.worker.gpu.sample import b70_sampler_fast as b70sm
+    cs = getattr(runner.speculator, "candidate_sampler", None)
+    if b70sm.enabled() and cs is not None:
+        # B70-SM: compile the top-k-first kernels (KP 16 and 32) here, not on a request.
+        b70sm.warmup(runner.device, runner.vocab_size, cs.num_steps, cs.top_k)
     torch.xpu.synchronize()
     del logits, k, p
     init_logger(__name__).info(

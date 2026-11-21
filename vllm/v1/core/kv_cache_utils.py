@@ -1343,7 +1343,30 @@ def unify_kv_cache_spec_page_size(
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):
-                new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                # B70-IP-K3: take the largest integer multiple of the block
+                # first, then pad only the remainder. Padding the whole gap
+                # wasted ~49% of every target page when a draft model's page
+                # is 2.03x the target's (int8 per-token-head KV with inline
+                # scales next to a DFlash drafter). The integer multiple keeps
+                # block sizes commensurate exactly as the divisible branch
+                # does. B70_KV_UNIFY_MULTIPLE=0 restores plain padding.
+                ratio = max_page_size // layer_page_size
+                if ratio >= 2 and os.environ.get("B70_KV_UNIFY_MULTIPLE", "1") != "0":
+                    new_spec = replace(
+                        layer_spec,
+                        block_size=layer_spec.block_size * ratio,
+                        page_size_padded=max_page_size,
+                    )
+                    logger.info_once(
+                        "B70-IP-K3 KV page unify: block %d -> %d (x%d), pad %.2f%%",
+                        layer_spec.block_size,
+                        layer_spec.block_size * ratio,
+                        ratio,
+                        100.0 * (max_page_size - layer_page_size * ratio)
+                        / max_page_size,
+                    )
+                else:
+                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
             else:
                 raise NotImplementedError(
                     f"Layer {layer_name}: page size is not divisible by the "

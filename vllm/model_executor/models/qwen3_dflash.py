@@ -544,14 +544,113 @@ class DFlashQwen3Model(nn.Module):
         else:
             # Quantized linear weights may use packed storage that cannot be
             # consumed by F.linear. Run each projection through its quant method.
+            # B70-V7-KV8 (B70_DFLASH_KV_INT8=1) replaces this with one KV-only
+            # W8A8 GEMM once the quant methods have repacked the weights
+            # (build_int8_context_kv, called by load_dflash_model).
             self._fused_kv_weight = None
             self._fused_kv_bias = None
+        self._kv_int8: tuple | None = None
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0
         ).contiguous()
+
+    def build_int8_context_kv(self) -> bool:
+        """B70-V7-KV8 (``B70_DFLASH_KV_INT8=1``): a KV-only int8 weight for the
+        context-KV precompute of a W8A8 (compressed-tensors int8) drafter.
+
+        Without it each layer runs its full qkv GEMM over every target row and
+        drops the Q columns. Here the K and V rows of every layer's packed int8
+        weight and their per-channel scales are stacked once into one
+        ``[L * 2 * kv, K]`` weight, run through the layers' own int8 kernel:
+        one dynamic per-token activation quant and one GEMM per step. The
+        activation scale depends only on the input row and the int32 dot
+        products are column-local, so the K/V values are the ones the
+        per-layer path computes. Must run after process_weights_after_loading
+        (the kernel's [K, N] weight view). Returns whether it is active.
+        """
+        import os
+
+        if os.environ.get("B70_DFLASH_KV_INT8", "0") != "1":
+            return False
+        if getattr(self, "_fused_kv_weight", None) is not None:
+            return False  # unquantized drafter: already one fused BF16 GEMM
+        projs = getattr(self, "_context_qkv_projs", None)
+        if not projs:
+            return False
+
+        def refuse(why: str) -> bool:
+            logger.warning_once("B70-V7-KV8 drafter int8 context KV off: %s", why)
+            self._kv_int8 = None
+            return False
+
+        kernels = []
+        for proj in projs:
+            scheme = getattr(proj, "scheme", None)
+            kernel = getattr(scheme, "kernel", None)
+            names = getattr(kernel, "layer_param_names", None)
+            if kernel is None or names is None or len(names) != 5:
+                return refuse(f"{type(scheme).__name__} has no int8 scaled-mm kernel")
+            kernels.append(kernel)
+        if len({type(k) for k in kernels}) != 1:
+            return refuse("layers use different int8 kernels")
+        kernel = kernels[0]
+        w_name, ws_name, is_name, izp_name, azp_name = kernel.layer_param_names
+        weights, scales, biases = [], [], []
+        for proj, q_size in zip(projs, self._context_q_sizes, strict=True):
+            w = getattr(proj, w_name)
+            k_in = proj.input_size_per_partition
+            n_out = proj.output_size_per_partition
+            if w.dtype != torch.int8 or tuple(w.shape) != (k_in, n_out):
+                return refuse(
+                    f"weight {tuple(w.shape)} {w.dtype} is not the processed int8 "
+                    f"[K={k_in}, N={n_out}] view"
+                )
+            if getattr(proj, is_name, None) is not None:
+                return refuse("static input scales (per-layer activation quant)")
+            if getattr(proj, azp_name, None) is not None:
+                return refuse("asymmetric activations")
+            ws = getattr(proj, ws_name).reshape(-1)
+            if ws.numel() == 1:
+                ws = ws.expand(n_out)
+            if ws.numel() != n_out:
+                return refuse(f"weight scale has {ws.numel()} entries for N={n_out}")
+            weights.append(w.t()[q_size:])  # [2*kv, K] rows of the [N, K] weight
+            scales.append(ws[q_size:])
+            if proj.bias is not None:
+                biases.append(proj.bias[q_size:])
+        if biases and len(biases) != len(projs):
+            return refuse("bias on some layers only")
+        fused = torch.cat(weights, dim=0).contiguous()  # [L*2*kv, K]
+        holder = nn.Module()
+        holder.register_parameter(
+            w_name,
+            nn.Parameter(fused.t(), requires_grad=False),  # [K, N] view
+        )
+        holder.register_parameter(
+            ws_name,
+            nn.Parameter(
+                torch.cat(scales).reshape(-1, 1).contiguous(), requires_grad=False
+            ),
+        )
+        for name in (is_name, izp_name, azp_name):
+            setattr(holder, name, None)
+        holder.logical_widths = [fused.shape[0]]
+        self._kv_int8 = (kernel, holder)
+        self._kv_int8_bias = torch.cat(biases).contiguous() if biases else None
+        logger.info(
+            "B70-V7-KV8 drafter context KV: one int8 GEMM [K=%d, N=%d] over %d "
+            "layers via %s (was %d qkv GEMMs of N=%d, Q columns dropped)",
+            fused.shape[1],
+            fused.shape[0],
+            len(projs),
+            type(kernel).__name__,
+            len(projs),
+            projs[0].output_size_per_partition,
+        )
+        return True
 
     def _build_fused_kv_buffers(self) -> None:
         """Build fused weight buffers for precompute_and_store_context_kv.
@@ -615,6 +714,15 @@ class DFlashQwen3Model(nn.Module):
         if self._fused_kv_weight is not None:
             all_kv_flat = F.linear(
                 normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
+            all_kv = all_kv_flat.view(num_ctx, num_layers, 2, num_kv_heads, head_dim)
+        elif getattr(self, "_kv_int8", None) is not None:
+            # B70-V7-KV8: one activation quant + one int8 GEMM over the K/V
+            # rows of every layer (no Q columns). Same per-token activation
+            # scale and the same int32 dot products as the per-layer qkv GEMMs.
+            kernel, holder = self._kv_int8
+            all_kv_flat = kernel.apply_weights(
+                holder, normed_context_states, self._kv_int8_bias
             )
             all_kv = all_kv_flat.view(num_ctx, num_layers, 2, num_kv_heads, head_dim)
         else:

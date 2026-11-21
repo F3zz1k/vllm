@@ -294,6 +294,24 @@ class FlashAttentionBackend(AttentionBackend):
     ]
     head_size_v: int | None = None
 
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """B70-IP-D2 (B70_PTH_FA_DECODE=1, XPU): int8_per_token_head gets
+        TRITON_ATTN's bytes per block (int8 K and V plus one fp32 scale each per
+        (token, KV head)), so page sizes, the hybrid page unify and B70-IP-K3
+        see the same pages as with TRITON_ATTN. The impl arranges those bytes as
+        the INT8 decode kernel's block-local split layout (b70_pth_fa)."""
+        spec = super().customize_spec(spec)
+        if spec.kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD:
+            return spec
+        from vllm.v1.attention.backends import b70_pth_fa
+
+        if not b70_pth_fa.fa_decode_enabled():
+            return spec
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+        return TritonAttentionBackend.customize_spec(spec)
+
     @staticmethod
     def _get_sm90_fa4_fp8_kv_block_size(
         kv_cache_spec: KVCacheSpec | None = None,
@@ -433,6 +451,11 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
+        if kv_cache_dtype == "int8_per_token_head":
+            # B70-IP-D2: native INT8 paged decode in vllm-xpu-kernels (XPU).
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            return b70_pth_fa.fa_decode_enabled()
         if kv_cache_dtype not in cls.supported_kv_cache_dtypes:
             return False
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -613,7 +636,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     #  https://github.com/vllm-project/vllm/issues/22945
     _cudagraph_support = (
         AttentionCGSupport.ALWAYS
-        if get_flash_attn_version() == 3
+        if get_flash_attn_version() == 3 or current_platform.is_xpu()
         else AttentionCGSupport.UNIFORM_BATCH
     )
     supports_update_block_table: bool = True
@@ -970,6 +993,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_num_splits=max_num_splits,
             causal=causal,
         )
+        from vllm.v1.attention.backends import b70_pth_fa as _b70_pth_fa
+
+        _b70_pth_fa.attach_host_lens(attn_metadata, common_attn_metadata)
 
         # Compute mm_prefix range tensor if the batch contains
         # multimodal tokens with bidirectional ranges.  Built for every FA
@@ -1081,6 +1107,13 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        # B70-IP-K5: prefill scratch is sized to max_model_len (config is
+        # current here, not at forward).
+        self._b70_max_model_len = None
+        if current_platform.is_xpu():
+            _cfg = get_current_vllm_config_or_none()
+            if _cfg is not None and _cfg.model_config is not None:
+                self._b70_max_model_len = _cfg.model_config.max_model_len
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -1136,6 +1169,34 @@ class FlashAttentionImpl(AttentionImpl):
                 f"FlashAttention does not support {self.kv_cache_dtype}"
                 " kv-cache on this device."
             )
+
+        # B70-IP-D2: int8_per_token_head on XPU (B70_PTH_FA_DECODE=1). Subclass
+        # impls that run their own kernels (QSA) hand this constructor "auto".
+        self._b70_fa_int8 = kv_cache_dtype == "int8_per_token_head"
+        if self._b70_fa_int8:
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            if not b70_pth_fa.fa_decode_enabled():
+                raise NotImplementedError(
+                    "FLASH_ATTN serves int8_per_token_head only on XPU with "
+                    "B70_PTH_FA_DECODE=1"
+                )
+            if (
+                alibi_slopes is not None
+                or self.logits_soft_cap
+                or attn_type != AttentionType.DECODER
+                or head_size % 64 != 0
+            ):
+                raise NotImplementedError(
+                    "B70-IP-D2 int8_per_token_head FLASH_ATTN: decoder layers "
+                    "without ALiBi or soft-cap, head_size a multiple of 64 (got "
+                    f"{head_size}, attn_type {attn_type})"
+                )
+            # Split-layout views (a tuple), cleared by the runner after the
+            # profile run like TRITON_ATTN's scale views.
+            self._k_scale_cache: Any = None
+            self._v_scale_cache: Any = None
+            b70_pth_fa.log_fa_decode_once(head_size, num_kv_heads)
 
         self.sinks = sinks
         if self.sinks is not None:
@@ -1248,6 +1309,20 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
+        if getattr(self, "_b70_fa_int8", False):
+            # B70-IP-D2: native INT8 per-token-head decode; prefill via K4.
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            return b70_pth_fa.fa_int8_forward(
+                self,
+                query,
+                kv_cache,
+                attn_metadata,
+                output,
+                num_actual_tokens,
+                _maybe_symmetrize_window(self.sliding_window, attn_metadata.causal),
+            )
+
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         # Fix degenerate strides on size-1 dims (e.g. num_kv_heads=1 with TP).
@@ -1289,6 +1364,31 @@ class FlashAttentionImpl(AttentionImpl):
         )
         k_descale = layer._k_scale.expand(descale_shape)
         v_descale = layer._v_scale.expand(descale_shape)
+
+        # B70-IP-K5: on XPU the FA kernel's fp8-KV path is ~2.2x slower than
+        # its bf16 path for prefill chunks; dequantize the referenced fp8
+        # blocks into a bf16 scratch and run FA bf16 (decode and spec-verify
+        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=1 turns it on (default off).
+        if (
+            current_platform.is_xpu()
+            and is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.dcp_world_size <= 1
+            and getattr(self, "_b70_k5_ok", True)
+        ):
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            b70_pth_fa.ensure_scratch(self, kv_cache, query.dtype)
+            if b70_pth_fa.maybe_fa_prefill(
+                self,
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                attn_metadata,
+                num_actual_tokens,
+                fp8_scales=(layer._k_scale, layer._v_scale),
+            ):
+                return output
 
         if self.dcp_world_size > 1:
             self._forward_with_dcp(
@@ -1435,6 +1535,31 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        if getattr(self, "_b70_fa_int8", False):
+            # B70-IP-D2: TRITON_ATTN's per-token-head writer, through the
+            # block-local split views (no SYCL writer exists for this layout).
+            from vllm.v1.attention.backends import b70_pth_fa
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash_per_token_head_quant,
+            )
+
+            key_cache, value_cache, k_scale, v_scale = b70_pth_fa.pth_split_views(
+                self, kv_cache
+            )
+            # The Triton writer sizes its grid by key; cut the padding rows.
+            num_slots = slot_mapping.shape[0]
+            triton_reshape_and_cache_flash_per_token_head_quant(
+                key[:num_slots],
+                value[:num_slots],
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+                kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            )
             return
 
         # Scatter write into the KV cache using slot_mapping indices.

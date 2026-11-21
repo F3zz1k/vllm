@@ -7,6 +7,8 @@ from itertools import islice
 
 import torch
 from torch import nn
+
+from vllm.compilation.decorators import support_torch_compile
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 from vllm import envs
@@ -16,6 +18,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
+from vllm.model_executor.layers import b70_i8_producer as b70_pq
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -85,6 +88,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 if current_platform.is_xpu():
+    from . import b70_compile_ops
     from .b70_hyperconnection import GatedResidual, HyperConnectionConfig
 else:
     from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -236,6 +240,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.ple",
                 use_sequence_parallel=self.use_hc_sequence_parallel,
             )
+            if current_platform.is_xpu():
+                b70_compile_ops.register(f"{prefix}.ple", self.ple)
 
         if layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -316,11 +322,44 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = self.ple(
-                hidden_states,
-                input_ids,
-                query_start_loc,
-                ngram_context,
+            if (
+                current_platform.is_xpu()
+                and b70_compile_ops.ENABLED
+                and torch.compiler.is_compiling()
+            ):
+                # B70-TC: PLE is a splitting op (host-prepared rows, per-request
+                # short-conv state); it writes graph-owned storage.
+                ple_out = torch.empty_like(hidden_states)
+                torch.ops.vllm.b70_qwen4_exp_ple(
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    ple_out,
+                    self.ple.prefix,
+                )
+                hidden_states = ple_out
+            else:
+                hidden_states = self.ple(
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                )
+
+        if (
+            b70_pq.ENABLED
+            and "_b70_i8_block" not in attn_hc.__dict__
+            and not torch.compiler.is_compiling()
+        ):
+            # B70-K2: decided once, after load (W1 converts at load time): does the
+            # block input feed a W1 int8 linear the HC gate mix can quantize for?
+            if self.layer_type == "linear_attention":
+                consumer = getattr(self.linear_attn, "in_proj_qkvz", None)
+            else:
+                consumer = getattr(self.self_attn, "qkv_proj", None)
+            attn_hc._b70_i8_block = (
+                b70_pq.consumer_is_w1(consumer) and not self.use_hc_sequence_parallel
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
@@ -328,6 +367,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
             )
+            if self.__dict__.get("_b70_stash_combined", False):
+                # B70-V7-AUX: the materialized combine is the previous layer's
+                # completed state, i.e. the DFlash2 aux feature input.
+                self.__dict__["_b70_combined"] = hidden_states
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
@@ -417,6 +460,24 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+def _b70_compile_enabled(vllm_config: VllmConfig) -> bool:
+    # B70-TC: upstream #55272 removed torch.compile for this implementation;
+    # B70_TORCH_COMPILE=1 restores it on XPU through b70_compile_ops.
+    return current_platform.is_xpu() and b70_compile_ops.ENABLED
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "query_start_loc": 0,
+        "ngram_context": 0,
+        "deepstack_input_embeds": 0,
+    },
+    enable_if=_b70_compile_enabled,
+)
 class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
@@ -554,6 +615,7 @@ class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
             hidden_states = intermediate_tensors["hidden_states"]
 
         aux_hidden_states: list[torch.Tensor] = []
+        self._b70_aux_defer = None  # B70-V7-AUX
         full_num_tokens = positions.shape[-1]
         block_output = None
         injection = None
@@ -610,6 +672,8 @@ class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            if getattr(self, "_b70_aux_defer", None) is not None:
+                self.collect_deferred_feature(aux_hidden_states, layer_idx, layer)
             self.capture_completed_layer(
                 aux_hidden_states,
                 layer_idx,

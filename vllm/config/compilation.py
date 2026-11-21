@@ -773,6 +773,8 @@ class CompilationConfig:
         "vllm::short_conv",
         # Qwen4Exp's AMD backend still uses these splitting ops.
         "vllm::qwen4_exp_ple_short_conv",
+        # B70-TC: XPU Qwen4Exp PLE layer under B70_TORCH_COMPILE=1.
+        "vllm::b70_qwen4_exp_ple",
         "vllm::qwen4_exp_qsa_with_output",
         # The fused prepare calls this op instead of the one above.
         "vllm::qwen4_exp_qsa_prepare_with_output",

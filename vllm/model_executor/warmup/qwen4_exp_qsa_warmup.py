@@ -81,6 +81,7 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
         block_table_for(owner.layer_name),
         num_query_heads=owner.num_heads,
         selection_width=indexer.output_width,
+        head_dim=owner.head_dim,
     )
     logger.info(
         "Warmed up Qwen4Exp QSA sparse attention kernels: %s.",
