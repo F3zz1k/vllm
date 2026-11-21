@@ -16,7 +16,9 @@ A layer is converted at load time into one storage format, chosen with
   nvfp4  the checkpoint bytes kept as they are (torch reference only for now);
          the MXFP8 layers are stored in bf16 (exact)
 
-`w13` is stored `(E, 2I, H)` as `[gate; up]`, `w2` `(E, H, I)`.
+bf16 / fp8 are stored in XpuFusedMoe's layout: `w13` `(E, H, 2I)` with the
+gate columns first, `w2` `(E, I, H)` (K-major); nvfp4 keeps the checkpoint
+row layout `w13` `(E, 2I, H/2)` (de-interleaved to [gate; up]).
 """
 
 from __future__ import annotations
@@ -132,12 +134,27 @@ class ExpertStore:
                         / parts[f"{name}_weight_outer_scale_denominator"].float())
                 return
         for name in ("w13", "w2"):
-            full = self.decode(parts, name)
-            if self.fmt == "bf16":
-                self.t[name] = full.to(torch.bfloat16)
-            else:
-                self.t[name], self.t[f"{name}_scale"] = quant_fp8_per_expert(full)
-            del full
+            w = parts[f"{name}_weight"]
+            e, rows = w.shape[:2]
+            cols = w.shape[2] * (2 if nvfp4_src else 1)
+            dt = torch.bfloat16 if self.fmt == "bf16" else torch.float8_e4m3fn
+            out = torch.empty((e, cols, rows), dtype=dt, device=device)  # (E, K, N)
+            scale = torch.empty(e, dtype=torch.float32, device=device)
+            for a in range(0, e, 16):
+                b = min(e, a + 16)
+                sub = {k: (v[a:b] if v.dim() > 1 or k.endswith("amax") else v)
+                       for k, v in parts.items() if k.startswith(name + "_")}
+                full = self.decode(sub, name)  # (n, rows, cols) fp32
+                if self.fmt == "bf16":
+                    out[a:b] = full.transpose(1, 2).to(torch.bfloat16)
+                else:
+                    q, sc = quant_fp8_per_expert(full)
+                    out[a:b] = q.transpose(1, 2)
+                    scale[a:b] = sc
+                del full
+            self.t[name] = out
+            if self.fmt == "fp8":
+                self.t[f"{name}_scale"] = scale
 
     # -------------------------------------------------------------- reference
 
@@ -146,9 +163,10 @@ class ExpertStore:
         out = []
         for name in ("w13", "w2"):
             if self.fmt == "bf16":
-                out.append(self.t[name][e])
+                out.append(self.t[name][e].t())
             elif self.fmt == "fp8":
-                out.append((self.t[name][e].float() * self.t[f"{name}_scale"][e]).to(torch.bfloat16))
+                out.append((self.t[name][e].t().float() * self.t[f"{name}_scale"][e]).to(
+                    torch.bfloat16))
             else:
                 w = dequant_nvfp4(self.t[f"{name}_packed"][e:e + 1], self.t[f"{name}_bscale"][e:e + 1],
                                   self.t[f"{name}_factor"][e:e + 1], torch.bfloat16)

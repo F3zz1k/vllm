@@ -138,22 +138,23 @@ class Inkling2Attention(nn.Module):
         rel_logits = torch.matmul(r, self.rel_proj)  # (T, H, E), bf16 as reference
 
         # k / v: short conv (static or dynamic) over the conv cache, then
-        # L2 clip (k) or unweighted RMS norm (v).
+        # L2 clip (k) or unweighted RMS norm (v), stored into the KV cache.
+        kw = dict(kv_owner=kv_owner, kv_md=attn_md)
         if self.is_local:
-            k = ops.short_conv(conv_owner, conv_md, "k", k_lin, positions, self.k_conv)
-            v = ops.short_conv(conv_owner, conv_md, "v", v_lin, positions, self.v_conv)
+            ops.conv(conv_owner, conv_md, "k", k_lin, positions, self.k_conv, norm=1,
+                     clip=self.qk_clip, **kw)
+            ops.conv(conv_owner, conv_md, "v", v_lin, positions, self.v_conv, norm=2,
+                     eps=self.eps, **kw)
         else:
-            k = ops.dynamic_conv(conv_owner, conv_md, "k", k_lin, positions, self.k_static,
-                                 yk[:, self.k_size:], Hk)
-            v = ops.dynamic_conv(conv_owner, conv_md, "v", v_lin, positions, self.v_static,
-                                 yv[:, self.v_size:], Hk)
-        k = ops.k_norm(k.view(T, Hk, D), self.qk_clip)
-        v = ops.v_norm(v.view(T, Hk, D), self.eps)
+            ops.conv(conv_owner, conv_md, "k", k_lin, positions, self.k_static,
+                     dyn=yk[:, self.k_size:], norm=1, clip=self.qk_clip, **kw)
+            ops.conv(conv_owner, conv_md, "v", v_lin, positions, self.v_static,
+                     dyn=yv[:, self.v_size:], norm=2, eps=self.eps, **kw)
 
         if attn_md is None:
             out = torch.zeros(T, H, D, dtype=torch.bfloat16, device=xq.device)
         else:
-            out = ops.attention(kv_owner, attn_md, q, k, v, rel_logits, sink, self.scale,
+            out = ops.attention(kv_owner, attn_md, q, rel_logits, sink, self.scale,
                                 self.window, self.rel_extent)
         out = (out.float().view(T, -1) * torch.sigmoid(gate_lin.float())).to(torch.bfloat16)
         return F.linear(out, self.wo)
@@ -247,7 +248,7 @@ class Inkling2DecoderLayer(nn.Module):
                           for i, m in enumerate(mixes))
 
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx)
-        a = ops.short_conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv).float()
+        a = ops.conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv).float()
         if self.boundary:
             mlp_blocks, residual = blocks + [h], a
         else:
@@ -256,7 +257,7 @@ class Inkling2DecoderLayer(nn.Module):
         if messages is not None:
             m = self.blend(3, m, messages[3])
         m = self.mlp(ops.rms_norm(m, self.mlp_norm, self.eps))
-        m = ops.short_conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv)
+        m = ops.conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv)
         return (residual + m.float()).to(torch.bfloat16)
 
 
