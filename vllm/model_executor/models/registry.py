@@ -475,6 +475,18 @@ _MULTIMODAL_MODELS = {
         "vllm.models.kimi_k3",
         "KimiK3ForConditionalGeneration",
     ),
+    "Inkling2LoopForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2LoopForConditionalGeneration",
+    ),
+    "Inkling2ForConditionalGeneration": (
+        "vllm.models.inkling2",
+        "Inkling2ForConditionalGeneration",
+    ),
+    "KimiK31ForConditionalGeneration": (
+        "vllm.models.kimi_k3",
+        "KimiK3ForConditionalGeneration",
+    ),
     "MoonshotKimiaForCausalLM": ("kimi_audio", "KimiAudioForConditionalGeneration"),
     "MossTranscribeDiarizeForConditionalGeneration": (
         "moss_transcribe_diarize",
@@ -653,6 +665,7 @@ _SPECULATIVE_DECODING_MODELS = {
         "vllm.models.kimi_k3.nvidia.dspark_mla",
         "K3DSparkForCausalLM",
     ),
+    "Inkling2DSparkModel": ("vllm.models.inkling2", "Inkling2DSparkModel"),
     "DFlashLagunaForCausalLM": ("laguna_dflash", "DFlashLagunaForCausalLM"),
     "Gemma4DSparkModel": ("gemma4_dspark", "Gemma4DSparkForCausalLM"),
     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
