@@ -76,6 +76,10 @@ docker run "${COMMON[@]}" -e ZE_AFFINITY_MASK=0,1,2,3 --entrypoint vllm vllm-xpu
 
 TP shards the attention heads; experts use EP = TP (each card holds 128 / TP experts). XPU graphs are on by default.
 
+DSpark speculative decoding with the checkpoint's bundled drafter: add
+`--speculative-config '{"method":"dspark","num_speculative_tokens":7}'` (on one card use
+`--max-num-batched-tokens 4096 --gpu-memory-utilization 0.92` to leave room for the draft).
+
 ## Format settings
 
 | variable | values (default first) | effect |
@@ -83,7 +87,7 @@ TP shards the attention heads; experts use EP = TP (each card holds 128 / TP exp
 | `VLLM_INKLING2_EXPERTS` | `fp8`, `nvfp4`, `bf16` | routed experts of layers 0-19. `nvfp4` (recommended) runs the checkpoint's NVFP4 bytes directly in `_inkling2_C` (exact, fastest); `fp8` is a per-expert FP8 conversion (~1.4% weight error); `bf16` is exact but does not fit one card |
 | `VLLM_INKLING2_MXFP8` | `fp8`, `bf16` | experts of layers 20-23 (MXFP8 in the checkpoint) |
 | `VLLM_INKLING2_DENSE` | `bf16`, `int8` | attention projections; `int8` is per-row W8A8 (faster decode, top-1 -0.1 to -0.2 pt) |
-| `VLLM_INKLING2_HEAD` | `bf16`, `int8` | output layer, same scheme |
+| `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme; `fp32` is the config's head dtype (top-1 within noise of `bf16`, ~7 ms/token slower on one card) |
 | `VLLM_INKLING2_PREFILL_EXPERTS` | `nvfp4`, `fp8`, `bf16` | experimental: a second expert copy used only for batches of 64+ tokens. `fp8` at TP=2: prefill +4-6%, KV memory per card 13.75 -> 4.06 GiB; not recommended there. `bf16` untested |
 
 `--max-num-batched-tokens`: 8,192 at TP=1 (16,384 does not fit beside the weights on one card), 16,384 at TP=2/4.
@@ -96,7 +100,19 @@ TP shards the attention heads; experts use EP = TP (each card holds 128 / TP exp
 | 2 | 63 t/s | 896 t/s | 6.2k t/s | 0.996 |
 | 4 | 77 t/s | 1,198 t/s | 8.0k t/s | 0.995 |
 
-BF16 dense: 48 / 59 / 75 t/s decode at TP=1/2/4, top-1 0.996-0.998. Top-1 is the agreement of the prompt-token argmax
+BF16 dense: 48 / 59 / 75 t/s decode at TP=1/2/4, top-1 0.996-0.998.
+
+DSpark (TP=1, int8 dense + head, greedy, 256 tokens, the six prompts of the decode benchmark in
+[mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu)):
+
+| workload | no speculation | DSpark k=7 | acceptance length |
+|---|--:|--:|--:|
+| task prompts, reasoning on | 64.4 t/s | 107.7 t/s | 3.23 |
+| task prompts, reasoning off | 64.5 t/s | 81.4 t/s | 2.67 |
+| short chat turns, reasoning off | 64.6 t/s | 63.8 t/s | 1.82 |
+
+Speculation is a net loss only on short chat with reasoning off (as that project found); the
+config is per server, so a deployment that serves mostly short chat can leave it off. Top-1 is the agreement of the prompt-token argmax
 with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tokens).
 
 ## Known limits
@@ -104,6 +120,15 @@ with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tok
 - KV pages must be 64 tokens (vLLM's XPU default): the SYCL attention kernels are built for that page size; other
   sizes fall back to a slower Triton path.
 - Prefix caching works (the short-conv inputs are a per-sequence recurrent state, cached in vLLM's align mode).
-- Not done yet: DSpark speculative decoding (no speculative decoding at all; the conv-state builder refuses it),
-  vision (not ported, text only), FP8 / INT8 KV cache, CPU KV offload (not validated), TP above 4, other GPUs.
+- Not done yet: vision (not ported, text only), FP8 / INT8 KV cache, CPU KV offload (not validated), TP above
+  4, DSpark at TP > 1 (not tested), other GPUs.
 - Decode has ~2 ms per token of small-kernel overhead still being fused.
+
+## Credits
+
+- Model code, DSpark draft and speculator: the upstream vLLM Inkling 2 implementation (NVIDIA), ported here.
+- [mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu), an independent single-B70 port,
+  used as a reference and benchmark (no code taken): its decode benchmark prompts, and its finding that DSpark
+  does not pay on short chat with reasoning off. At the shapes here, its Triton expert path measured 183 / 1,970 /
+  24,475 us per call at 1 / 16 / 4,096 tokens against 122 / 670 / 9,521 us for the grouped GEMM in this branch,
+  and its decode attention 83 / 436 us (local @1k / global @32k) against 46 / 272 us.
