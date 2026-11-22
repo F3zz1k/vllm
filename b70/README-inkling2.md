@@ -1,6 +1,6 @@
 # Inkling 2 Mini on Intel Arc Pro B70 (vLLM, XPU)
 
-Text-only serving of [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on Intel Arc Pro B70
+Text and image serving of [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on Intel Arc Pro B70
 (Xe2) with vLLM: model code in `vllm/models/inkling2/xpu/`, kernels in `b70/inkling2-kernels/`, image kit in
 `b70/image/`. Work in progress; see "Not done yet".
 
@@ -127,8 +127,14 @@ with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tok
   blocks are not stored); a 32k restore takes 0.6 s against 15 s of prefill.
 - TP=2 with KV offload to CPU and DSpark faulted the GPU at 32 concurrent long requests (out-of-bounds access,
   under investigation); `--max-num-seqs 16` is stable. TP=1 and TP=4 pass the same load.
-- Not done yet: vision (not ported, text only), FP8 / INT8 KV cache, TP above 4, other GPUs.
-- Decode has ~2 ms per token of small-kernel overhead still being fused.
+- Images: the vision encoder runs replicated on every rank (torch ops, XPU varlen attention); text-only
+  servers can pass `--limit-mm-per-prompt '{"image":0}'` to skip its memory profile.
+- TP=8 is not blocked (24 query / 8 KV heads and 128 experts divide; each rank then holds 3 query heads,
+  1 KV head and 16 experts) but is untested: this rig has six cards.
+- Decode is GPU-bound under XPU graphs: the device is busy for the whole step, and the per-kernel floor
+  measures 0.7-2.4 us, so further fusion of the ~4 ms of small kernels per token is worth at most a few
+  percent; the expert and int8 dense GEMMs (~9.6 ms per token at TP=1) run at ~60% of memory bandwidth.
+- Not done yet: FP8 / INT8 KV cache, other GPUs.
 
 ## Credits
 
