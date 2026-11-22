@@ -225,6 +225,16 @@ class Inkling2DecoderLayer(nn.Module):
         return ops.message_blend(dest, message, self.ctrl_down[i], self.ctrl_gain[i],
                                  self.ctrl_forget[i])
 
+    def blend_streams(self, s: slice, dests: torch.Tensor, messages: torch.Tensor):
+        """The controllers of streams `s` at once (batched GEMMs): fp32 `(S, T, D)`
+        dests and messages -> fp32 `(S, T, D)`; same math as `blend` per stream."""
+        rms = ops.ref.unweighted_rms
+        cat = torch.cat([rms(dests), rms(messages)], -1).to(self.ctrl_down.dtype)
+        h = torch.bmm(cat, self.ctrl_down[s].transpose(1, 2)).float()
+        gf = torch.bmm(h, self.ctrl_gf[s].transpose(1, 2))
+        D = dests.shape[-1]
+        return (1 - torch.tanh(gf[..., D:])) * dests + torch.tanh(gf[..., :D]) * messages
+
     def forward(self, positions, h, stack, n: int, attn_query, mlp_query, messages, tau,
                 pass_idx: int):
         """One visit. `h` is the layer input (bf16); `stack[:n]` the completed
@@ -238,11 +248,11 @@ class Inkling2DecoderLayer(nn.Module):
             xs = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps)
             xq, xk, xv = (xs[0], xs[0], xs[0]) if self.is_local else xs.unbind(0)
         else:
-            mixes = ops.attn_res(stack, n, h, None, attn_query)  # fp32
-            src = [mixes[0]] * 3 if self.is_local else list(mixes.unbind(0))
-            norms = [self.attn_norm[0 if self.is_local else i] for i in range(3)]
-            xq, xk, xv = (ops.rms_norm(self.blend(i, src[i], messages[i]), norms[i], self.eps)
-                          for i in range(3))
+            mixes = ops.attn_res(stack, n, h, None, attn_query)  # fp32 (1 or 3, T, D)
+            dests = mixes.expand(3, -1, -1) if self.is_local else mixes
+            blended = self.blend_streams(slice(0, 3), dests, messages[:3])
+            w = self.attn_norm.expand(3, -1) if self.is_local else self.attn_norm
+            xq, xk, xv = ops.rms_norm(blended, w[:, None, :], self.eps).unbind(0)
 
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx)
         a = ops.conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv)
@@ -257,7 +267,8 @@ class Inkling2DecoderLayer(nn.Module):
                              self.eps)[0]
         else:
             m = ops.attn_res(stack, n, last, addend, mlp_query)[0]
-            m = ops.rms_norm(self.blend(3, m, messages[3]), self.mlp_norm, self.eps)
+            m = self.blend_streams(slice(3, 4), m[None], messages[3:])[0]
+            m = ops.rms_norm(m, self.mlp_norm, self.eps)
         m = self.mlp(m)
         m = ops.conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv)
         return ops.add3(last, addend, m), n
@@ -298,6 +309,11 @@ class Inkling2LoopModel(nn.Module):
         self.max_blocks = mx
 
     def finish_loading(self) -> None:
+        for layer in self.layers:
+            if layer.is_core:  # [gain; forget] stacked for one batched GEMM per stream set
+                layer.register_buffer("ctrl_gf", torch.cat([layer.ctrl_gain.data,
+                                                            layer.ctrl_forget.data], 1),
+                                      persistent=False)
         with torch.no_grad():
             for p in [*self.attn_queries, *self.mlp_queries, self.output_query]:
                 p.mul_(self.scale)
