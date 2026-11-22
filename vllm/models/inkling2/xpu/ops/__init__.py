@@ -103,6 +103,17 @@ def conv(owner, md, stream: str, x: torch.Tensor, positions: torch.Tensor,
     return y
 
 
+def rel_logits(r: torch.Tensor, proj: torch.Tensor, attn) -> torch.Tensor:
+    """(T, H, E) relative logits r @ proj (bf16, as the reference). The Triton
+    kernel takes them reversed along E (from a flipped copy of proj, free)."""
+    if BACKEND == "triton":
+        rev = getattr(attn, "_rel_proj_rev", None)
+        if rev is None or rev.data_ptr() == 0 or rev.shape != proj.shape:
+            rev = attn._rel_proj_rev = proj.flip(-1).contiguous()
+        return torch.matmul(r, rev)
+    return torch.matmul(r, proj)
+
+
 def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
               rel_extent: int) -> torch.Tensor:
     """Attention over the visit's KV cache (K/V already stored by `conv`)."""
@@ -111,10 +122,10 @@ def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
         from .triton_attention import rel_attention
 
         decode = md.max_query_len <= 8
-        splits = (8 if window is None else 2) if decode else 1
+        splits = (16 if window is None else 8) if decode else 1
         return rel_attention(q, owner.kv_cache, rel_logits, sinks, md.block_table, md.seq_lens,
                              md.query_start_loc, scale, window, rel_extent, n_req,
-                             out=torch.zeros_like(q), num_splits=splits)
+                             out=torch.zeros_like(q), num_splits=splits, rel_reversed=True)
     n = md.num_actual_tokens
     out = torch.zeros_like(q)
     out[:n] = ref.rel_attention(q[:n], rel_logits[:n], sinks[:n], owner.kv_cache,

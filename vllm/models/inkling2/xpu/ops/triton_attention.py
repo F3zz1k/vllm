@@ -58,7 +58,8 @@ def _rel_attn_kernel(
     s_q_t, s_q_h, s_kv_b, s_kv_h, s_kv_n, s_rel_t, s_rel_h, s_sink_t, s_bt, s_o_t, s_o_h,
     s_po_s, s_po_t, s_po_h, s_pl_s, s_pl_t, s_pl_h,
     G: tl.constexpr, D: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
-    PAGE: tl.constexpr, SPLIT: tl.constexpr, DOT32: tl.constexpr,
+    PAGE: tl.constexpr, SPLIT: tl.constexpr, DOT32: tl.constexpr, REV: tl.constexpr,
+    BLOCKPTR: tl.constexpr,
 ):
     TOKENS: tl.constexpr = BLOCK_M // G
     prog = tl.program_id(0)
@@ -106,17 +107,29 @@ def _rel_attn_kernel(
     for kb in range(start, hi, BLOCK_N * SPLIT):
         key = kb + n_off
         key_ok = key < hi
-        blk = tl.load(BlockTable + req * s_bt + key // PAGE, mask=key_ok, other=0).to(tl.int64)
-        base = blk * s_kv_b + kvh * s_kv_h + (key % PAGE) * s_kv_n
-        k = tl.load(KV + base[:, None] + d[None, :], mask=key_ok[:, None], other=0.0)
-        v = tl.load(KV + base[:, None] + D + d[None, :], mask=key_ok[:, None], other=0.0)
+        if BLOCKPTR:  # one page per step: 2D block loads (BLOCK_N == PAGE, aligned)
+            blk = tl.load(BlockTable + req * s_bt + kb // PAGE).to(tl.int64)
+            kp = tl.make_block_ptr(KV + blk * s_kv_b + kvh * s_kv_h, shape=(PAGE, 2 * D),
+                                   strides=(s_kv_n, 1), offsets=(0, 0), block_shape=(BLOCK_N, D),
+                                   order=(1, 0))
+            k = tl.load(kp)
+            v = tl.load(tl.advance(kp, (0, D)))
+        else:
+            blk = tl.load(BlockTable + req * s_bt + key // PAGE, mask=key_ok, other=0).to(tl.int64)
+            base = blk * s_kv_b + kvh * s_kv_h + (key % PAGE) * s_kv_n
+            k = tl.load(KV + base[:, None] + d[None, :], mask=key_ok[:, None], other=0.0)
+            v = tl.load(KV + base[:, None] + D + d[None, :], mask=key_ok[:, None], other=0.0)
         if DOT32:
             s = tl.dot(q.to(tl.float32), tl.trans(k.to(tl.float32)))
         else:
             s = tl.dot(q, tl.trans(k.to(q.dtype)))
         dist = pos[:, None] - key[None, :]
         in_rel = (dist >= 0) & (dist < rel_extent) & row_ok[:, None]
-        bias = tl.load(Rel + t[:, None] * s_rel_t + head[:, None] * s_rel_h + dist,
+        if REV:  # rel stored reversed: column E-1-d, forward-contiguous along keys
+            roff = rel_extent - 1 - dist
+        else:
+            roff = dist
+        bias = tl.load(Rel + t[:, None] * s_rel_t + head[:, None] * s_rel_h + roff,
                        mask=in_rel, other=0.0).to(tl.float32)
         s = s * qk_scale + bias * LOG2E
         ok = (dist >= 0) & key_ok[None, :]
@@ -164,12 +177,24 @@ def _combine_kernel(PartO, PartL, Out, s_po_s, s_po_t, s_po_h, s_pl_s, s_pl_t, s
     tl.store(Out + t * s_o_t + h * s_o_h + d, (num / den).to(Out.dtype.element_ty))
 
 
+def _launch_opts() -> dict:
+    o = {}
+    if os.environ.get("INKLING2_ATTN_WARPS"):
+        o["num_warps"] = int(os.environ["INKLING2_ATTN_WARPS"])
+    if os.environ.get("INKLING2_ATTN_GRF"):
+        o["grf_mode"] = os.environ["INKLING2_ATTN_GRF"]
+    return o
+
+
 def rel_attention(q: torch.Tensor, kv: torch.Tensor, rel: torch.Tensor, sinks: torch.Tensor,
                   block_table: torch.Tensor, seq_lens: torch.Tensor, cu_q: torch.Tensor,
                   scale: float, window: int | None, rel_extent: int, num_reqs: int,
                   out: torch.Tensor | None = None, num_splits: int = 1,
-                  block_m: int | None = None, block_n: int = 64) -> torch.Tensor:
-    """q (T, Hq, D) bf16; kv [B, Hk, page, 2D]; rel (T, Hq, E); sinks (T, Hq) (row
+                  block_m: int | None = None, block_n: int = 64,
+                  rel_reversed: bool = False) -> torch.Tensor:
+    """q (T, Hq, D) bf16; kv [B, Hk, page, 2D]; rel (T, Hq, E) (column d = bias at
+    distance d, or with `rel_reversed` column E-1-d: the kernel then reads it
+    forward-contiguous along keys, which the B70 needs); sinks (T, Hq) (row
     stride free); returns (T, Hq, D) bf16. Rows of padded tokens beyond
     `cu_q[num_reqs]` are left untouched."""
     T, Hq, D = q.shape
@@ -196,7 +221,9 @@ def rel_attention(q: torch.Tensor, kv: torch.Tensor, rel: torch.Tensor, sinks: t
         q.stride(0), q.stride(1), kv.stride(0), kv.stride(1), kv.stride(2),
         rel.stride(0), rel.stride(1), sinks.stride(0), block_table.stride(0),
         out.stride(0), out.stride(1), *pstr,
-        G=G, D=D, BLOCK_M=block_m, BLOCK_N=block_n, PAGE=page, SPLIT=num_splits, DOT32=INTERP,
+        G=G, D=D, BLOCK_M=block_m, BLOCK_N=block_n, PAGE=page, SPLIT=num_splits, DOT32=INTERP, REV=rel_reversed,
+        BLOCKPTR=(os.environ.get("INKLING2_ATTN_BLOCKPTR") == "1" and block_n == page
+                  and not INTERP), **_launch_opts(),
     )
     if num_splits > 1:
         # every token row; padded rows (beyond the real tokens) get garbage

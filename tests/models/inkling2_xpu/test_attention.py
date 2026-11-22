@@ -33,16 +33,18 @@ def _case(qlens, ctxs, window, E, Hq=6, Hk=2, D=32, page=16, seed=0):
     return q, kv, rel, sinks, bt, sl, cu
 
 
+@pytest.mark.parametrize("rev", [False, True])
 @pytest.mark.parametrize("window", [None, 24])
 @pytest.mark.parametrize("splits", [1, 4])
 @pytest.mark.parametrize("qlens,ctxs", [([37], [0]), ([1, 1, 1], [5, 70, 0]),
                                         ([9, 1, 20], [40, 3, 17])])
-def test_rel_attention(window, splits, qlens, ctxs):
+def test_rel_attention(rev, window, splits, qlens, ctxs):
     E = 32
     q, kv, rel, sinks, bt, sl, cu = _case(qlens, ctxs, window, E)
     want = ref.rel_attention(q, rel, sinks, kv, bt, sl, cu, 32 ** -0.5, window, E)
-    args = [x.to(DEV) for x in (q, kv, rel, sinks, bt, sl, cu)]
+    rel_in = rel.flip(-1).contiguous() if rev else rel
+    args = [x.to(DEV) for x in (q, kv, rel_in, sinks, bt, sl, cu)]
     got = rel_attention(*args, 32 ** -0.5, window, E, len(qlens), num_splits=splits,
-                        block_n=16).cpu()
+                        block_n=16, rel_reversed=rev).cpu()
     err = (got.float() - want.float()).abs().max().item()
     assert err < 2e-2, err

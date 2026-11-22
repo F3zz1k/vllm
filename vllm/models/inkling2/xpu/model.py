@@ -135,7 +135,7 @@ class Inkling2Attention(nn.Module):
         # q / r: learned scale, L2 clip (+ log scaling on global layers).
         q = ops.qr_norm(q_lin.view(T, H, D), self.q_scale, self.qk_clip, tau)
         r = ops.qr_norm(r_lin.view(T, H, R), self.r_scale, self.rel_clip, tau)
-        rel_logits = torch.matmul(r, self.rel_proj)  # (T, H, E), bf16 as reference
+        rel_logits = ops.rel_logits(r, self.rel_proj, self)  # (T, H, E), bf16 as reference
 
         # k / v: short conv (static or dynamic) over the conv cache, then
         # L2 clip (k) or unweighted RMS norm (v), stored into the KV cache.
