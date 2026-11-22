@@ -44,7 +44,7 @@ from vllm.sequence import IntermediateTensors
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
 from . import ops
 from .cache import Inkling2ConvState, Inkling2KVCache, layer_metadata
-from .experts import ExpertStore, expert_format
+from .experts import ExpertStore, expert_format, prefill_expert_format
 from .ops.ref import ConvLayout
 
 logger = init_logger(__name__)
@@ -201,8 +201,10 @@ class Inkling2MoE(nn.Module):
         self.gate_weight = _param(self.total_experts, config.hidden_size, dtype=torch.float32)
         self.gate_bias = _param(self.total_experts, dtype=torch.float32)
         self.store = ExpertStore(expert_format())
+        self.prefill_store = None  # optional fp8 / bf16 copy for prefill (NVFP4 layers)
         self._parts: dict[str, torch.Tensor] = {}
         self._kernel = None
+        self._prefill_kernel = None
 
     def load_part(self, name: str, tensor: torch.Tensor) -> None:
         """Collect a layer's checkpoint expert tensors; convert once complete
@@ -218,6 +220,12 @@ class Inkling2MoE(nn.Module):
         if len(self._parts) < need:
             return
         self.store.build(self._parts, self.gate_weight.device)
+        pf = prefill_expert_format()
+        if self.store.fmt == "nvfp4" and pf != "nvfp4":
+            self.prefill_store = ExpertStore(pf)
+            self.prefill_store.build(self._parts, self.gate_weight.device)
+            for k, v in self.prefill_store.t.items():
+                self.register_buffer(f"pe_{k}", v, persistent=False)
         self._parts = {}
         for k, v in self.store.t.items():
             self.register_buffer(f"e_{k}", v, persistent=False)

@@ -1,0 +1,17 @@
+# Dev toolchain for Inkling2 SYCL kernels: the env image plus the same oneAPI DPC++ 2026.1.1 the
+# env's kernels were built with, and sycl-tla at the revision they pin (87f6850 + kit 0001).
+ARG ENV_IMAGE=vllm-xpu-b70env:0.1.16.2-w4a8
+FROM ${ENV_IMAGE}
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+RUN apt-get update -y && apt-get install -y --no-install-recommends gpg wget git && \
+    wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor > /usr/share/keyrings/oneapi.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" > /etc/apt/sources.list.d/oneapi.list && \
+    apt-get update -y && apt-get install -y --no-install-recommends \
+      intel-oneapi-compiler-dpcpp-cpp-2026.1=2026.1.1-325 intel-oneapi-dpcpp-cpp-2026.1=2026.1.1-325 && \
+    rm -rf /var/lib/apt/lists/* && \
+    uv pip install "cmake>=3.26" ninja && \
+    . /opt/intel/oneapi/setvars.sh --force >/dev/null && icpx --version | grep 'Compiler 2026.1.1 '
+COPY tla-0001.patch /tmp/tla-0001.patch
+RUN S=87f6850680a580654b9ea2c80dbc01aeb36ad231 && git init -q /src/tla && cd /src/tla && \
+    git fetch -q --depth 1 https://github.com/intel/sycl-tla.git $S && git checkout -q FETCH_HEAD && \
+    git -c user.name=b70 -c user.email=b70@localhost am -q /tmp/tla-0001.patch

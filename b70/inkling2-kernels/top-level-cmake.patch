@@ -1,0 +1,7 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -81,2 +81,4 @@
+ option(B70_W4A8_STANDALONE
+        "Build the standalone _b70_w4a8_C module (W4A8 grouped GEMM only)" OFF)
++option(INKLING2_ATTN_ENABLED
++       "Build the standalone _inkling2_C module (Inkling2 relative-bias attention)" OFF)

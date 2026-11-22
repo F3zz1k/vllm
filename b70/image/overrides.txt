@@ -1,0 +1,18 @@
+# Pins the kit holds (PROVENANCE.md sections 8-9) against what requirements/xpu.txt and torch 2.14.0+xpu ask for:
+# vllm_xpu_kernels 0.1.16.2 (xpu.txt names 0.1.15.4), oneCCL 2022.1.2 core and devel (torch names 2022.1.1), and the
+# oneAPI 2026.1.1 runtime wheels, the version of the compiler the builder uses (torch names 2026.1.0; the onemkl wheels
+# stay at torch's 2026.1.0, as in the kit). Used by the base stage and again by the vllm stage, so installing an engine
+# tree never moves the environment.
+torch==2.14.0+xpu
+vllm-xpu-kernels==0.1.16.2
+oneccl==2022.1.2
+oneccl-devel==2022.1.2
+auto-round-lib==0.16.0
+transformers==5.17.0
+intel-sycl-rt==2026.1.1
+dpcpp-cpp-rt==2026.1.1
+intel-opencl-rt==2026.1.1
+intel-cmplr-lib-rt==2026.1.1
+intel-cmplr-lib-ur==2026.1.1
+intel-cmplr-lic-rt==2026.1.1
+intel-openmp==2026.1.1

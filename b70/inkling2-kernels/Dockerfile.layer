@@ -1,0 +1,6 @@
+# The Inkling2 kernel library on top of a b70 engine image:
+#   docker build -f Dockerfile.layer --build-arg ENGINE=vllm-xpu:b70-inkling2-<sha> -t <tag> <dir with the build.sh OUT files>
+ARG ENGINE
+FROM ${ENGINE}
+COPY _inkling2_C.abi3.so libinkling2_attn_kernels_xe_2.so libinkling2_moe_kernels_xe_2.so /opt/inkling2/
+ENV VLLM_INKLING2_C=/opt/inkling2/_inkling2_C.abi3.so

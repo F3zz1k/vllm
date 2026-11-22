@@ -257,19 +257,24 @@ except ImportError:  # pragma: no cover
     pass
 
 
-def _fused_moe(moe):
-    k = getattr(moe, "_kernel", None)
+# prefill-sized batches use the optional fp8 / bf16 expert copy (VLLM_INKLING2_PREFILL_EXPERTS)
+PREFILL_EXPERT_MIN_TOKENS = 64
+
+
+def _fused_moe(moe, prefill: bool = False):
+    attr = "_prefill_kernel" if prefill else "_kernel"
+    k = getattr(moe, attr, None)
     if k is None:
         from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 
-        t = moe.store.t
+        t = (moe.prefill_store if prefill else moe.store).t
         k = XpuFusedMoe(w13=t["w13"], w13_scales=t.get("w13_scale"), w13_bias=None,
                         w2=t["w2"], w2_scales=t.get("w2_scale"), w2_bias=None,
                         n_experts_per_token=moe.top_k, activation="situ",
                         num_experts=moe.num_experts, ep_rank=moe.ep_rank, ep_size=moe.ep_size,
                         activation_situ_beta=moe.gate_cap,
                         activation_situ_linear_beta=moe.up_cap)
-        moe._kernel = k
+        setattr(moe, attr, k)
     return k
 
 
@@ -325,6 +330,11 @@ def experts(moe, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> t
     if BACKEND == "triton" and x.is_xpu and moe.store.fmt in ("bf16", "fp8"):
         out = torch.empty_like(x)
         _fused_moe(moe).apply(out, x, weights, ids)
+        return out
+    if (BACKEND == "triton" and x.is_xpu and moe.prefill_store is not None
+            and x.shape[0] >= PREFILL_EXPERT_MIN_TOKENS):
+        out = torch.empty_like(x)
+        _fused_moe(moe, prefill=True).apply(out, x, weights, ids)
         return out
     if BACKEND == "triton" and x.is_xpu and moe.store.fmt == "nvfp4":
         from . import moe_nvfp4

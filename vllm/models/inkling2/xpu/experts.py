@@ -42,6 +42,17 @@ def expert_format() -> str:
     return fmt
 
 
+def prefill_expert_format() -> str:
+    """VLLM_INKLING2_PREFILL_EXPERTS=nvfp4 (default: one copy) | fp8 | bf16: a second copy of
+    the NVFP4 layers' experts used only for prefill-sized batches (the NVFP4 GEMM unpacks
+    4-bit values in its main loop and runs ~1.7x slower than the vendor fp8/bf16 GEMMs at
+    8k tokens). Decode keeps the exact NVFP4 copy."""
+    fmt = os.environ.get("VLLM_INKLING2_PREFILL_EXPERTS", "nvfp4").lower()
+    if fmt not in ("nvfp4", "fp8", "bf16"):
+        raise ValueError(f"VLLM_INKLING2_PREFILL_EXPERTS must be nvfp4, fp8 or bf16, got {fmt!r}")
+    return fmt
+
+
 def _byte_table(device) -> torch.Tensor:
     vals = torch.tensor(E2M1_VALUES, device=device)
     byte = torch.arange(256, device=device)
