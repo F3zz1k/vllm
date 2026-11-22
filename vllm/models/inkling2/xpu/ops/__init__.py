@@ -53,6 +53,43 @@ def attn_res(stack: torch.Tensor, n: int, last: torch.Tensor, addend: torch.Tens
                         for q in range(mixes.shape[0])])
 
 
+def qkr(attn, yq: torch.Tensor, tau: torch.Tensor | None, fused: bool):
+    """q (T, H, D) and the relative logits (T, H, E) from the projection's q / r
+    columns (`yq` rows: [q | r | ...]). `fused`: one Triton kernel (distance-order
+    logits, for the SYCL attention); else the torch ops."""
+    T = yq.shape[0]
+    H, D, R = attn.num_heads, attn.head_dim, attn.d_rel
+    if fused:
+        from .triton_glue import qkr_prep
+
+        return qkr_prep(yq, attn.q_scale, attn.r_scale, tau, attn.rel_proj, H, D, R, H * D,
+                        attn.qk_clip, attn.rel_clip)
+    q = qr_norm(yq[:, :H * D].view(T, H, D), attn.q_scale, attn.qk_clip, tau)
+    r = qr_norm(yq[:, H * D:H * D + H * R].view(T, H, R), attn.r_scale, attn.rel_clip, tau)
+    return q, rel_logits(r, attn.rel_proj, attn)
+
+
+def blend(layer, s: slice, dests: torch.Tensor, messages: torch.Tensor, norm_w: torch.Tensor,
+          eps: float) -> torch.Tensor:
+    """Loop controllers of streams `s` then the next sublayer's RMSNorm: fp32 `(S, T, D)`
+    dests / messages -> bf16 `(S, T, D)`. h = down(cat(rms(dest), rms(message))) (bf16
+    GEMM), [gain; forget](h) (fp32 GEMM), (1 - tanh(forget)) dest + tanh(gain) message."""
+    if BACKEND == "triton" and dests.is_xpu:
+        from .triton_glue import blend_out, blend_prep
+
+        cat = blend_prep(dests, messages)
+        h = torch.bmm(cat, layer.ctrl_down[s].transpose(1, 2)).float()
+        gf = torch.bmm(h, layer.ctrl_gf[s].transpose(1, 2))
+        return blend_out(gf, dests, messages, norm_w, eps)
+    rms = ref.unweighted_rms
+    cat = torch.cat([rms(dests), rms(messages)], -1).to(layer.ctrl_down.dtype)
+    h = torch.bmm(cat, layer.ctrl_down[s].transpose(1, 2)).float()
+    gf = torch.bmm(h, layer.ctrl_gf[s].transpose(1, 2))
+    D = dests.shape[-1]
+    x = (1 - torch.tanh(gf[..., D:])) * dests + torch.tanh(gf[..., :D]) * messages
+    return ref.rms_norm(x, norm_w[:, None, :], eps)
+
+
 def add3(last: torch.Tensor, addend: torch.Tensor | None, m: torch.Tensor) -> torch.Tensor:
     """(last (+ addend) + m) in fp32, rounded to bf16 once (the layer output)."""
     y = last.float() if addend is None else last.float() + addend.float()
@@ -82,11 +119,13 @@ def _ref_history(owner, md, stream, x, positions):
 
 def conv(owner, md, stream: str, x: torch.Tensor, positions: torch.Tensor,
          weight: torch.Tensor, dyn: torch.Tensor | None = None, norm: int = 0,
-         clip: float = 0.0, eps: float = 1e-6, kv_owner=None, kv_md=None) -> torch.Tensor:
+         clip: float = 0.0, eps: float = 1e-6, kv_owner=None, kv_md=None,
+         last: torch.Tensor | None = None, addend: torch.Tensor | None = None) -> torch.Tensor:
     """Short conv of one stream over the visit's conv state (static taps, or
     dynamic with `dyn`), then optionally a per-head norm (1 = L2 clip, 2 =
     unweighted RMS) and a store into the visit's KV cache (K for stream 'k',
-    V for 'v'). Returns bf16 `(T, C)`."""
+    V for 'v'). Returns bf16 `(T, C)`; with `last` (and `addend`), the layer output
+    last (+ addend) + conv in fp32, rounded once."""
     T = x.shape[0]
     hph = owner.layout.stream(stream)[1]
     have_md = md is not None and owner.kv_cache.numel() > 0
@@ -99,7 +138,9 @@ def conv(owner, md, stream: str, x: torch.Tensor, positions: torch.Tensor,
                           md.query_start[:T], positions[:T], weight, dyn=dyn, norm=norm,
                           clip=clip, eps=eps, kv=kv,
                           kv_slots=None if kv is None else kv_md.slot_mapping[:T],
-                          kv_off=0 if stream == "k" else hph)
+                          kv_off=0 if stream == "k" else hph,
+                          last=None if last is None else last.contiguous(),
+                          addend=None if addend is None else addend.contiguous())
     hist = _ref_history(owner, md if have_md else None, stream, x, positions)
     if dyn is None:
         y = ref.static_conv(hist, weight).to(torch.bfloat16)
@@ -117,7 +158,7 @@ def conv(owner, md, stream: str, x: torch.Tensor, positions: torch.Tensor,
         o = 0 if stream == "k" else hph
         cache[slots[valid] // page, :, slots[valid] % page, o:o + hph] = (
             y[valid].view(-1, owner.layout.num_heads, hph).to(cache.dtype))
-    return y
+    return y if last is None else add3(last, addend, y)
 
 
 def _use_sycl_attention() -> bool:
@@ -140,16 +181,25 @@ def rel_logits(r: torch.Tensor, proj: torch.Tensor, attn) -> torch.Tensor:
     return torch.matmul(r, proj)
 
 
+def sycl_ready(owner) -> bool:
+    """The SYCL attention (and the glue fused around it) serves this KV cache."""
+    return _use_sycl_attention() and owner.kv_cache.shape[2] == 64
+
+
 def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
-              rel_extent: int) -> torch.Tensor:
-    """Attention over the visit's KV cache (K/V already stored by `conv`)."""
+              rel_extent: int, gate: torch.Tensor | None = None) -> torch.Tensor:
+    """Attention over the visit's KV cache (K/V already stored by `conv`): (T, H, D)
+    bf16, or with `gate` (T, H*D) the sigmoid-gated output (T, H*D) bf16."""
+    T, H, D = q.shape
     out = torch.zeros_like(q)
-    _attention_into(out, q, rel_logits, sinks, owner=owner, scale=scale, window=window,
-                    rel_extent=rel_extent)
-    return out
+    gated = None if gate is None else torch.empty((T, H * D), dtype=q.dtype, device=q.device)
+    _attention_into(out, q, rel_logits, sinks, gated, gate, owner=owner, scale=scale,
+                    window=window, rel_extent=rel_extent)
+    return out if gate is None else gated
 
 
-def _attention_into(out, q, rel_logits, sinks, *, owner, scale, window, rel_extent):
+def _attention_into(out, q, rel_logits, sinks, gated, gate, *, owner, scale, window,
+                    rel_extent):
     """Writes `out` in place. The kernels take host-side lengths (max query / key
     length, token count), so under breakable XPU graphs this is an eager break: on
     replay it runs with the current step's metadata, looked up here, not the
@@ -168,6 +218,15 @@ def _attention_into(out, q, rel_logits, sinks, *, owner, scale, window, rel_exte
         # split count it was captured with.
         splits = (int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
                   if window is None else 4) if decode else 1
+        if gated is not None:
+            from .triton_glue import attn_post
+
+            _, lse = sycl_attention.rel_attention(
+                q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], md.block_table, md.seq_lens,
+                md.query_start_loc, scale, window, md.max_query_len, md.max_seq_len,
+                num_splits=splits, out=out[:n], return_lse=True)
+            attn_post(out, lse, sinks, gate, gated, n)
+            return
         sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n],
                                      md.block_table, md.seq_lens, md.query_start_loc,
                                      scale, window, md.max_query_len, md.max_seq_len,
@@ -181,10 +240,12 @@ def _attention_into(out, q, rel_logits, sinks, *, owner, scale, window, rel_exte
         rel_attention(q, owner.kv_cache, rel_logits, sinks, md.block_table, md.seq_lens,
                       md.query_start_loc, scale, window, rel_extent, n_req, out=out,
                       num_splits=splits, rel_reversed=True)
-        return
-    out[:n] = ref.rel_attention(q[:n], rel_logits[:n], sinks[:n], owner.kv_cache,
-                                md.block_table, md.seq_lens, md.query_start_loc, scale,
-                                window, rel_extent)
+    else:
+        out[:n] = ref.rel_attention(q[:n], rel_logits[:n], sinks[:n], owner.kv_cache,
+                                    md.block_table, md.seq_lens, md.query_start_loc, scale,
+                                    window, rel_extent)
+    if gated is not None:
+        gated.copy_((out.float().view(gated.shape) * torch.sigmoid(gate.float())).to(gated.dtype))
 
 
 try:
@@ -208,6 +269,15 @@ def _fused_moe(moe):
                         activation_situ_linear_beta=moe.up_cap)
         moe._kernel = k
     return k
+
+
+def route_fused(x, weight, bias, top_k: int, route_scale: float):
+    """Router: the fused Triton kernel on XPU, else the reference."""
+    if BACKEND == "triton" and x.is_xpu:
+        from .triton_glue import route as tri
+
+        return tri(x, weight, bias, top_k, route_scale)
+    return ref.route(x, weight, bias, top_k, route_scale)
 
 
 def experts(moe, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:

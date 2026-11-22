@@ -25,11 +25,12 @@ import triton.language as tl
 
 @triton.jit
 def _sconv_kernel(
-    X, Out, Conv, Slots, BlockTable, SeqIdx, QStart, Pos, W, Dyn, KV, KVSlots,
+    X, Out, Conv, Slots, BlockTable, SeqIdx, QStart, Pos, W, Dyn, KV, KVSlots, Last, Addend,
     C, hph, off, eps, clip, inv_norm, dyn_heads_w,
     s_x, s_o, s_c_b, s_c_h, s_c_n, s_bt, s_w0, s_w1, s_dyn, s_kv_b, s_kv_h, s_kv_n, KV_OFF,
     K: tl.constexpr, BLOCK_C: tl.constexpr, DYNAMIC: tl.constexpr, NORM: tl.constexpr,
     STORE_KV: tl.constexpr, PAGE: tl.constexpr, KV_PAGE: tl.constexpr,
+    RESID: tl.constexpr, HAS_ADD: tl.constexpr,
 ):
     t = tl.program_id(0)
     cb = tl.program_id(1)
@@ -71,7 +72,13 @@ def _sconv_kernel(
         y = y * tl.minimum(clip / (n + 1e-6), 1.0)
     elif NORM == 2:
         y = y * tl.rsqrt(tl.sum(y * y, 0) / BLOCK_C + eps)
-    tl.store(Out + t * s_o + c, y.to(Out.dtype.element_ty), mask=cm)
+    if RESID:  # the layer output: (last (+ addend) + conv out) in fp32, rounded once
+        res = tl.load(Last + t * s_o + c, mask=cm, other=0.0).to(tl.float32)
+        if HAS_ADD:
+            res += tl.load(Addend + t * s_o + c, mask=cm, other=0.0).to(tl.float32)
+        tl.store(Out + t * s_o + c, (res + y).to(Out.dtype.element_ty), mask=cm)
+    else:
+        tl.store(Out + t * s_o + c, y.to(Out.dtype.element_ty), mask=cm)
     if slot >= 0:
         cs = slot
         tl.store(Conv + (cs // PAGE).to(tl.int64) * s_c_b + head * s_c_h + (cs % PAGE) * s_c_n
@@ -88,9 +95,12 @@ def short_conv(x: torch.Tensor, conv: torch.Tensor, stream_off: int, hph: int,
                query_start: torch.Tensor, positions: torch.Tensor, weight: torch.Tensor,
                dyn: torch.Tensor | None = None, norm: int = 0, clip: float = 0.0,
                eps: float = 1e-6, kv: torch.Tensor | None = None,
-               kv_slots: torch.Tensor | None = None, kv_off: int = 0) -> torch.Tensor:
+               kv_slots: torch.Tensor | None = None, kv_off: int = 0,
+               last: torch.Tensor | None = None,
+               addend: torch.Tensor | None = None) -> torch.Tensor:
     """x (T, C) bf16 (C = heads * hph); conv [B, H, page, W]; weight (C, k)
-    static or (k, C) with `dyn` (T, H * k); returns (T, C) bf16."""
+    static or (k, C) with `dyn` (T, H * k); returns (T, C) bf16, or with `last`
+    (and `addend`), contiguous (T, C), the residual sum last (+ addend) + conv."""
     T, C = x.shape
     k = weight.shape[1] if dyn is None else weight.shape[0]
     out = torch.empty((T, C), dtype=torch.bfloat16, device=x.device)
@@ -108,6 +118,7 @@ def short_conv(x: torch.Tensor, conv: torch.Tensor, stream_off: int, hph: int,
     _sconv_kernel[(T, triton.cdiv(C, block_c))](
         x, out, conv, slots, block_table, seq_idx, query_start, positions, weight,
         dyn if dyn is not None else x, kvt, kv_slots if store_kv else slots,
+        last if last is not None else x, addend if addend is not None else x,
         C, hph, stream_off, eps, clip, inv, hph if dyn is not None else 1,
         x.stride(0), out.stride(0), conv.stride(0), conv.stride(1), conv.stride(2),
         block_table.stride(0), weight.stride(0), weight.stride(1),
@@ -115,5 +126,6 @@ def short_conv(x: torch.Tensor, conv: torch.Tensor, stream_off: int, hph: int,
         kvt.stride(0), kvt.stride(1), kvt.stride(2), kv_off,
         K=k, BLOCK_C=block_c, DYNAMIC=dyn is not None, NORM=norm, STORE_KV=store_kv,
         PAGE=conv.shape[2], KV_PAGE=kvt.shape[2],
+        RESID=last is not None, HAS_ADD=addend is not None,
     )
     return out

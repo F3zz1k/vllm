@@ -44,9 +44,11 @@ def available() -> bool:
 def rel_attention(q: torch.Tensor, kv: torch.Tensor, rel: torch.Tensor, sinks: torch.Tensor,
                   block_table: torch.Tensor, seq_lens: torch.Tensor, cu_q: torch.Tensor,
                   scale: float, window: int | None, max_q: int, max_k: int,
-                  num_splits: int = 1, out: torch.Tensor | None = None) -> torch.Tensor:
+                  num_splits: int = 1, out: torch.Tensor | None = None,
+                  return_lse: bool = False):
     """q (T, Hq, D) bf16; kv [B, Hk, page, 2D] (K | V); rel (T, Hq, E) bf16 with
-    column d = bias at distance d; sinks (T, Hq); returns (T, Hq, D) bf16."""
+    column d = bias at distance d; sinks (T, Hq); returns (T, Hq, D) bf16. With
+    `return_lse`, the sinks are not applied: returns (out, lse (Hq, T) fp32)."""
     D = q.shape[-1]
     kvt = kv.transpose(1, 2)  # [B, page, Hk, 2D]
     k, v = kvt[..., :D], kvt[..., D:]
@@ -56,6 +58,8 @@ def rel_attention(q: torch.Tensor, kv: torch.Tensor, rel: torch.Tensor, sinks: t
     torch.ops._inkling2_C.rel_attention(
         q, k, v, out, cu_q, seq_lens, block_table, max_q, max_k, scale,
         -1 if window is None else window - 1, rel, lse, num_splits)
+    if return_lse:
+        return out, lse
     gate = torch.sigmoid(lse.t() - sinks.float())  # (T, Hq)
     out.copy_((out.float() * gate[..., None]).to(out.dtype))
     return out

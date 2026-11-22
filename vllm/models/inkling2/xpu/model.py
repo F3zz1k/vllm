@@ -132,10 +132,10 @@ class Inkling2Attention(nn.Module):
         conv_md = layer_metadata(conv_owner.prefix)
         attn_md = layer_metadata(kv_owner.prefix)
 
-        # q / r: learned scale, L2 clip (+ log scaling on global layers).
-        q = ops.qr_norm(q_lin.view(T, H, D), self.q_scale, self.qk_clip, tau)
-        r = ops.qr_norm(r_lin.view(T, H, R), self.r_scale, self.rel_clip, tau)
-        rel_logits = ops.rel_logits(r, self.rel_proj, self)  # (T, H, E), bf16 as reference
+        # q / r: learned scale, L2 clip (+ log scaling on global layers), and the
+        # relative logits (one fused kernel when the SYCL attention serves the cache)
+        fused = attn_md is not None and ops.sycl_ready(kv_owner)
+        q, rel_logits = ops.qkr(self, yq, tau, fused)
 
         # k / v: short conv (static or dynamic) over the conv cache, then
         # L2 clip (k) or unweighted RMS norm (v), stored into the KV cache.
@@ -152,11 +152,10 @@ class Inkling2Attention(nn.Module):
                      dyn=yv[:, self.v_size:], norm=2, eps=self.eps, **kw)
 
         if attn_md is None:
-            out = torch.zeros(T, H, D, dtype=torch.bfloat16, device=xq.device)
-        else:
+            out = torch.zeros(T, H * D, dtype=torch.bfloat16, device=xq.device)
+        else:  # sinks and the sigmoid output gate applied inside
             out = ops.attention(kv_owner, attn_md, q, rel_logits, sink, self.scale,
-                                self.window, self.rel_extent)
-        out = (out.float().view(T, -1) * torch.sigmoid(gate_lin.float())).to(torch.bfloat16)
+                                self.window, self.rel_extent, gate=gate_lin)
         return F.linear(out, self.wo)
 
 
@@ -194,7 +193,8 @@ class Inkling2MoE(nn.Module):
         return self.store.expert_weights(e)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w, ids = ops.route(x, self.gate_weight, self.gate_bias, self.top_k, self.route_scale)
+        w, ids = ops.route_fused(x, self.gate_weight, self.gate_bias, self.top_k,
+                                 self.route_scale)
         return ops.experts(self, x, w, ids)
 
 
@@ -221,20 +221,6 @@ class Inkling2DecoderLayer(nn.Module):
             self.ctrl_gain = _param(len(LOOP_STREAMS), D, r, dtype=torch.float32)
             self.ctrl_forget = _param(len(LOOP_STREAMS), D, r, dtype=torch.float32)
 
-    def blend(self, i: int, dest, message):
-        return ops.message_blend(dest, message, self.ctrl_down[i], self.ctrl_gain[i],
-                                 self.ctrl_forget[i])
-
-    def blend_streams(self, s: slice, dests: torch.Tensor, messages: torch.Tensor):
-        """The controllers of streams `s` at once (batched GEMMs): fp32 `(S, T, D)`
-        dests and messages -> fp32 `(S, T, D)`; same math as `blend` per stream."""
-        rms = ops.ref.unweighted_rms
-        cat = torch.cat([rms(dests), rms(messages)], -1).to(self.ctrl_down.dtype)
-        h = torch.bmm(cat, self.ctrl_down[s].transpose(1, 2)).float()
-        gf = torch.bmm(h, self.ctrl_gf[s].transpose(1, 2))
-        D = dests.shape[-1]
-        return (1 - torch.tanh(gf[..., D:])) * dests + torch.tanh(gf[..., :D]) * messages
-
     def forward(self, positions, h, stack, n: int, attn_query, mlp_query, messages, tau,
                 pass_idx: int):
         """One visit. `h` is the layer input (bf16); `stack[:n]` the completed
@@ -250,9 +236,8 @@ class Inkling2DecoderLayer(nn.Module):
         else:
             mixes = ops.attn_res(stack, n, h, None, attn_query)  # fp32 (1 or 3, T, D)
             dests = mixes.expand(3, -1, -1) if self.is_local else mixes
-            blended = self.blend_streams(slice(0, 3), dests, messages[:3])
             w = self.attn_norm.expand(3, -1) if self.is_local else self.attn_norm
-            xq, xk, xv = ops.rms_norm(blended, w[:, None, :], self.eps).unbind(0)
+            xq, xk, xv = ops.blend(self, slice(0, 3), dests, messages[:3], w, self.eps).unbind(0)
 
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx)
         a = ops.conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv)
@@ -267,11 +252,12 @@ class Inkling2DecoderLayer(nn.Module):
                              self.eps)[0]
         else:
             m = ops.attn_res(stack, n, last, addend, mlp_query)[0]
-            m = self.blend_streams(slice(3, 4), m[None], messages[3:])[0]
-            m = ops.rms_norm(m, self.mlp_norm, self.eps)
+            m = ops.blend(self, slice(3, 4), m[None], messages[3:], self.mlp_norm.view(1, -1),
+                          self.eps)[0]
         m = self.mlp(m)
-        m = ops.conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv)
-        return ops.add3(last, addend, m), n
+        # the MLP-output conv also adds the residual (last (+ addend)): the layer output
+        return ops.conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv, last=last,
+                        addend=addend), n
 
 
 class Inkling2LoopModel(nn.Module):
