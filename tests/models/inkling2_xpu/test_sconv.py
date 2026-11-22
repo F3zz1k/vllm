@@ -82,3 +82,62 @@ def test_short_conv_steps(mode):
             stored = kv_tri.cpu()[kvs // 16, :, kvs % 16, o:o + hd]
             assert (stored.float() - got.view(T, H, hd).float()).abs().max() == 0
         assert torch.equal(st_tri.cpu(), st_ref), step
+
+
+@pytest.mark.parametrize("mode", ["attn", "dynamic_k"])
+def test_short_conv_spec(mode):
+    """Speculative decode: state of k - 1 + S rows; verify steps of 1 + S rows read from
+    row num_accepted - 1. Reference: the conv over the truly accepted history."""
+    g = torch.Generator().manual_seed(2)
+    H, hd, hidden, k, S = 2, 32, 128, 4, 3
+    layout = ref.ConvLayout.make(H, hd, hidden)
+    stream = "attn" if mode == "attn" else "k"
+    off, w = layout.stream(stream)
+    C = H * w
+    dyn_mode = mode.startswith("dynamic")
+    weight = torch.randn((k, C) if dyn_mode else (C, k), generator=g) * 0.4
+    if dyn_mode:
+        weight = weight.bfloat16()
+    st = torch.zeros(4, k - 1 + S, H * layout.width).bfloat16().to(DEV)
+    hist = {0: torch.zeros(0, C), 1: torch.zeros(0, C)}  # truly accepted inputs per request
+    acc = {0: 1, 1: 1}
+    d = lambda t: t.to(DEV)
+    i32 = lambda v: torch.tensor(v, dtype=torch.int32, device=DEV)
+    # per step: (req, rows); decode rows (1 + S) first, as vLLM orders them
+    steps = [[(0, 6)], [(0, 4), (1, 9)], [(0, 4), (1, 4)], [(0, 4), (1, 4)], [(1, 4), (0, 2)]]
+    for step in steps:
+        qsl = [0]
+        for _, n in step:
+            qsl.append(qsl[-1] + n)
+        T = qsl[-1]
+        x = torch.randn(T, C, generator=g).bfloat16()
+        dyn = (torch.randn(T, H * k, generator=g) * 0.3).bfloat16() if dyn_mode else None
+        want = []
+        for r, (req, n) in enumerate(step):
+            prior = hist[req][-(k - 1):].float()
+            prior = torch.cat([torch.zeros(k - 1 - prior.shape[0], C), prior])
+            seq = torch.cat([prior, x[qsl[r]:qsl[r + 1]].float()])
+            hh = torch.stack([seq[i:i + k] for i in range(n)])
+            if dyn_mode:
+                want.append(ref.dynamic_conv(hh, weight, dyn[qsl[r]:qsl[r + 1]], H))
+            else:
+                want.append(ref.static_conv(hh, weight))
+        want = torch.cat(want).bfloat16()
+        if dyn_mode:
+            want = ref.l2_clip(want.view(T, H, hd).float(), 22.6).to(torch.bfloat16).view(T, C)
+        seq_idx = torch.cat([torch.full((n,), r) for r, (_, n) in enumerate(step)]).int()
+        qs = torch.tensor([qsl[r] for r in seq_idx.tolist()]).int()
+        lens = [hist[req].shape[0] + n for req, n in step]
+        nacc = [acc[req] for req, _ in step]
+        got = short_conv(d(x), st, off, w, layout.width, d(seq_idx), d(qs), i32(qsl),
+                         i32([[req] for req, _ in step]), i32(lens), d(weight),
+                         dyn=None if dyn is None else d(dyn), norm=1 if dyn_mode else 0,
+                         clip=22.6, num_accepted=i32(nacc), spec=S).cpu()
+        err = (got.float() - want.float()).abs().max().item()
+        assert err <= 1.6e-2, (step, err)
+        for r, (req, n) in enumerate(step):  # accept a random prefix of each verify row
+            xs = x[qsl[r]:qsl[r + 1]].float()
+            is_dec = hist[req].shape[0] > 0 and n <= 1 + S
+            a = int(torch.randint(1, n + 1, (1,), generator=g)) if is_dec else n
+            hist[req] = torch.cat([hist[req], xs[:a]])
+            acc[req] = a if is_dec else 1

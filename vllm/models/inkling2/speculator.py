@@ -46,13 +46,11 @@ class Inkling2DSparkSpeculator(DSparkSpeculator):
         model.attach_target(target_model.get_language_model())
         return model
 
-    def prepare_context_anchor(
-        self,
-        num_reqs: int,
-        query_start_loc: torch.Tensor,
-        num_rejected: torch.Tensor | None,
-    ) -> None:
-        assert num_rejected is not None
+    def prepare_context_anchor(self, input_batch, num_rejected: torch.Tensor) -> None:
+        """The Markov head's recurrent input: each request's feature row at its last
+        accepted target position."""
+        num_reqs = input_batch.num_reqs
+        query_start_loc = input_batch.query_start_loc
         ends = query_start_loc[1 : num_reqs + 1] - num_rejected[:num_reqs]
         rows = self.hidden_states[(ends - 1).clamp_min(0).long()]
         self.f_rnn[:num_reqs] = self.model.compute_f_rnn(rows)

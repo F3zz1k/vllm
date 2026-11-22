@@ -43,6 +43,10 @@ def init_speculator(
 
         return DFlashSpeculator(vllm_config, device)
     elif speculative_config.method == "dspark":
+        if "Inkling2DSparkModel" in speculative_config.draft_model_config.architectures:
+            from vllm.models.inkling2.speculator import Inkling2DSparkSpeculator
+
+            return Inkling2DSparkSpeculator(vllm_config, device)
         from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
             DSparkSpeculator,
         )

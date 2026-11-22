@@ -38,7 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
+from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsEagle3
 from vllm.sequence import IntermediateTensors
 
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
@@ -310,6 +310,9 @@ class Inkling2DecoderLayer(nn.Module):
 class Inkling2LoopModel(nn.Module):
     def __init__(self, config: Inkling2ModelConfig, prefix: str) -> None:
         super().__init__()
+        # visits whose input partial block the DSpark draft reads (set by the speculator)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+        self._visit_idx, self._aux = 0, []
         self.config = config
         D = config.hidden_size
         self.eps = config.rms_norm_eps
@@ -359,6 +362,10 @@ class Inkling2LoopModel(nn.Module):
         return ops.rms_norm(self.embed_tokens(input_ids), self.embed_norm, self.eps)
 
     def _visit(self, i, p, positions, h, stack, n, messages, tau):
+        # DSpark: the partial block entering visit v (0-based over the unrolled loop)
+        if self._visit_idx in self.aux_hidden_state_layers:
+            self._aux.append(h)
+        self._visit_idx += 1
         attn_query = None if i == 0 else self.attn_queries[i - 1]
         return self.layers[i](positions, h, stack, n, attn_query, self.mlp_queries[i], messages,
                               tau, p)
@@ -370,6 +377,7 @@ class Inkling2LoopModel(nn.Module):
             tau = ops.log_scaling_tau(positions, c.log_scaling_n_floor, c.log_scaling_alpha)
         core = self.core
         T, D = inputs_embeds.shape
+        self._visit_idx, self._aux = 0, []
         stack = inputs_embeds.new_empty((self.max_blocks, T, D))
         h, n = inputs_embeds, 0
         for i in range(core.start):
@@ -387,11 +395,15 @@ class Inkling2LoopModel(nn.Module):
                 h, n = self._visit(i, p, positions, h, stack, n, messages, tau)
         for i in range(core.stop, c.num_hidden_layers):
             h, n = self._visit(i, 0, positions, h, stack, n, None, tau)
-        return ops.attn_res(stack, n, h, None, self.output_query, self.norm.view(1, -1),
-                            self.eps)[0]
+        out = ops.attn_res(stack, n, h, None, self.output_query, self.norm.view(1, -1),
+                           self.eps)[0]
+        if self.aux_hidden_state_layers:
+            aux, self._aux = self._aux, []
+            return out, [*aux, out]
+        return out
 
 
-class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, SupportsEagle3):
     """Text path of Inkling 2 Mini on XPU (vision: not yet). Hybrid: every visit's
     short-conv inputs are a per-sequence state (`cache.Inkling2ConvState`)."""
 
@@ -402,7 +414,10 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
                                                                  tc.head_dim)
         tp = vllm_config.parallel_config.tensor_parallel_size
         layout = ConvLayout.make(tc.num_key_value_heads // tp, tc.head_dim, tc.hidden_size)
-        return (Inkling2ConvState.state_shape(layout, tc.sconv_kernel_size),)
+        from .cache import spec_tokens
+
+        return (Inkling2ConvState.state_shape(layout, tc.sconv_kernel_size,
+                                              spec_tokens(vllm_config)),)
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
@@ -425,9 +440,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
         # The config's fp32 head would cast the 0.9 GB weight to fp32 on every step
         # (~9 ms/token on XPU); the reference runs the head in bf16, so do the same.
         self.logits_processor.head_dtype = None
+        # a DSpark draft shares the bf16 LM head, so the int8 head keeps the bf16 weight then
+        self._keep_head_bf16 = vllm_config.speculative_config is not None
 
     def get_language_model(self) -> nn.Module:
         return self
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -464,8 +484,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
             q, sc = ops.quant_rows_int8(self.lm_head.weight.data)
             self.register_buffer("head_q", q, persistent=False)
             self.register_buffer("head_s", sc, persistent=False)
-            self.lm_head.weight.data = torch.empty(0, dtype=self.lm_head.weight.dtype,
-                                                   device=q.device)
+            if not self._keep_head_bf16:
+                self.lm_head.weight.data = torch.empty(0, dtype=self.lm_head.weight.dtype,
+                                                       device=q.device)
         torch.xpu.empty_cache() if torch.xpu.is_available() else None
 
     # ---------------------------------------------------------------- weights

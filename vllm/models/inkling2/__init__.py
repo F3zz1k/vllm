@@ -18,6 +18,10 @@ def __getattr__(name: str):
         from .xpu import model
 
         return model.Inkling2LoopForConditionalGeneration
-    if name in ("Inkling2ForConditionalGeneration", "Inkling2DSparkModel"):
+    if name == "Inkling2DSparkModel":
+        from .xpu import dspark
+
+        return dspark.Inkling2DSparkModel
+    if name == "Inkling2ForConditionalGeneration":
         raise NotImplementedError(f"{name} is not ported to this tree yet")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

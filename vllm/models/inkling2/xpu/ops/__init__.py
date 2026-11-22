@@ -130,9 +130,12 @@ def conv(owner, md, stream: str, x: torch.Tensor, weight: torch.Tensor,
                           kv_off=0 if stream == "k" else hph,
                           last=None if last is None else last.contiguous(),
                           addend=None if addend is None else addend.contiguous(),
-                          align=md.align, state_block_size=md.state_block_size)
+                          align=md.align, state_block_size=md.state_block_size,
+                          num_accepted=md.num_accepted_tokens if owner.spec else None,
+                          spec=owner.spec)
     k = owner.kernel_size
     if have_md:
+        assert owner.spec == 0, "reference conv: no speculative decoding"
         nreq = md.num_reqs
         qsl = md.query_start_loc[:nreq + 1].tolist()
         lens = md.seq_lens[:nreq].tolist()

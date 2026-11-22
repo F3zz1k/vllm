@@ -118,7 +118,6 @@ class Inkling2ConvMetadataBuilder(ShortConvAttentionMetadataBuilder):
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
-        assert vllm_config.speculative_config is None, "Inkling2 conv state: no spec decode yet"
         n_tok = vllm_config.scheduler_config.max_num_batched_tokens
         self.seq_idx_buf = torch.zeros(n_tok, dtype=torch.int32, device=device)
         self.query_start_buf = torch.zeros(n_tok, dtype=torch.int32, device=device)
@@ -127,7 +126,7 @@ class Inkling2ConvMetadataBuilder(ShortConvAttentionMetadataBuilder):
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
               fast_build: bool = False, **kw):
         m = common_attn_metadata
-        md = super().build(common_prefix_len, m, fast_build)
+        md = super().build(common_prefix_len, m, fast_build, **kw)
         n_act = int(m.query_start_loc_cpu[-1])
         n_pad = m.slot_mapping.shape[0]
         sconv_seq_metadata(m.query_start_loc, m.num_reqs, n_act, self.seq_idx_buf,
@@ -140,6 +139,11 @@ class Inkling2ConvMetadataBuilder(ShortConvAttentionMetadataBuilder):
     def update_block_table(self, metadata, blk_table, slot_mapping):
         return replace(super().update_block_table(metadata, blk_table, slot_mapping),
                        block_table=blk_table)
+
+
+def spec_tokens(vllm_config) -> int:
+    sc = getattr(vllm_config, "speculative_config", None)
+    return 0 if sc is None else int(sc.num_speculative_tokens or 0)
 
 
 class Inkling2ConvBackend(ShortConvAttentionBackend):
@@ -159,6 +163,7 @@ class Inkling2ConvState(nn.Module, MambaBase):
         self.layout = layout
         self.kernel_size = kernel_size
         vllm_config = get_current_vllm_config()
+        self.spec = spec_tokens(vllm_config)
         self.dtype = vllm_config.model_config.dtype
         assert self.dtype == torch.bfloat16, "Inkling2 conv state is bf16"
         self.kv_cache = (torch.tensor([]),)
@@ -167,12 +172,13 @@ class Inkling2ConvState(nn.Module, MambaBase):
     def forward(self): ...
 
     @staticmethod
-    def state_shape(layout: ConvLayout, kernel_size: int) -> tuple[int, int]:
-        """(kernel_size - 1, H * W): the last inputs, oldest first."""
-        return (kernel_size - 1, layout.num_heads * layout.width)
+    def state_shape(layout: ConvLayout, kernel_size: int, spec: int = 0) -> tuple[int, int]:
+        """(kernel_size - 1 + spec, H * W): the last inputs, oldest first (with speculative
+        decoding, vLLM's rolling conv state of spec extra rows)."""
+        return (kernel_size - 1 + spec, layout.num_heads * layout.width)
 
     def get_state_shape(self):
-        return (self.state_shape(self.layout, self.kernel_size),)
+        return (self.state_shape(self.layout, self.kernel_size, self.spec),)
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         return (self.dtype,)
