@@ -120,10 +120,19 @@ def conv(owner, md, stream: str, x: torch.Tensor, positions: torch.Tensor,
     return y
 
 
+def _use_sycl_attention() -> bool:
+    if os.environ.get("VLLM_INKLING2_ATTN", "sycl") != "sycl" or BACKEND != "triton":
+        return False
+    from . import sycl_attention
+
+    return sycl_attention.available()
+
+
 def rel_logits(r: torch.Tensor, proj: torch.Tensor, attn) -> torch.Tensor:
     """(T, H, E) relative logits r @ proj (bf16, as the reference). The Triton
-    kernel takes them reversed along E (from a flipped copy of proj, free)."""
-    if BACKEND == "triton":
+    kernel takes them reversed along E (from a flipped copy of proj, free);
+    the SYCL kernel in distance order."""
+    if BACKEND == "triton" and not _use_sycl_attention():
         rev = getattr(attn, "_rel_proj_rev", None)
         if rev is None or rev.data_ptr() == 0 or rev.shape != proj.shape:
             rev = attn._rel_proj_rev = proj.flip(-1).contiguous()
@@ -135,6 +144,21 @@ def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
               rel_extent: int) -> torch.Tensor:
     """Attention over the visit's KV cache (K/V already stored by `conv`)."""
     n_req = md.query_start_loc.shape[0] - 1
+    if _use_sycl_attention():
+        from . import sycl_attention
+
+        decode = md.max_query_len <= 1
+        # Fixed per layer type (not per context length): a graph replays the
+        # split count it was captured with.
+        splits = (int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
+                  if window is None else 4) if decode else 1
+        out = torch.zeros_like(q)
+        n = md.num_actual_tokens
+        sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n],
+                                     md.block_table, md.seq_lens, md.query_start_loc,
+                                     scale, window, md.max_query_len, md.max_seq_len,
+                                     num_splits=splits, out=out[:n])
+        return out
     if BACKEND == "triton":
         from .triton_attention import rel_attention
 

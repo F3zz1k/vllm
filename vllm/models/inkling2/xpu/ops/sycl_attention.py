@@ -28,6 +28,13 @@ def available() -> bool:
         except ImportError:
             path = os.environ.get("VLLM_INKLING2_C")
             if path and os.path.exists(path):
+                import ctypes
+
+                # its kernel library sits next to it (dev builds): open it by
+                # path first, so LD_LIBRARY_PATH stays the image's
+                lib = os.path.join(os.path.dirname(path), "libinkling2_attn_kernels_xe_2.so")
+                if os.path.exists(lib):
+                    ctypes.CDLL(lib, mode=ctypes.RTLD_GLOBAL)
                 torch.ops.load_library(path)
                 _LOADED = True
     return _LOADED
