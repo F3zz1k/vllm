@@ -52,10 +52,12 @@ def layer_metadata(prefix: str):
 
 
 class Inkling2KVCache(nn.Module, AttentionLayerBase):
-    def __init__(self, prefix: str, num_kv_heads: int, head_dim: int,
+    def __init__(self, prefix: str, num_heads: int, num_kv_heads: int, head_dim: int,
                  sliding_window: int | None) -> None:
         super().__init__()
         self.prefix = prefix
+        self.num_heads = num_heads  # read by the metadata builder
+        self.head_size = head_dim
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sliding_window = sliding_window

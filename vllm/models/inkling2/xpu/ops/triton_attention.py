@@ -32,7 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-LOG2E = 1.4426950408889634
+LOG2E = tl.constexpr(1.4426950408889634)
 # The Triton interpreter's bf16 tl.dot is wrong in this build: dot in fp32 there.
 INTERP = os.environ.get("TRITON_INTERPRET", "0") == "1"
 

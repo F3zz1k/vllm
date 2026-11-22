@@ -89,7 +89,7 @@ class Inkling2Attention(nn.Module):
             self.v_static = _param(self.kernel, Hk * D)
         self.layout = ConvLayout.make(Hk, D, c.hidden_size)
         self.kv_caches = nn.ModuleList(
-            Inkling2KVCache(f"{prefix}.kv.p{p}", Hk, D, self.window) for p in range(num_passes))
+            Inkling2KVCache(f"{prefix}.kv.p{p}", H, Hk, D, self.window) for p in range(num_passes))
         self.conv_states = nn.ModuleList(
             Inkling2ConvState(f"{prefix}.conv.p{p}", self.layout, self.kernel)
             for p in range(num_passes))
