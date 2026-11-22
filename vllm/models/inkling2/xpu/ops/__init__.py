@@ -29,6 +29,10 @@ def _backend() -> str:
 BACKEND = _backend()
 
 
+def ref_interp() -> bool:
+    return os.environ.get("TRITON_INTERPRET") == "1"
+
+
 def attn_res(blocks: list[torch.Tensor], partial: torch.Tensor,
              queries: torch.Tensor) -> torch.Tensor:
     if blocks:
@@ -134,10 +138,67 @@ def _fused_moe(moe):
     return k
 
 
+_SCRATCH: dict = {}
+
+
+def _nvfp4_via_scratch(moe, x, weights, ids, fp8: bool):
+    """NVFP4 storage, compute on XpuFusedMoe: decode the hit experts into one
+    scratch shared by every layer (fp8 with per-expert scales, or bf16)."""
+    from .triton_nvfp4_dequant import dequant_hit
+
+    t = moe.store.t
+    E, I2, H2 = t["w13_packed"].shape
+    H, I = 2 * H2, I2 // 2
+    key = (E, H, I, fp8, x.device)
+    sc = _SCRATCH.get(key)
+    if sc is None:
+        from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+
+        dt = torch.float8_e4m3fn if fp8 else torch.bfloat16
+        w13 = torch.empty((E, H, 2 * I), dtype=dt, device=x.device)
+        w2 = torch.empty((E, I, H), dtype=dt, device=x.device)
+        s13 = torch.ones(E, dtype=torch.float32, device=x.device) if fp8 else None
+        s2 = torch.ones(E, dtype=torch.float32, device=x.device) if fp8 else None
+        k = XpuFusedMoe(w13=w13, w13_scales=s13, w13_bias=None, w2=w2, w2_scales=s2,
+                        w2_bias=None, n_experts_per_token=moe.top_k, activation="situ",
+                        num_experts=E, activation_situ_beta=moe.gate_cap,
+                        activation_situ_linear_beta=moe.up_cap)
+        ones = torch.ones(E, dtype=torch.float32, device=x.device)
+        sc = _SCRATCH[key] = (k, w13, w2, s13, s2, ones)
+    k, w13, w2, s13, s2, ones = sc
+    hit = torch.zeros(E, dtype=torch.int32, device=x.device).scatter_(
+        0, ids.reshape(-1).long(), 1)
+    dequant_hit(t["w13_packed"], t["w13_bscale"], t["w13_factor"],
+                t["w13_inv8"] if fp8 else ones, hit, w13)
+    dequant_hit(t["w2_packed"], t["w2_bscale"], t["w2_factor"],
+                t["w2_inv8"] if fp8 else ones, hit, w2)
+    if fp8:
+        s13.copy_(t["w13_s8"])
+        s2.copy_(t["w2_s8"])
+    out = torch.empty_like(x)
+    k.apply(out, x, weights, ids)
+    return out
+
+
 def experts(moe, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     if BACKEND == "triton" and x.is_xpu and moe.store.fmt in ("bf16", "fp8"):
         out = torch.empty_like(x)
         _fused_moe(moe).apply(out, x, weights, ids)
         return out
+    # NVFP4 storage: VLLM_INKLING2_NVFP4_COMPUTE = auto (direct 4-bit Triton
+    # kernel for small batches, fp8 scratch + XpuFusedMoe for large ones;
+    # measured crossover ~64-128 routed rows), triton, fp8 or bf16.
+    mode = os.environ.get("VLLM_INKLING2_NVFP4_COMPUTE", "auto")
+    if mode == "auto":
+        thr = int(os.environ.get("VLLM_INKLING2_NVFP4_SCRATCH_MIN_TOKENS", "256"))
+        mode = "fp8" if x.shape[0] >= thr else "triton"
+    if BACKEND == "triton" and moe.store.fmt == "nvfp4" and x.is_xpu and mode in ("fp8", "bf16"):
+        return _nvfp4_via_scratch(moe, x, weights, ids, mode == "fp8")
+    if BACKEND == "triton" and moe.store.fmt == "nvfp4" and (x.is_xpu or ref_interp()):
+        from .triton_moe_nvfp4 import nvfp4_moe
+
+        t = moe.store.t
+        return nvfp4_moe(x, weights, ids, t["w13_packed"], t["w13_bscale"], t["w13_factor"],
+                         t["w2_packed"], t["w2_bscale"], t["w2_factor"], moe.gate_cap, moe.up_cap)
     return ref.moe_experts(x, weights, ids, moe.expert_weights, moe.num_experts,
                            moe.gate_cap, moe.up_cap)

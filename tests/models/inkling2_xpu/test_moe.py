@@ -16,10 +16,10 @@ from vllm.models.inkling2.xpu.ops import ref
 DEV = os.environ.get("INKLING2_TEST_DEVICE", "cpu")
 
 
-@pytest.mark.parametrize("fmt", ["bf16", "fp8"])
+@pytest.mark.parametrize("fmt", ["bf16", "fp8", "nvfp4/fp8", "nvfp4/bf16", "nvfp4/triton"])
 @pytest.mark.parametrize("tokens", [1, 7, 64, 300])
 def test_experts_kernel(fmt, tokens):
-    if DEV == "cpu":
+    if DEV == "cpu" and fmt != "nvfp4":
         pytest.skip("XPU only")
     g = torch.Generator().manual_seed(2)
     E, H, I, K = 128, 2304, 1152, 8
@@ -30,6 +30,8 @@ def test_experts_kernel(fmt, tokens):
         parts[f"{n}_weight_scale"] = (torch.rand(E, r, c // 16, generator=g) * 2 + 0.25).to(torch.float8_e4m3fn)
         parts[f"{n}_weight_amax"] = torch.rand(E, generator=g) * 0.5 + 0.5
         parts[f"{n}_weight_outer_scale_denominator"] = torch.tensor([2688.0 / 3])
+    fmt, _, compute = fmt.partition("/")
+    os.environ["VLLM_INKLING2_NVFP4_COMPUTE"] = compute or "auto"
     store = ExpertStore(fmt)
     store.build(parts, DEV)
     moe = SimpleNamespace(store=store, top_k=K, num_experts=E, gate_cap=4.0, up_cap=25.0,
@@ -40,4 +42,6 @@ def test_experts_kernel(fmt, tokens):
     got = ops.experts(moe, x, w, ids)
     want = ref.moe_experts(x, w, ids, store.expert_weights, E, 4.0, 25.0)
     rel = ((got.float() - want.float()).norm() / want.float().norm()).item()
-    assert rel < 2e-2, rel
+    # the fp8 scratch carries the per-expert fp8 re-encode (3% on random codes,
+    # 1.4% measured on the checkpoint's NVFP4 layers)
+    assert rel < (8e-2 if compute == "fp8" else 2e-2), rel
