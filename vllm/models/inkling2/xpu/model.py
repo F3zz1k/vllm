@@ -93,6 +93,7 @@ class Inkling2Attention(nn.Module):
         self.q_scale = _param(H, D)
         self.r_scale = _param(H, R)
         self.rel_proj = _param(R, self.rel_extent)
+        self.int8 = False  # int8 dense weights (set after loading)
         if self.is_local:
             self.k_conv = _param(Hk * D, self.kernel, dtype=torch.float32)
             self.v_conv = _param(Hk * D, self.kernel, dtype=torch.float32)
@@ -124,7 +125,7 @@ class Inkling2Attention(nn.Module):
             out["vdyn"] = (off, self.dyn)
         return out
 
-    def _project(self, xq, xk, xv, stacked=None):
+    def _project(self, xq, xk, xv, stacked=None, rows_q=None):
         nq = sum(self.q_sizes)
         nk = self.k_size + self.dyn
         w, s = self.qkvr, getattr(self, "qkvr_s", None)
@@ -132,21 +133,22 @@ class Inkling2Attention(nn.Module):
         if stacked is not None and T <= 64:
             # decode sizes are weight-bandwidth bound: one GEMM over the three inputs
             # (3T rows, all of qkvr) costs one weight read instead of three GEMM floors
-            y = ops.linear(stacked.reshape(3 * T, -1), w, s)
+            y = ops.linear(stacked.reshape(3 * T, -1), w, s, xq=rows_q)
             return y[:T, :nq], y[T:2 * T, nq:nq + nk], y[2 * T:, nq + nk:]
 
         def part(x, a, b):
             return ops.linear(x, w[a:b], None if s is None else s[a:b])
 
         if xq is xk and xk is xv:
-            y = ops.linear(xq, w, s)
+            y = ops.linear(xq, w, s, xq=rows_q)
             return y[:, :nq], y[:, nq:nq + nk], y[:, nq + nk:]
         return part(xq, 0, nq), part(xk, nq, nq + nk), part(xv, nq + nk, w.shape[0])
 
-    def forward(self, positions, xq, xk, xv, tau, pass_idx: int, stacked=None) -> torch.Tensor:
+    def forward(self, positions, xq, xk, xv, tau, pass_idx: int, stacked=None,
+                rows_q=None) -> torch.Tensor:
         T = xq.shape[0]
         H, Hk, D, R = self.num_heads, self.num_kv_heads, self.head_dim, self.d_rel
-        yq, yk, yv = self._project(xq, xk, xv, stacked)
+        yq, yk, yv = self._project(xq, xk, xv, stacked, rows_q)
         q_lin, r_lin, gate_lin, sink = yq.split(self.q_sizes, -1)
         k_lin, v_lin = yk[:, :self.k_size], yv[:, :self.v_size]
         kv_owner = self.kv_caches[pass_idx]
@@ -173,12 +175,15 @@ class Inkling2Attention(nn.Module):
             ops.conv(conv_owner, conv_md, "v", v_lin, self.v_static,
                      dyn=yv[:, self.v_size:], norm=2, eps=self.eps, **kw)
 
+        rows_o = None
         if attn_md is None:
             out = torch.zeros(T, H * D, dtype=torch.bfloat16, device=xq.device)
         else:  # sinks and the sigmoid output gate applied inside
             out = ops.attention(kv_owner, attn_md, q, rel_logits, sink, self.scale,
-                                self.window, self.rel_extent, gate=gate_lin)
-        o = ops.linear(out, self.wo, getattr(self, "wo_s", None))
+                                self.window, self.rel_extent, gate=gate_lin, quant=self.int8)
+            if self.int8:
+                out, rows_o = out
+        o = ops.linear(out, self.wo, getattr(self, "wo_s", None), xq=rows_o)
         return o if get_tensor_model_parallel_world_size() == 1 else tensor_model_parallel_all_reduce(o)
 
 
@@ -271,13 +276,18 @@ class Inkling2DecoderLayer(nn.Module):
         conv_owner = self.attn.conv_states[pass_idx]
         conv_md = layer_metadata(conv_owner.prefix)
         xs = None  # (3, T, D) contiguous when q, k and v inputs differ
+        rows_q = None  # int8 rows of the qkvr input(s), from the producing kernel
         if attn_query is None:  # layer 0: no mix
             xq = xk = xv = ops.rms_norm(h, self.attn_norm[0], self.eps)
         elif messages is None:  # mixes and their RMSNorms in one kernel
-            xs = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps)
+            xs, rows_q = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps,
+                                      quant=self.attn.int8)
             xq, xk, xv = (xs[0], xs[0], xs[0]) if self.is_local else xs.unbind(0)
             if self.is_local:
                 xs = None
+                if rows_q is not None:
+                    T = h.shape[0]
+                    rows_q = (rows_q[0][:T], rows_q[1][:T])
         else:
             mixes = ops.attn_res(stack, n, h, None, attn_query)  # fp32 (1 or 3, T, D)
             dests = mixes.expand(3, -1, -1) if self.is_local else mixes
@@ -286,7 +296,8 @@ class Inkling2DecoderLayer(nn.Module):
             xq, xk, xv = xs.unbind(0)
 
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx,
-                      stacked=xs if xs is not None and xs.is_contiguous() else None)
+                      stacked=xs if xs is not None and xs.is_contiguous() else None,
+                      rows_q=rows_q)
         a = ops.conv(conv_owner, conv_md, "attn", a, self.attn_conv)
         if self.boundary:
             stack[n].copy_(h)
@@ -477,6 +488,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
         if ops.dense_format() == "int8":
             for layer in self.model.layers:
                 a = layer.attn
+                a.int8 = True
                 for name in ("qkvr", "wo"):
                     q, sc = ops.quant_rows_int8(getattr(a, name).data)
                     setattr(a, name, nn.Parameter(q, requires_grad=False))

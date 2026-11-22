@@ -100,6 +100,50 @@ def attn_post(o, lse, sinks, gate, out, n):
 
 
 @triton.jit
+def _attn_post_q_kernel(O, LSE, Sink, Gate, Out, XQ, XS, n, s_lse, s_sink, s_gate,
+                        H: tl.constexpr, HP: tl.constexpr, D: tl.constexpr):
+    # one program per token: the gated row (H * D) and its per-token int8 quant
+    t = tl.program_id(0)
+    h = tl.arange(0, HP)
+    d = tl.arange(0, D)
+    hm = h < H
+    m = hm[:, None]
+    if t >= n:
+        tl.store(Out + t * (H * D) + h[:, None] * D + d[None, :], tl.zeros((HP, D), tl.bfloat16),
+                 mask=m)
+        tl.store(XQ + t * (H * D) + h[:, None] * D + d[None, :], tl.zeros((HP, D), tl.int8), mask=m)
+        tl.store(XS + t, 1e-10)
+        return
+    o = tl.load(O + (t * H + h[:, None]) * D + d[None, :], mask=m, other=0.0).to(tl.float32)
+    z = tl.load(LSE + h * s_lse + t, mask=hm, other=0.0) - tl.load(
+        Sink + t * s_sink + h, mask=hm, other=0.0).to(tl.float32)
+    o = (o / (1.0 + tl.exp(-z))[:, None]).to(tl.bfloat16).to(tl.float32)
+    g = tl.load(Gate + t * s_gate + h[:, None] * D + d[None, :], mask=m, other=0.0).to(tl.float32)
+    y = (o / (1.0 + tl.exp(-g))).to(tl.bfloat16)
+    tl.store(Out + t * (H * D) + h[:, None] * D + d[None, :], y, mask=m)
+    yf = tl.where(m, y.to(tl.float32), 0.0)
+    sc = tl.maximum(tl.max(tl.max(tl.abs(yf), 1), 0) / 127.0, 1e-10)
+    x = yf / sc
+    f = tl.floor(x)
+    r = x - f
+    up = (r > 0.5) | ((r == 0.5) & ((f - 2.0 * tl.floor(f * 0.5)) != 0.0))  # half to even
+    tl.store(XQ + t * (H * D) + h[:, None] * D + d[None, :], tl.where(up, f + 1.0, f).to(tl.int8),
+             mask=m)
+    tl.store(XS + t, sc)
+
+
+def attn_post_q(o, lse, sinks, gate, out, n, xq, xs):
+    """attn_post plus the per-token int8 rows (xq (T, H*D) int8, xs (T,) fp32) of the
+    output, for an int8 GEMM; decode sizes (one program per token)."""
+    T, H, D = o.shape
+    if T:
+        _attn_post_q_kernel[(T,)](o, lse, sinks, gate, out, xq, xs, n, lse.stride(0),
+                                  sinks.stride(0), gate.stride(0), H=H,
+                                  HP=triton.next_power_of_2(H), D=D, num_warps=8)
+    return out
+
+
+@triton.jit
 def _route_kernel(X, W, Logits, Bias, Ids, Wts, H, scale, E: tl.constexpr, TOPK: tl.constexpr,
                   BK: tl.constexpr, LOGITS_IN: tl.constexpr):
     t = tl.program_id(0)

@@ -36,22 +36,24 @@ def ref_interp() -> bool:
 
 def attn_res(stack: torch.Tensor, n: int, last: torch.Tensor, addend: torch.Tensor | None,
              queries: torch.Tensor, norm_weight: torch.Tensor | None = None,
-             norm_eps: float = 1e-6) -> torch.Tensor:
+             norm_eps: float = 1e-6, quant: bool = False):
     """Block AttnRes over `[*stack[:n], last (+ addend)]` with normalized values,
     one mix per query row: fp32 `(Q, T, D)`, or bf16 RMS-normalized with the
-    matching row of `norm_weight` `(Q, D)` (the next sublayer's norm, fused)."""
+    matching row of `norm_weight` `(Q, D)` (the next sublayer's norm, fused). With
+    `quant`: (out, int8 rows or None), the rows for an int8 GEMM, fused at decode sizes."""
     if BACKEND == "triton" and last.is_xpu or (BACKEND == "triton" and ref_interp()):
         from .triton_attn_res import attn_res as tri
 
         return tri(stack[:n], last.contiguous(), None if addend is None else addend.contiguous(),
                    queries.contiguous(), None if norm_weight is None else norm_weight.contiguous(),
-                   norm_eps, True)
+                   norm_eps, True, quant=quant and norm_weight is not None)
     partial = last.float() if addend is None else last.float() + addend.float()
     mixes = ref.attn_res(stack[:n], partial, queries)
     if norm_weight is None:
         return mixes
-    return torch.stack([ref.rms_norm(mixes[q], norm_weight[q], norm_eps)
-                        for q in range(mixes.shape[0])])
+    out = torch.stack([ref.rms_norm(mixes[q], norm_weight[q], norm_eps)
+                       for q in range(mixes.shape[0])])
+    return (out, None) if quant else out
 
 
 def qkr(attn, yq: torch.Tensor, tau: torch.Tensor | None, fused: bool):
@@ -191,18 +193,26 @@ def sycl_ready(owner) -> bool:
 
 
 def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
-              rel_extent: int, gate: torch.Tensor | None = None) -> torch.Tensor:
+              rel_extent: int, gate: torch.Tensor | None = None, quant: bool = False):
     """Attention over the visit's KV cache (K/V already stored by `conv`): (T, H, D)
-    bf16, or with `gate` (T, H*D) the sigmoid-gated output (T, H*D) bf16."""
+    bf16, or with `gate` (T, H*D) the sigmoid-gated output (T, H*D) bf16. With `quant`
+    (gated, decode sizes, SYCL path): (gated, (int8 rows, fp32 scales)) for an int8 GEMM."""
     T, H, D = q.shape
     out = torch.zeros_like(q)
     gated = None if gate is None else torch.empty((T, H * D), dtype=q.dtype, device=q.device)
-    _attention_into(out, q, rel_logits, sinks, gated, gate, owner=owner, scale=scale,
-                    window=window, rel_extent=rel_extent)
-    return out if gate is None else gated
+    qbuf = None
+    if quant and gate is not None and T <= 16 and sycl_ready(owner):
+        qbuf = (torch.empty((T, H * D), dtype=torch.int8, device=q.device),
+                torch.empty((T,), dtype=torch.float32, device=q.device))
+    _attention_into(out, q, rel_logits, sinks, gated, gate, None if qbuf is None else qbuf[0],
+                    None if qbuf is None else qbuf[1], owner=owner, scale=scale, window=window,
+                    rel_extent=rel_extent)
+    if gate is None:
+        return out
+    return (gated, qbuf) if quant else gated
 
 
-def _attention_into(out, q, rel_logits, sinks, gated, gate, *, owner, scale, window,
+def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, scale, window,
                     rel_extent):
     """Writes `out` in place. The kernels take host-side lengths (max query / key
     length, token count), so under breakable XPU graphs this is an eager break: on
@@ -223,13 +233,16 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, *, owner, scale, win
         splits = (int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
                   if window is None else 4) if decode else 1
         if gated is not None:
-            from .triton_glue import attn_post
+            from .triton_glue import attn_post, attn_post_q
 
             _, lse = sycl_attention.rel_attention(
                 q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], md.block_table, md.seq_lens,
                 md.query_start_loc, scale, window, md.max_query_len, md.max_seq_len,
                 num_splits=splits, out=out[:n], return_lse=True)
-            attn_post(out, lse, sinks, gate, gated, n)
+            if xq is not None:
+                attn_post_q(out, lse, sinks, gate, gated, n, xq, xs)
+            else:
+                attn_post(out, lse, sinks, gate, gated, n)
             return
         sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n],
                                      md.block_table, md.seq_lens, md.query_start_loc,
@@ -309,16 +322,19 @@ def quant_rows_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, s
 
 
-def linear(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor | None = None) -> torch.Tensor:
+def linear(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor | None = None,
+           xq: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
     """x @ w.T: bf16, or W8A8 (int8 rows of `w` with fp32 `w_scale`; activations int8
-    per token, quantised here; oneDNN int8 GEMM, bf16 out)."""
+    per token, from the producing kernel (`xq`: int8 rows, fp32 scales) or quantised
+    here; oneDNN int8 GEMM, bf16 out)."""
     if w.dtype != torch.int8:
         return F.linear(x, w)
-    from vllm import _custom_ops as vops
+    if xq is None:
+        from vllm import _custom_ops as vops
 
-    xq, xs, _ = vops.scaled_int8_quant(x.contiguous(), None, None, True)
-    return torch.ops._xpu_C.int8_scaled_mm(xq, xs.reshape(-1).float(), w.t(), w_scale,
-                                           x.dtype, None)
+        q, sc, _ = vops.scaled_int8_quant(x.contiguous(), None, None, True)
+        xq = (q, sc.reshape(-1).float())
+    return torch.ops._xpu_C.int8_scaled_mm(xq[0], xq[1], w.t(), w_scale, x.dtype, None)
 
 
 def route_fused(x, weight, bias, top_k: int, route_scale: float):

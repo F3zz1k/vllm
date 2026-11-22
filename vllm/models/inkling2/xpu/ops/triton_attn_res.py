@@ -31,9 +31,19 @@ def _src(Stack, s_st, Last, Addend, t, s_row, d, dm, n: tl.constexpr, N_STACK: t
 
 
 @triton.jit
-def _attn_res_kernel(Stack, Last, Addend, Q, W, Out, s_st, s_row, s_oq, s_ot, eps, norm_eps,
-                     D: tl.constexpr, N_STACK: tl.constexpr, HAS_ADDEND: tl.constexpr,
-                     APPLY_NORM: tl.constexpr, BLOCK: tl.constexpr, NP2: tl.constexpr):
+def _rint(x):
+    # round half to even, as the vendor's per-token int8 quant
+    f = tl.floor(x)
+    d = x - f
+    up = (d > 0.5) | ((d == 0.5) & ((f - 2.0 * tl.floor(f * 0.5)) != 0.0))
+    return tl.where(up, f + 1.0, f)
+
+
+@triton.jit
+def _attn_res_kernel(Stack, Last, Addend, Q, W, Out, OutB, XQ, XS, s_st, s_row, s_oq, s_ot, eps,
+                     norm_eps, D: tl.constexpr, N_STACK: tl.constexpr, HAS_ADDEND: tl.constexpr,
+                     APPLY_NORM: tl.constexpr, BLOCK: tl.constexpr, NP2: tl.constexpr,
+                     QUANT: tl.constexpr):
     qi = tl.program_id(0)
     t = tl.program_id(1)
     N: tl.constexpr = N_STACK + 1
@@ -70,21 +80,30 @@ def _attn_res_kernel(Stack, Last, Addend, Q, W, Out, s_st, s_row, s_oq, s_ot, ep
             tl.store(Out + qi * s_oq + t * s_ot + d, acc, mask=dm)  # fp32 scratch row
         else:
             tl.store(Out + qi * s_oq + t * s_ot + d, acc, mask=dm)
-    if APPLY_NORM:
+    if APPLY_NORM:  # bf16 out (OutB), and with QUANT (one chunk per row) int8 rows + scales
         r = 1.0 / tl.sqrt(ss_out / D + norm_eps)
         for c in tl.static_range(0, D, BLOCK):
             d = c + tl.arange(0, BLOCK)
             dm = d < D
             acc = tl.load(Out + qi * s_oq + t * s_ot + d, mask=dm, other=0.0)
             w = tl.load(W + qi * D + d, mask=dm, other=0.0).to(tl.float32)
-            tl.store(Out + qi * s_oq + t * s_ot + d, w * (acc * r), mask=dm)
+            y = (w * (acc * r)).to(tl.bfloat16)
+            tl.store(OutB + qi * s_oq + t * s_ot + d, y, mask=dm)
+            if QUANT:
+                yf = y.to(tl.float32)
+                sc = tl.maximum(tl.max(tl.abs(yf), 0) / 127.0, 1e-10)
+                qv = _rint(yf / sc)
+                tl.store(XQ + (qi * (s_oq // D) + t) * D + d, qv.to(tl.int8), mask=dm)
+                tl.store(XS + qi * (s_oq // D) + t, sc)
 
 
 def attn_res(stack: torch.Tensor, last: torch.Tensor, addend: torch.Tensor | None,
              queries: torch.Tensor, norm_weight: torch.Tensor | None, norm_eps: float,
-             normalize_values: bool = True, eps: float = 1e-6) -> torch.Tensor:
+             normalize_values: bool = True, eps: float = 1e-6, quant: bool = False):
     """stack (N, T, D) (N may be 0), last/addend (T, D), queries fp32 (Q, D);
-    returns fp32 (Q, T, D), or bf16 normalized with norm_weight (Q, D)."""
+    returns fp32 (Q, T, D), or bf16 normalized with norm_weight (Q, D). With `quant`
+    (and norm_weight) returns (bf16 out, (int8 (Q*T, D), fp32 scales (Q*T,))) when the
+    rows are decode-sized, else (bf16 out, None)."""
     assert normalize_values
     T, D = last.shape
     Q = queries.shape[0]
@@ -92,15 +111,25 @@ def attn_res(stack: torch.Tensor, last: torch.Tensor, addend: torch.Tensor | Non
     assert last.stride(1) == 1 and (N == 0 or (stack.stride(1) == last.stride(0)
                                                and stack.stride(2) == 1))
     out = torch.empty((Q, T, D), dtype=torch.float32, device=last.device)
+    outb = (torch.empty((Q, T, D), dtype=torch.bfloat16, device=last.device)
+            if norm_weight is not None else out)
     # decode sizes have only Q * T programs: give each one the whole row
     # (measured 6-14 us vs 21-42 us per call at T=1; 4096/16 warps miscompiles)
-    blk, nw = (triton.next_power_of_2(D), 32) if T <= 16 else (1024, 8)
+    whole = T <= 16
+    blk, nw = (triton.next_power_of_2(D), 32) if whole else (1024, 8)
+    do_q = quant and whole and norm_weight is not None
+    xq = torch.empty((Q * T, D), dtype=torch.int8, device=last.device) if do_q else out
+    xs = torch.empty((Q * T,), dtype=torch.float32, device=last.device) if do_q else out
     if T:
         _attn_res_kernel[(Q, T)](
             stack if N else last, last, addend if addend is not None else last, queries,
-            norm_weight if norm_weight is not None else queries, out,
+            norm_weight if norm_weight is not None else queries, out, outb, xq, xs,
             stack.stride(0) if N else 0, last.stride(0), out.stride(0), out.stride(1), eps,
             norm_eps, D=D, N_STACK=N, HAS_ADDEND=addend is not None,
             APPLY_NORM=norm_weight is not None, BLOCK=blk, NP2=triton.next_power_of_2(N + 1),
-            num_warps=nw)
-    return out if norm_weight is None else out.to(torch.bfloat16)
+            QUANT=do_q, num_warps=nw)
+    if norm_weight is None:
+        return out
+    if quant:
+        return outb, ((xq, xs) if do_q else None)
+    return outb

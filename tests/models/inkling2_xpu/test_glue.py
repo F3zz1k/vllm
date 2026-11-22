@@ -93,3 +93,47 @@ def test_blend(S, T):
     x = (1 - torch.tanh(gf[..., DM:])) * dests + torch.tanh(gf[..., :DM]) * msgs
     want = ref.rms_norm(x, w[:, None, :], 1e-6)
     assert _rel(got, want) < 1e-2
+
+
+def _vendor_q(x):
+    from vllm import _custom_ops as vops
+
+    q, s, _ = vops.scaled_int8_quant(x.contiguous(), None, None, True)
+    return q, s.reshape(-1).float()
+
+
+@pytest.mark.parametrize("Q,T", [(1, 1), (3, 4)])
+def test_attn_res_quant(Q, T):
+    _skip()
+    from vllm.models.inkling2.xpu.ops.triton_attn_res import attn_res as tri
+
+    stack = torch.randn(2, T, DM, device=DEV)
+    last = torch.randn(T, DM, device=DEV).bfloat16()
+    qs = torch.randn(Q, DM, device=DEV) * DM ** -0.5
+    w = (torch.rand(Q, DM, device=DEV) + 0.5).bfloat16()
+    out, (xq, xs) = tri(stack, last, None, qs, w, 1e-6, True, quant=True)
+    q0, s0 = _vendor_q(out.reshape(Q * T, DM))
+    # the vendor rounds its scale to bf16; ours keeps the exact fp32 absmax / 127
+    assert ((xs - s0).abs() / s0).max().item() <= 8e-3
+    assert (xq.int() - q0.int()).abs().max().item() <= 1
+
+
+def test_attn_post_quant():
+    _skip()
+    from vllm.models.inkling2.xpu.ops.triton_glue import attn_post, attn_post_q
+
+    T, n = 4, 3
+    o = torch.randn(T, H, D, device=DEV).bfloat16()
+    lse = torch.randn(H, T, device=DEV)
+    y = torch.randn(T, 64 + H * D, device=DEV).bfloat16()
+    sinks, gate = y[:, :H], y[:, 64:]
+    a = torch.empty(T, H * D, device=DEV, dtype=torch.bfloat16)
+    b = torch.empty_like(a)
+    xq = torch.empty(T, H * D, device=DEV, dtype=torch.int8)
+    xs = torch.empty(T, device=DEV)
+    attn_post(o, lse, sinks, gate, a, n)
+    attn_post_q(o, lse, sinks, gate, b, n, xq, xs)
+    assert torch.equal(a, b)
+    q0, s0 = _vendor_q(a[:n])
+    assert ((xs[:n] - s0).abs() / s0).max().item() <= 8e-3
+    assert (xq[:n].int() - q0.int()).abs().max().item() <= 1
