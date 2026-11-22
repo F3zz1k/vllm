@@ -24,7 +24,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.config import VllmConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
@@ -61,8 +66,13 @@ class Inkling2Attention(nn.Module):
         super().__init__()
         self.is_local = layer_id in config.local_layer_ids
         c = config
-        self.num_heads = c.swa_num_attention_heads if self.is_local else c.num_attention_heads
-        self.num_kv_heads = c.swa_num_key_value_heads if self.is_local else c.num_key_value_heads
+        tp = get_tensor_model_parallel_world_size()
+        heads = c.swa_num_attention_heads if self.is_local else c.num_attention_heads
+        kv_heads = c.swa_num_key_value_heads if self.is_local else c.num_key_value_heads
+        assert heads % tp == 0 and kv_heads % tp == 0, (heads, kv_heads, tp)
+        # TP shards the heads (q heads h*3..h*3+2 share kv head h, contiguous per rank)
+        self.num_heads = heads // tp
+        self.num_kv_heads = kv_heads // tp
         self.head_dim = c.swa_head_dim if self.is_local else c.head_dim
         self.d_rel = c.d_rel
         self.window = c.sliding_window_size if self.is_local else None
@@ -114,10 +124,16 @@ class Inkling2Attention(nn.Module):
             out["vdyn"] = (off, self.dyn)
         return out
 
-    def _project(self, xq, xk, xv):
+    def _project(self, xq, xk, xv, stacked=None):
         nq = sum(self.q_sizes)
         nk = self.k_size + self.dyn
         w, s = self.qkvr, getattr(self, "qkvr_s", None)
+        T = xq.shape[0]
+        if stacked is not None and T <= 64:
+            # decode sizes are weight-bandwidth bound: one GEMM over the three inputs
+            # (3T rows, all of qkvr) costs one weight read instead of three GEMM floors
+            y = ops.linear(stacked.reshape(3 * T, -1), w, s)
+            return y[:T, :nq], y[T:2 * T, nq:nq + nk], y[2 * T:, nq + nk:]
 
         def part(x, a, b):
             return ops.linear(x, w[a:b], None if s is None else s[a:b])
@@ -127,10 +143,10 @@ class Inkling2Attention(nn.Module):
             return y[:, :nq], y[:, nq:nq + nk], y[:, nq + nk:]
         return part(xq, 0, nq), part(xk, nq, nq + nk), part(xv, nq + nk, w.shape[0])
 
-    def forward(self, positions, xq, xk, xv, tau, pass_idx: int) -> torch.Tensor:
+    def forward(self, positions, xq, xk, xv, tau, pass_idx: int, stacked=None) -> torch.Tensor:
         T = xq.shape[0]
         H, Hk, D, R = self.num_heads, self.num_kv_heads, self.head_dim, self.d_rel
-        yq, yk, yv = self._project(xq, xk, xv)
+        yq, yk, yv = self._project(xq, xk, xv, stacked)
         q_lin, r_lin, gate_lin, sink = yq.split(self.q_sizes, -1)
         k_lin, v_lin = yk[:, :self.k_size], yv[:, :self.v_size]
         kv_owner = self.kv_caches[pass_idx]
@@ -162,27 +178,38 @@ class Inkling2Attention(nn.Module):
         else:  # sinks and the sigmoid output gate applied inside
             out = ops.attention(kv_owner, attn_md, q, rel_logits, sink, self.scale,
                                 self.window, self.rel_extent, gate=gate_lin)
-        return ops.linear(out, self.wo, getattr(self, "wo_s", None))
+        o = ops.linear(out, self.wo, getattr(self, "wo_s", None))
+        return o if get_tensor_model_parallel_world_size() == 1 else tensor_model_parallel_all_reduce(o)
 
 
 class Inkling2MoE(nn.Module):
     def __init__(self, config: Inkling2ModelConfig, layer_id: int) -> None:
         super().__init__()
         self.layer_id = layer_id
-        self.num_experts = config.n_routed_experts
+        # EP = TP: rank r holds experts [r * E / tp, (r + 1) * E / tp); routing is replicated
+        self.ep_size = get_tensor_model_parallel_world_size()
+        self.ep_rank = get_tensor_model_parallel_rank()
+        self.total_experts = config.n_routed_experts
+        assert self.total_experts % self.ep_size == 0
+        self.num_experts = self.total_experts // self.ep_size
+        self.expert_start = self.ep_rank * self.num_experts
+        self.expert_map = None
         self.top_k = config.num_experts_per_tok
         self.route_scale = config.route_scale
         self.gate_cap = config.mlp_gate_softcap
         self.up_cap = config.mlp_up_softcap
-        self.gate_weight = _param(self.num_experts, config.hidden_size, dtype=torch.float32)
-        self.gate_bias = _param(self.num_experts, dtype=torch.float32)
+        self.gate_weight = _param(self.total_experts, config.hidden_size, dtype=torch.float32)
+        self.gate_bias = _param(self.total_experts, dtype=torch.float32)
         self.store = ExpertStore(expert_format())
         self._parts: dict[str, torch.Tensor] = {}
         self._kernel = None
 
     def load_part(self, name: str, tensor: torch.Tensor) -> None:
         """Collect a layer's checkpoint expert tensors; convert once complete
-        (NVFP4 layers have 8 tensors, MXFP8 layers 4)."""
+        (NVFP4 layers have 8 tensors, MXFP8 layers 4). Under EP only this rank's
+        experts are kept."""
+        if self.ep_size > 1 and tensor.dim() >= 1 and tensor.shape[0] == self.total_experts:
+            tensor = tensor[self.expert_start:self.expert_start + self.num_experts]
         self._parts[name] = tensor
         w13 = self._parts.get("w13_weight")
         if w13 is None:
@@ -201,7 +228,8 @@ class Inkling2MoE(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w, ids = ops.route_fused(x, self.gate_weight, self.gate_bias, self.top_k,
                                  self.route_scale)
-        return ops.experts(self, x, w, ids)
+        out = ops.experts(self, x, w, ids)
+        return out if self.ep_size == 1 else tensor_model_parallel_all_reduce(out)
 
 
 class Inkling2DecoderLayer(nn.Module):
@@ -234,18 +262,23 @@ class Inkling2DecoderLayer(nn.Module):
         a block-boundary layer appends `h` to the stack."""
         conv_owner = self.attn.conv_states[pass_idx]
         conv_md = layer_metadata(conv_owner.prefix)
+        xs = None  # (3, T, D) contiguous when q, k and v inputs differ
         if attn_query is None:  # layer 0: no mix
             xq = xk = xv = ops.rms_norm(h, self.attn_norm[0], self.eps)
         elif messages is None:  # mixes and their RMSNorms in one kernel
             xs = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps)
             xq, xk, xv = (xs[0], xs[0], xs[0]) if self.is_local else xs.unbind(0)
+            if self.is_local:
+                xs = None
         else:
             mixes = ops.attn_res(stack, n, h, None, attn_query)  # fp32 (1 or 3, T, D)
             dests = mixes.expand(3, -1, -1) if self.is_local else mixes
             w = self.attn_norm.expand(3, -1) if self.is_local else self.attn_norm
-            xq, xk, xv = ops.blend(self, slice(0, 3), dests, messages[:3], w, self.eps).unbind(0)
+            xs = ops.blend(self, slice(0, 3), dests, messages[:3], w, self.eps)
+            xq, xk, xv = xs.unbind(0)
 
-        a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx)
+        a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx,
+                      stacked=xs if xs is not None and xs.is_contiguous() else None)
         a = ops.conv(conv_owner, conv_md, "attn", a, self.attn_conv)
         if self.boundary:
             stack[n].copy_(h)
@@ -359,7 +392,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
         tc = vllm_config.model_config.hf_config.text_config
         assert (tc.swa_num_key_value_heads, tc.swa_head_dim) == (tc.num_key_value_heads,
                                                                  tc.head_dim)
-        layout = ConvLayout.make(tc.num_key_value_heads, tc.head_dim, tc.hidden_size)
+        tp = vllm_config.parallel_config.tensor_parallel_size
+        layout = ConvLayout.make(tc.num_key_value_heads // tp, tc.head_dim, tc.hidden_size)
         return (Inkling2ConvState.state_shape(layout, tc.sconv_kernel_size),)
 
     @classmethod
@@ -373,7 +407,6 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
-        assert get_tensor_model_parallel_world_size() == 1, "TP > 1: not yet"
         self.config = config
         self.text_config = tc = config.text_config
         self.model = Inkling2LoopModel(tc, f"{prefix}model" if prefix else "model")
@@ -403,7 +436,10 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
         if hq is None:
             return self.logits_processor(self.lm_head, hidden_states)
         tc = self.text_config
-        logits = ops.linear(hidden_states, hq, self.head_s)[..., :tc.vocab_size]
+        logits = ops.linear(hidden_states, hq, self.head_s)  # this rank's vocab shard
+        if get_tensor_model_parallel_world_size() > 1:
+            logits = tensor_model_parallel_all_gather(logits, dim=-1)
+        logits = logits[..., :tc.vocab_size]
         cap = tc.final_logit_softcapping
         return torch.tanh(logits / cap) * cap
 
@@ -460,16 +496,29 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
         params = dict(self.named_parameters())
         loaded: set[str] = set()
 
+        tp, rank = get_tensor_model_parallel_world_size(), get_tensor_model_parallel_rank()
+
+        def shard(name: str, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+            n = tensor.shape[dim] // tp
+            return tensor.narrow(dim, rank * n, n)
+
         def put(name: str, tensor: torch.Tensor, rows: tuple[int, int] | None = None,
                 index: int | None = None) -> None:
             p = params[name]
+            if tp > 1:  # per-head tensors: this rank's heads
+                if rows is not None:  # a qkvr segment: per head, head-major
+                    tensor = shard(name, tensor, 0)
+                elif name.endswith((".q_scale", ".r_scale", ".k_conv", ".v_conv")):
+                    tensor = shard(name, tensor, 0)
+                elif name.endswith((".wo", ".k_static", ".v_static")):
+                    tensor = shard(name, tensor, 1)
             dst = p.data if index is None else p.data[index]
             if rows is not None:
                 dst = dst[rows[0]:rows[0] + rows[1]]
             if name.endswith(("k_conv", "v_conv", "attn_conv", "mlp_conv")):
                 tensor = tensor.squeeze(1)  # (C, 1, k) -> (C, k)
             if name == "lm_head.weight" or name == "model.embed_tokens.weight":
-                default_weight_loader(p, tensor)
+                getattr(p, "weight_loader", default_weight_loader)(p, tensor)
             else:
                 if "quer" in name and dst.numel() == tensor.numel():
                     tensor = tensor.reshape(dst.shape)  # (D,) pseudo-queries -> (1, D)

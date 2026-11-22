@@ -25,9 +25,19 @@ def gemm(a, w, s, f, out, rows_per_expert):
     return out
 
 
-def moe(x, weights, ids, w13, s13, f13, w2, s2, f2, gate_cap, up_cap):
-    """x bf16 (T, H); weights fp32 / ids int32 (T, k); w13 (E, 2I, H/2) [gate; up] rows,
-    s13 (E, 2I, H/16) e4m3 bytes, f13 (E,); w2 (E, H, I/2), s2, f2 -> bf16 (T, H)."""
+def expert_map(local: int, rank: int, size: int, device) -> torch.Tensor:
+    """Global expert id -> local id on this EP rank (-1 elsewhere)."""
+    import vllm_xpu_kernels.fused_moe_interface  # noqa: F401
+
+    m = torch.empty((local * size,), dtype=torch.int32, device=device)
+    torch.ops._moe_C.init_expert_map(m, local, rank, size)
+    return m
+
+
+def moe(x, weights, ids, w13, s13, f13, w2, s2, f2, gate_cap, up_cap, expert_map=None):
+    """x bf16 (T, H); weights fp32 / ids int32 (T, k) global ids; w13 (E, 2I, H/2) [gate; up]
+    rows of the E local experts, s13 (E, 2I, H/16) e4m3 bytes, f13 (E,); w2 (E, H, I/2), s2,
+    f2 -> bf16 (T, H): this rank's partial sum under EP (`expert_map` from `expert_map()`)."""
     import vllm_xpu_kernels.fused_moe_interface  # noqa: F401  (loads _moe_C / _C)
 
     assert available(), "_inkling2_C with grouped_gemm_nvfp4 is required for nvfp4 experts"
@@ -42,8 +52,9 @@ def moe(x, weights, ids, w13, s13, f13, w2, s2, f2, gate_cap, up_cap):
     unp = torch.empty((T, k), dtype=torch.int32, device=dev)
     torch.ops._moe_C.remap_hidden_states(
         hidden_states=x, hidden_states_scales=None, remapped_hidden_states=remapped,
-        remapped_hidden_states_scales=None, expert_map=None, rows_per_expert=rpe,
-        unpermuted_row_to_permuted_row=unp, topk_ids=ids, total_experts_num=E,
+        remapped_hidden_states_scales=None, expert_map=expert_map, rows_per_expert=rpe,
+        unpermuted_row_to_permuted_row=unp, topk_ids=ids,
+        total_experts_num=E if expert_map is None else expert_map.shape[0],
         local_experts_num=E)
     g1 = gemm(remapped, w13, s13, f13, torch.empty((rows, I2), dtype=x.dtype, device=dev), rpe)
     act = torch.empty((rows, I2 // 2), dtype=x.dtype, device=dev)

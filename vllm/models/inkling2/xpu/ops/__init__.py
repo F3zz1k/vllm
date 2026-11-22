@@ -266,7 +266,8 @@ def _fused_moe(moe):
         k = XpuFusedMoe(w13=t["w13"], w13_scales=t.get("w13_scale"), w13_bias=None,
                         w2=t["w2"], w2_scales=t.get("w2_scale"), w2_bias=None,
                         n_experts_per_token=moe.top_k, activation="situ",
-                        num_experts=moe.num_experts, activation_situ_beta=moe.gate_cap,
+                        num_experts=moe.num_experts, ep_rank=moe.ep_rank, ep_size=moe.ep_size,
+                        activation_situ_beta=moe.gate_cap,
                         activation_situ_linear_beta=moe.up_cap)
         moe._kernel = k
     return k
@@ -329,7 +330,12 @@ def experts(moe, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> t
         from . import moe_nvfp4
 
         t = moe.store.t
+        if moe.ep_size > 1 and moe.expert_map is None:
+            moe.expert_map = moe_nvfp4.expert_map(moe.num_experts, moe.ep_rank, moe.ep_size,
+                                                  x.device)
         return moe_nvfp4.moe(x, weights, ids, t["w13_q"], t["w13_bscale"], t["w13_factor"],
-                             t["w2_q"], t["w2_bscale"], t["w2_factor"], moe.gate_cap, moe.up_cap)
+                             t["w2_q"], t["w2_bscale"], t["w2_factor"], moe.gate_cap, moe.up_cap,
+                             expert_map=moe.expert_map)
+    assert moe.ep_size == 1, "reference experts: no EP"
     return ref.moe_experts(x, weights, ids, moe.expert_weights, moe.num_experts,
                            moe.gate_cap, moe.up_cap)
