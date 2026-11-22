@@ -14,8 +14,12 @@ import os
 import torch
 import torch.nn.functional as F
 
+from vllm.logger import init_logger
+
 from . import ref
 from .ref import log_scaling_tau, message_blend, rms_norm, route  # noqa: F401
+
+logger = init_logger(__name__)
 
 
 def _backend() -> str:
@@ -215,24 +219,50 @@ def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
 _ROWWISE_MAX_Q = int(os.environ.get("VLLM_INKLING2_ROWWISE_MAX_Q", "16"))
 
 
+_ROWWISE_CHECK = os.environ.get("VLLM_INKLING2_ROWWISE_CHECK") == "1"
+_ROWWISE_SPLITS = os.environ.get("VLLM_INKLING2_ROWWISE_SPLITS")
+
+
+def _check_rowwise(md, n, out, qlen):
+    """Debug (VLLM_INKLING2_ROWWISE_CHECK=1, syncs): host-side bounds of the row-wise rows."""
+    bt, lens, _ = (t.cpu() for t in out)
+    qsl, sl = md.query_start_loc.cpu(), md.seq_lens.cpu()
+    page = 64
+    bad = []
+    if int(qsl[-1]) != n:
+        bad.append(f"qsl[-1]={int(qsl[-1])} n={n}")
+    need = (lens + page - 1) // page
+    if int(need.max()) > bt.shape[1]:
+        bad.append(f"lens need {int(need.max())} blocks > table width {bt.shape[1]}")
+    for i in range(n):
+        ids = bt[i, :int(need[i])]
+        if (ids < 0).any():
+            bad.append(f"row {i}: negative block id, lens {int(lens[i])}")
+            break
+    if bad:
+        logger.error("inkling2 rowwise check: %s; qsl %s seq_lens %s qlen %s max_q %s max_k %s",
+                     bad, qsl.tolist()[:40], sl.tolist()[:40], qlen.cpu().tolist()[:40],
+                     md.max_query_len, md.max_seq_len)
+
+
 def _rowwise_metadata(md, n: int):
     """Per-token decode metadata for a batch of short queries: token j of request r (query
     length L_r, S_r keys) attends to its first S_r - L_r + 1 + j keys through r's block table.
-    Cached on the metadata object: FlashAttentionMetadataBuilder.build makes a new one per
-    step, shared by the visits of its KV cache group."""
-    memo = getattr(md, "__dict__", {})  # slotted metadata: no memo, recomputed per visit
-    hit = memo.get("_ink2_rowwise")
-    if hit is not None and hit[0] == n:
-        return hit[1]
+    Never cached: under breakable XPU graphs the runner reuses metadata objects with their
+    buffers updated in place, and a stale table of the same token count faults the device.
+    """
     qsl = md.query_start_loc
     B = qsl.shape[0] - 1
     qlen = qsl[1:] - qsl[:-1]
-    req = torch.repeat_interleave(torch.arange(B, device=qsl.device), qlen, output_size=n)
     tok = torch.arange(n, device=qsl.device, dtype=qsl.dtype)
-    lens = (md.seq_lens[req] - qlen[req] + 1 + (tok - qsl[req])).to(md.seq_lens.dtype)
+    # each token's request, bounded whatever the padding of query_start_loc
+    req = torch.searchsorted(qsl[1:], tok, right=True).clamp_(max=B - 1)
+    lens = (md.seq_lens[req] - qlen[req] + 1 + (tok - qsl[req])).clamp_(min=1)
+    lens = lens.to(md.seq_lens.dtype)
     out = (md.block_table.index_select(0, req), lens,
            torch.arange(n + 1, device=qsl.device, dtype=qsl.dtype))
-    memo["_ink2_rowwise"] = (n, out)
+    if _ROWWISE_CHECK and not torch.xpu.is_current_stream_capturing():
+        _check_rowwise(md, n, out, qlen)
     return out
 
 
@@ -263,12 +293,23 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
         # split count it was captured with.
         splits = (int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
                   if window is None else 4) if decode else 1
+        if decode and md.max_query_len > 1 and _ROWWISE_SPLITS:
+            splits = int(_ROWWISE_SPLITS)
         if gated is not None:
             from .triton_glue import attn_post, attn_post_q
 
             _, lse = sycl_attention.rel_attention(
                 q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], bt, lens, qsl, scale, window,
                 max_q, md.max_seq_len, num_splits=splits, out=out[:n], return_lse=True)
+            if (_ROWWISE_CHECK and md.max_query_len > 1
+                    and not torch.xpu.is_current_stream_capturing()):
+                bad = ~torch.isfinite(out[:n].float()).all(-1).all(-1)
+                if bool(bad.any()) or not bool(torch.isfinite(lse).all()):
+                    rows = bad.nonzero().flatten()[:8].tolist()
+                    logger.error("inkling2 rowwise: non-finite attention rows %s (window %s, "
+                                 "rowwise %s): lens %s, lse finite %s", rows, window,
+                                 max_q == 1, lens[rows].tolist() if max_q == 1 else None,
+                                 bool(torch.isfinite(lse).all()))
             if xq is not None:
                 attn_post_q(out, lse, sinks, gate, gated, n, xq, xs)
             else:

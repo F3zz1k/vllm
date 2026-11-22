@@ -305,8 +305,10 @@ class Inkling2DecoderLayer(nn.Module):
         if attn_query is None:  # layer 0: no mix
             xq = xk = xv = ops.rms_norm(h, self.attn_norm[0], self.eps)
         elif messages is None:  # mixes and their RMSNorms in one kernel
-            xs, rows_q = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps,
-                                      quant=self.attn.int8)
+            xs = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps,
+                              quant=self.attn.int8)
+            if self.attn.int8:  # (mixes, int8 rows); bf16 dense returns the mixes alone
+                xs, rows_q = xs
             xq, xk, xv = (xs[0], xs[0], xs[0]) if self.is_local else xs.unbind(0)
             if self.is_local:
                 xs = None
