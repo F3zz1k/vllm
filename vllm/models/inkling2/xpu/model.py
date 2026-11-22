@@ -225,40 +225,42 @@ class Inkling2DecoderLayer(nn.Module):
         return ops.message_blend(dest, message, self.ctrl_down[i], self.ctrl_gain[i],
                                  self.ctrl_forget[i])
 
-    def forward(self, positions, h, blocks: list[torch.Tensor], attn_query, mlp_query,
-                messages, tau, pass_idx: int):
-        """One visit. `h` is the layer input (bf16), `blocks` the completed
-        AttnRes blocks. Returns the layer output (bf16)."""
+    def forward(self, positions, h, stack, n: int, attn_query, mlp_query, messages, tau,
+                pass_idx: int):
+        """One visit. `h` is the layer input (bf16); `stack[:n]` the completed
+        AttnRes blocks (a persistent buffer). Returns (layer output bf16, n):
+        a block-boundary layer appends `h` to the stack."""
         conv_owner = self.attn.conv_states[pass_idx]
         conv_md = layer_metadata(conv_owner.prefix)
-        n_in = 1 if self.is_local else 3
-        if attn_query is None:
-            mixes = [h] * n_in
+        if attn_query is None:  # layer 0: no mix
+            xq = xk = xv = ops.rms_norm(h, self.attn_norm[0], self.eps)
+        elif messages is None:  # mixes and their RMSNorms in one kernel
+            xs = ops.attn_res(stack, n, h, None, attn_query, self.attn_norm, self.eps)
+            xq, xk, xv = (xs[0], xs[0], xs[0]) if self.is_local else xs.unbind(0)
         else:
-            mixes = list(ops.attn_res(blocks, h, attn_query).unbind(0))
-        if messages is not None:
-            src = [mixes[0]] * 3 if self.is_local else mixes
-            mixes = [self.blend(i, src[i], messages[i]) for i in range(3)]
+            mixes = ops.attn_res(stack, n, h, None, attn_query)  # fp32
+            src = [mixes[0]] * 3 if self.is_local else list(mixes.unbind(0))
             norms = [self.attn_norm[0 if self.is_local else i] for i in range(3)]
-            xq, xk, xv = (ops.rms_norm(m, w, self.eps) for m, w in zip(mixes, norms))
-        elif self.is_local:
-            xq = xk = xv = ops.rms_norm(mixes[0], self.attn_norm[0], self.eps)
-        else:
-            xq, xk, xv = (ops.rms_norm(m, self.attn_norm[i], self.eps)
-                          for i, m in enumerate(mixes))
+            xq, xk, xv = (ops.rms_norm(self.blend(i, src[i], messages[i]), norms[i], self.eps)
+                          for i in range(3))
 
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx)
-        a = ops.conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv).float()
+        a = ops.conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv)
         if self.boundary:
-            mlp_blocks, residual = blocks + [h], a
+            stack[n].copy_(h)
+            n += 1
+            last, addend = a, None
         else:
-            mlp_blocks, residual = blocks, h.float() + a
-        m = ops.attn_res(mlp_blocks, residual, mlp_query)[0]
-        if messages is not None:
-            m = self.blend(3, m, messages[3])
-        m = self.mlp(ops.rms_norm(m, self.mlp_norm, self.eps))
+            last, addend = h, a
+        if messages is None:
+            m = ops.attn_res(stack, n, last, addend, mlp_query, self.mlp_norm.view(1, -1),
+                             self.eps)[0]
+        else:
+            m = ops.attn_res(stack, n, last, addend, mlp_query)[0]
+            m = ops.rms_norm(self.blend(3, m, messages[3]), self.mlp_norm, self.eps)
+        m = self.mlp(m)
         m = ops.conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv)
-        return (residual + m.float()).to(torch.bfloat16)
+        return ops.add3(last, addend, m), n
 
 
 class Inkling2LoopModel(nn.Module):
@@ -288,6 +290,12 @@ class Inkling2LoopModel(nn.Module):
                              torch.zeros(len(core), len(LOOP_STREAMS), D, dtype=torch.float32),
                              persistent=False)
         self.scale = D ** -0.5
+        # completed AttnRes blocks held at once (each pass restarts from the prelude's)
+        nb = mx = 0
+        for i in [*range(core.start), *core, *range(core.stop, config.num_hidden_layers)]:
+            nb += i % config.n_layers_per_attn_res_block == 0
+            mx = max(mx, nb)
+        self.max_blocks = mx
 
     def finish_loading(self) -> None:
         with torch.no_grad():
@@ -301,13 +309,10 @@ class Inkling2LoopModel(nn.Module):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return ops.rms_norm(self.embed_tokens(input_ids), self.embed_norm, self.eps)
 
-    def _visit(self, i, p, positions, h, blocks, messages, tau):
-        layer = self.layers[i]
+    def _visit(self, i, p, positions, h, stack, n, messages, tau):
         attn_query = None if i == 0 else self.attn_queries[i - 1]
-        out = layer(positions, h, blocks, attn_query, self.mlp_queries[i], messages, tau, p)
-        if layer.boundary:
-            blocks = blocks + [h]
-        return out, blocks
+        return self.layers[i](positions, h, stack, n, attn_query, self.mlp_queries[i], messages,
+                              tau, p)
 
     def forward(self, positions: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
         c = self.config
@@ -315,23 +320,26 @@ class Inkling2LoopModel(nn.Module):
         if c.log_scaling_n_floor is not None:
             tau = ops.log_scaling_tau(positions, c.log_scaling_n_floor, c.log_scaling_alpha)
         core = self.core
-        h, blocks = inputs_embeds, []
+        T, D = inputs_embeds.shape
+        stack = inputs_embeds.new_empty((self.max_blocks, T, D))
+        h, n = inputs_embeds, 0
         for i in range(core.start):
-            h, blocks = self._visit(i, 0, positions, h, blocks, None, tau)
-        pre_h, pre_blocks = h, list(blocks)
-        n_pre = len(pre_blocks)
+            h, n = self._visit(i, 0, positions, h, stack, n, None, tau)
+        pre_h, n_pre = h, n
         for i in core:
-            h, blocks = self._visit(i, 0, positions, h, blocks, None, tau)
+            h, n = self._visit(i, 0, positions, h, stack, n, None, tau)
         for p in range(1, c.num_loop_passes):
-            bank, prev_h = blocks[n_pre + 1:], h
-            h, blocks = pre_h, list(pre_blocks)
+            # the previous pass's blocks after the prelude (+1: skip the pre-loop
+            # partial its first layer appended) and its output form the bank
+            bank, nb, prev_h = stack[n_pre + 1:n].clone(), n - n_pre - 1, h
+            h, n = pre_h, n_pre
             for j, i in enumerate(core):
-                messages = ops.attn_res(bank, prev_h, self.message_queries[j])
-                h, blocks = self._visit(i, p, positions, h, blocks, messages, tau)
+                messages = ops.attn_res(bank, nb, prev_h, None, self.message_queries[j])
+                h, n = self._visit(i, p, positions, h, stack, n, messages, tau)
         for i in range(core.stop, c.num_hidden_layers):
-            h, blocks = self._visit(i, 0, positions, h, blocks, None, tau)
-        out = ops.attn_res(blocks, h, self.output_query)[0]
-        return ops.rms_norm(out, self.norm, self.eps)
+            h, n = self._visit(i, 0, positions, h, stack, n, None, tau)
+        return ops.attn_res(stack, n, h, None, self.output_query, self.norm.view(1, -1),
+                            self.eps)[0]
 
 
 class Inkling2LoopForConditionalGeneration(nn.Module):

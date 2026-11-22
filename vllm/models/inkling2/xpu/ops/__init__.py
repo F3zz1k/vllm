@@ -33,13 +33,30 @@ def ref_interp() -> bool:
     return os.environ.get("TRITON_INTERPRET") == "1"
 
 
-def attn_res(blocks: list[torch.Tensor], partial: torch.Tensor,
-             queries: torch.Tensor) -> torch.Tensor:
-    if blocks:
-        stack = torch.stack(blocks, 0)
-    else:
-        stack = partial.new_empty((0, *partial.shape))
-    return ref.attn_res(stack, partial, queries)
+def attn_res(stack: torch.Tensor, n: int, last: torch.Tensor, addend: torch.Tensor | None,
+             queries: torch.Tensor, norm_weight: torch.Tensor | None = None,
+             norm_eps: float = 1e-6) -> torch.Tensor:
+    """Block AttnRes over `[*stack[:n], last (+ addend)]` with normalized values,
+    one mix per query row: fp32 `(Q, T, D)`, or bf16 RMS-normalized with the
+    matching row of `norm_weight` `(Q, D)` (the next sublayer's norm, fused)."""
+    if BACKEND == "triton" and last.is_xpu or (BACKEND == "triton" and ref_interp()):
+        from .triton_attn_res import attn_res as tri
+
+        return tri(stack[:n], last.contiguous(), None if addend is None else addend.contiguous(),
+                   queries.contiguous(), None if norm_weight is None else norm_weight.contiguous(),
+                   norm_eps, True)
+    partial = last.float() if addend is None else last.float() + addend.float()
+    mixes = ref.attn_res(stack[:n], partial, queries)
+    if norm_weight is None:
+        return mixes
+    return torch.stack([ref.rms_norm(mixes[q], norm_weight[q], norm_eps)
+                        for q in range(mixes.shape[0])])
+
+
+def add3(last: torch.Tensor, addend: torch.Tensor | None, m: torch.Tensor) -> torch.Tensor:
+    """(last (+ addend) + m) in fp32, rounded to bf16 once (the layer output)."""
+    y = last.float() if addend is None else last.float() + addend.float()
+    return (y + m.float()).to(torch.bfloat16)
 
 
 def qr_norm(x: torch.Tensor, scale: torch.Tensor, clip: float,
