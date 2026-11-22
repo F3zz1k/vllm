@@ -102,13 +102,14 @@ class ConvLayout:
     attn_off: int
     mlp_off: int
     hidden_per_head: int
-    width: int  # padded row width W
+    width: int  # row width W per head
 
     @staticmethod
     def make(num_kv_heads: int, head_dim: int, hidden: int) -> ConvLayout:
         hph = hidden // num_kv_heads
-        raw = 2 * head_dim + 2 * hph
-        width = 1 << (raw - 1).bit_length()
+        # unpadded: the conv-state page must stay under the attention page so the KV
+        # block stays at 64 tokens (with speculative rows at TP=2 a padded row did not)
+        width = 2 * head_dim + 2 * hph
         return ConvLayout(num_kv_heads, 0, head_dim, head_dim, head_dim,
                           2 * head_dim, 2 * head_dim + hph, hph, width)
 
