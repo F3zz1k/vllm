@@ -212,6 +212,30 @@ def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
     return (gated, qbuf) if quant else gated
 
 
+_ROWWISE_MAX_Q = int(os.environ.get("VLLM_INKLING2_ROWWISE_MAX_Q", "16"))
+
+
+def _rowwise_metadata(md, n: int):
+    """Per-token decode metadata for a batch of short queries: token j of request r (query
+    length L_r, S_r keys) attends to its first S_r - L_r + 1 + j keys through r's block table.
+    Cached on the metadata object: FlashAttentionMetadataBuilder.build makes a new one per
+    step, shared by the visits of its KV cache group."""
+    memo = getattr(md, "__dict__", {})  # slotted metadata: no memo, recomputed per visit
+    hit = memo.get("_ink2_rowwise")
+    if hit is not None and hit[0] == n:
+        return hit[1]
+    qsl = md.query_start_loc
+    B = qsl.shape[0] - 1
+    qlen = qsl[1:] - qsl[:-1]
+    req = torch.repeat_interleave(torch.arange(B, device=qsl.device), qlen, output_size=n)
+    tok = torch.arange(n, device=qsl.device, dtype=qsl.dtype)
+    lens = (md.seq_lens[req] - qlen[req] + 1 + (tok - qsl[req])).to(md.seq_lens.dtype)
+    out = (md.block_table.index_select(0, req), lens,
+           torch.arange(n + 1, device=qsl.device, dtype=qsl.dtype))
+    memo["_ink2_rowwise"] = (n, out)
+    return out
+
+
 def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, scale, window,
                     rel_extent):
     """Writes `out` in place. The kernels take host-side lengths (max query / key
@@ -227,7 +251,14 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
     if _use_sycl_attention() and owner.kv_cache.shape[2] == 64:
         from . import sycl_attention
 
-        decode = md.max_query_len <= 1
+        bt, lens, qsl, max_q = md.block_table, md.seq_lens, md.query_start_loc, md.max_query_len
+        if 1 < max_q <= _ROWWISE_MAX_Q:
+            # short multi-token queries (speculative verify): one decode row per token, each
+            # with its own causal key count, so the split-K decode kernel serves them (the
+            # chunk-prefill kernel has no KV split: a few work-groups per layer at depth)
+            bt, lens, qsl = _rowwise_metadata(md, n)
+            max_q = 1
+        decode = max_q <= 1
         # Fixed per layer type (not per context length): a graph replays the
         # split count it was captured with.
         splits = (int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
@@ -236,17 +267,15 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
             from .triton_glue import attn_post, attn_post_q
 
             _, lse = sycl_attention.rel_attention(
-                q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], md.block_table, md.seq_lens,
-                md.query_start_loc, scale, window, md.max_query_len, md.max_seq_len,
-                num_splits=splits, out=out[:n], return_lse=True)
+                q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], bt, lens, qsl, scale, window,
+                max_q, md.max_seq_len, num_splits=splits, out=out[:n], return_lse=True)
             if xq is not None:
                 attn_post_q(out, lse, sinks, gate, gated, n, xq, xs)
             else:
                 attn_post(out, lse, sinks, gate, gated, n)
             return
-        sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n],
-                                     md.block_table, md.seq_lens, md.query_start_loc,
-                                     scale, window, md.max_query_len, md.max_seq_len,
+        sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], bt, lens,
+                                     qsl, scale, window, max_q, md.max_seq_len,
                                      num_splits=splits, out=out[:n])
         return
     if BACKEND == "triton":
