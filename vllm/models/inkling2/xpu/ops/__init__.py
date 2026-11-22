@@ -289,9 +289,10 @@ def dense_format() -> str:
 
 
 def head_format() -> str:
-    """VLLM_INKLING2_HEAD=bf16 (default) | int8: the output layer."""
+    """VLLM_INKLING2_HEAD=bf16 (default) | int8 | fp32: the output layer (fp32 = the
+    config's head dtype, the weight cast every step)."""
     fmt = os.environ.get("VLLM_INKLING2_HEAD", "bf16").lower()
-    assert fmt in ("bf16", "int8"), fmt
+    assert fmt in ("bf16", "int8", "fp32"), fmt
     return fmt
 
 

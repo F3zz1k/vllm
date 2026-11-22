@@ -439,7 +439,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
             soft_cap=tc.final_logit_softcapping)
         # The config's fp32 head would cast the 0.9 GB weight to fp32 on every step
         # (~9 ms/token on XPU); the reference runs the head in bf16, so do the same.
-        self.logits_processor.head_dtype = None
+        if ops.head_format() != "fp32":
+            self.logits_processor.head_dtype = None
         # a DSpark draft shares the bf16 LM head, so the int8 head keeps the bf16 weight then
         self._keep_head_bf16 = vllm_config.speculative_config is not None
 
