@@ -2,7 +2,7 @@
 
 Text and image serving of [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) on Intel Arc Pro B70
 (Xe2) with vLLM: model code in `vllm/models/inkling2/xpu/`, kernels in `b70/inkling2-kernels/`, image kit in
-`b70/image/`. Work in progress; see "Not done yet".
+`b70/image/`.
 
 ## Tested on
 
@@ -13,8 +13,8 @@ Text and image serving of [Inkling 2 Mini](https://huggingface.co/thinkingmachin
   triton 3.8.0+xpu, oneAPI 2026.1.1 runtime, vllm-xpu-kernels 0.1.16.2 + upstream `6b30c9b` + Lumnus kit patches.
 - Base: the [Lumnus b70-flash-next](https://github.com/Lumnus/b70-flash-next) kit at `v0.32.0-b70.7` (vLLM v0.32.0
   with B70 patches); this branch adds the Inkling 2 model code on top.
-- Checkpoint: the published NVFP4/MXFP8 checkpoint (experts NVFP4 in layers 0-19, MXFP8 in layers 20-23), max model
-  length 32,768.
+- Checkpoint: the published NVFP4/MXFP8 checkpoint (experts NVFP4 in layers 0-19, MXFP8 in layers 20-23), context
+  tested to 512k tokens.
 
 ## Build
 
@@ -59,6 +59,8 @@ SERVE=(serve /models/inkling-2-mini --served-model-name inkling-2-mini --trust-r
   --max-model-len 32768 --gpu-memory-utilization 0.85 --max-num-seqs 32)
 ```
 
+Context fits up to ~64k on one card, ~393k at TP=2 and 1M at TP=4 (512k tested).
+
 `ZE_AFFINITY_MASK` takes Level Zero (SYCL) device indices, which follow ascending PCIe address, not DRM card numbers;
 keep a TP group behind one PCIe switch.
 
@@ -84,75 +86,43 @@ DSpark speculative decoding with the checkpoint's bundled drafter: add
 
 | variable | values (default first) | effect |
 |---|---|---|
-| `VLLM_INKLING2_EXPERTS` | `fp8`, `nvfp4`, `bf16` | routed experts of layers 0-19. `nvfp4` (recommended) runs the checkpoint's NVFP4 bytes directly in `_inkling2_C` (exact, fastest); `fp8` is a per-expert FP8 conversion (~1.4% weight error); `bf16` is exact but does not fit one card |
-| `VLLM_INKLING2_MXFP8` | `fp8`, `bf16` | experts of layers 20-23 (MXFP8 in the checkpoint) |
-| `VLLM_INKLING2_DENSE` | `bf16`, `int8` | attention projections; `int8` is per-row W8A8 (faster decode, top-1 -0.1 to -0.2 pt) |
-| `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme; `fp32` is the config's head dtype (top-1 within noise of `bf16`, ~7 ms/token slower on one card) |
-| `VLLM_INKLING2_PREFILL_EXPERTS` | `nvfp4`, `fp8`, `bf16` | experimental: a second expert copy used only for batches of 64+ tokens. `fp8` at TP=2: prefill +4-6%, KV memory per card 13.75 -> 4.06 GiB; not recommended there. `bf16` untested |
+| `VLLM_INKLING2_EXPERTS` | `fp8`, `nvfp4`, `bf16` | experts of layers 0-19; `nvfp4` (recommended) runs the checkpoint's bytes directly (exact, fastest) |
+| `VLLM_INKLING2_DENSE` | `bf16`, `int8` | attention projections; `int8` = per-row W8A8, faster decode, top-1 -0.1 to -0.2 pt |
+| `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme |
 
-`--max-num-batched-tokens`: 8,192 at TP=1 (16,384 does not fit beside the weights on one card), 16,384 at TP=2/4.
+## Measured (230 W cap, int8 dense + head, NVFP4 experts, XPU graphs)
 
-## Measured (int8 dense + head, NVFP4 experts, XPU graphs, 200 W power cap)
+t/s, no speculation (DSpark k=7). Chat, greedy, 256 tokens, reasoning on; short prompts are the six task prompts of
+[mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu)'s decode bench; "@N" = one fresh
+prompt of N tokens of varied filler plus a task; 32 streams = aggregate on short prompts.
 
-Decode in t/s, no speculation (DSpark k=7 in brackets): chat, greedy, 256 tokens, reasoning on, the six
-task prompts of the decode benchmark in
-[mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu); "@32k" puts ~32k tokens of
-filler before each prompt; 32 streams is aggregate.
-
-| TP | 1 stream | 1 stream @32k | 32 streams | prefill (30k prompt) | top-1 vs BF16 reference |
-|--:|--:|--:|--:|--:|--:|
-| 1 | 64.8 (101.7) | 53.8 (74.5) | 624 (412) | 4.5k t/s | 0.994-0.995 |
-| 2 | 78.4 (132.5) | 61.9 (99.0) | 917 (1,074) | 6.5k t/s | 0.995-0.996 |
-| 4 | 82.2 (165.6) | 76.5 (147.1) | 1,255 (1,345) | 8.2k t/s | 0.995 |
-
-On one card at 32 streams the KV pool is nearly full and DSpark loses; elsewhere it gains 1.1-2x. Prefill
-and top-1 were measured at 230 W. BF16 dense (TP=1/2/4, 230 W): 48 / 59 / 75 t/s @32k, top-1 0.996-0.998.
-
-Long context (TP=4, DSpark): a passcode hidden at 10% / 50% / 90% of varied filler was retrieved in 15 of 15
-prompts at 32k, 64k, 128k, 256k and 512k tokens (512k: ~120 s per answer, prefill included). int8 against
-BF16 dense at 32k and 128k: every needle found by both; greedy outputs identical to the end in 3 of 6, the
-others diverge in wording after 20-60 tokens.
-
-DSpark by workload (TP=1, 230 W, before the verify-attention change below):
-
-| workload | no speculation | DSpark k=7 | acceptance length |
+| | TP=1 | TP=2 | TP=4 |
 |---|--:|--:|--:|
-| task prompts, reasoning on | 64.4 t/s | 107.7 t/s | 3.23 |
-| task prompts, reasoning on, TP=2 | 77.5 t/s | 133.7 t/s | 2.98 |
-| task prompts, reasoning off | 64.5 t/s | 81.4 t/s | 2.67 |
-| short chat turns, reasoning off | 64.6 t/s | 63.8 t/s | 1.82 |
+| decode, short prompts | 64.7 (94.1) | 78.0 (130.4) | 82.7 (168.1) |
+| decode @32k | 55.1 (88.1) | 61.2 (123.8) | 77.2 (176.6) |
+| decode @128k | n/a | 48.2 (98.7) | 70.9 (107.5) |
+| decode @256k | n/a | 35.9 (57.9) | 63.7 (69.4) |
+| decode @512k | n/a | n/a | 53.1 (42.1) |
+| 32 streams | 628 (457) | 929 (1,026) | 1,229 (1,319) |
+| prefill @32k / 128k / 256k / 512k | 4.2k / n/a | 6.5k / 5.3k / 4.1k | 8.1k / 7.2k / 6.0k / 4.6k |
 
-Speculation is a net loss only on short chat with reasoning off (as that project found); the
-config is per server, so a deployment that serves mostly short chat can leave it off. Top-1 is the agreement of the prompt-token argmax
-with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tokens).
+TP=1 is configured for 64k (@60k: 51.0 (83.3) t/s decode, 3.9k t/s prefill). DSpark loses on one card at 32 streams
+(KV pool nearly full), at 512k, and on short chat with reasoning off (63.8 vs 64.6 t/s).
+
+Quality: top-1 agreement with a transformers BF16 reference 0.994-0.995 (BF16 dense weights: 0.996-0.998; 4,421
+prompt tokens). Needle (passcode at 10/50/90% depth) found 15/15 at 32k-512k; int8 and BF16 dense give the same
+answers at 32k and 128k.
 
 ## Known limits
 
-- KV pages must be 64 tokens (vLLM's XPU default): the SYCL attention kernels are built for that page size; other
-  sizes fall back to a slower Triton path.
-- Prefix caching works (the short-conv inputs are per-sequence recurrent states, three per visit, cached in
-  vLLM's align mode). KV offload to CPU stores 37 KiB per cached token at 32k (out-of-window sliding-window
-  blocks are not stored); a 32k restore takes 0.6 s against 15 s of prefill.
-- DSpark's verify step (8 query tokens per request) runs on the split-K decode kernel, one row per token; on
-  the chunk-prefill kernel it had no KV split and DSpark fell below plain decode at depth (TP=4 @32k: 58.5
-  against 76.5 t/s, now 147.1).
-- TP=2 with KV offload to CPU, DSpark and 32 concurrent 8k requests is not stable: a GPU fault on the older
-  verify path, and on the current one an out-of-memory on one rank in the third round (the per-step verify
-  buffers sit outside vLLM's memory profile). `--max-num-seqs 16` is stable; TP=1 and TP=4 pass 32.
-- Images: the vision encoder runs replicated on every rank (torch ops, XPU varlen attention); text-only
-  servers can pass `--limit-mm-per-prompt '{"image":0}'` to skip its memory profile.
-- TP=8 is not blocked (24 query / 8 KV heads and 128 experts divide; each rank then holds 3 query heads,
-  1 KV head and 16 experts) but is untested: this rig has six cards.
-- Decode is GPU-bound under XPU graphs: the device is busy for the whole step, and the per-kernel floor
-  measures 0.7-2.4 us, so further fusion of the ~4 ms of small kernels per token is worth at most a few
-  percent; the expert and int8 dense GEMMs (~9.6 ms per token at TP=1) run at ~60% of memory bandwidth.
-- Not done yet: FP8 / INT8 KV cache, other GPUs.
+- KV pages must be 64 tokens (vLLM's XPU default); other sizes fall back to a slower Triton path.
+- TP=2 + KV offload + DSpark is stable at `--max-num-seqs 16`; at 32 concurrent 8k requests one rank runs out of
+  memory. TP=1 and TP=4 pass 32.
+- Images work (encoder replicated per rank); `--limit-mm-per-prompt '{"image":0}'` frees its memory on text-only servers.
+- TP=8 is not blocked but untested. No expert offload to CPU. No FP8 / INT8 KV cache.
 
 ## Credits
 
 - Model code, DSpark draft and speculator: the upstream vLLM Inkling 2 implementation (NVIDIA), ported here.
-- [mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu), an independent single-B70 port,
-  used as a reference and benchmark (no code taken): its decode benchmark prompts, and its finding that DSpark
-  does not pay on short chat with reasoning off. At the shapes here, its Triton expert path measured 183 / 1,970 /
-  24,475 us per call at 1 / 16 / 4,096 tokens against 122 / 670 / 9,521 us for the grouped GEMM in this branch,
-  and its decode attention 83 / 436 us (local @1k / global @32k) against 46 / 272 us.
+- [mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu): an independent single-B70 port, used
+  as a reference and benchmark only (no code taken); its decode prompts are used above.
