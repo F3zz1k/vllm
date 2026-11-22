@@ -28,9 +28,9 @@ def _clip_round(x, clip):
 
 
 @triton.jit
-def _qkr_kernel(Y, QS, RS, Tau, Proj, Q, Rel, s_y, r_off, q_clip, r_clip,
+def _qkr_kernel(Y, QS, RS, Tau, Proj, Q, Rel, Rout, s_y, r_off, q_clip, r_clip,
                 H: tl.constexpr, D: tl.constexpr, R: tl.constexpr, E: tl.constexpr,
-                BE: tl.constexpr, TAU: tl.constexpr):
+                BE: tl.constexpr, TAU: tl.constexpr, REL: tl.constexpr):
     t = tl.program_id(0)
     h = tl.program_id(1)
     d = tl.arange(0, D)
@@ -45,6 +45,9 @@ def _qkr_kernel(Y, QS, RS, Tau, Proj, Q, Rel, s_y, r_off, q_clip, r_clip,
         q = (q * tau).to(tl.bfloat16).to(tl.float32)
         r = (r * tau).to(tl.bfloat16).to(tl.float32)
     tl.store(Q + (t * H + h) * D + d, q.to(tl.bfloat16))
+    if not REL:  # large batches: r out, the logits as one bf16 GEMM
+        tl.store(Rout + (t * H + h) * R + j, r.to(tl.bfloat16))
+        return
     for e0 in tl.static_range(0, E, BE):
         e = e0 + tl.arange(0, BE)
         p = tl.load(Proj + j[:, None] * E + e[None, :]).to(tl.float32)
@@ -58,12 +61,16 @@ def qkr_prep(y, q_scale, r_scale, tau, proj, H, D, R, r_off, q_clip, r_clip):
     T = y.shape[0]
     E = proj.shape[1]
     q = torch.empty((T, H, D), dtype=torch.bfloat16, device=y.device)
-    rel = torch.empty((T, H, E), dtype=torch.bfloat16, device=y.device)
+    # in-kernel logits win at decode sizes; above that the GEMM does (2.2 ms vs a
+    # fraction at T = 2048)
+    in_kernel = T <= 64
+    rel = torch.empty((T, H, E) if in_kernel else (T, H, R), dtype=torch.bfloat16,
+                      device=y.device)
     if T:
         _qkr_kernel[(T, H)](y, q_scale, r_scale, tau if tau is not None else y, proj, q, rel,
-                            y.stride(0), r_off, q_clip, r_clip, H=H, D=D, R=R, E=E,
-                            BE=min(E, 256), TAU=tau is not None, num_warps=4)
-    return q, rel
+                            rel, y.stride(0), r_off, q_clip, r_clip, H=H, D=D, R=R, E=E,
+                            BE=min(E, 256), TAU=tau is not None, REL=in_kernel, num_warps=4)
+    return q, rel if in_kernel else torch.matmul(rel, proj)
 
 
 @triton.jit
