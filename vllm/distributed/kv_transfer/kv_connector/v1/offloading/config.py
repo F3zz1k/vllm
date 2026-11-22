@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (
     mamba_state_runs,
+    short_conv_state_runs,
 )
 from vllm.utils.math_utils import round_up
 from vllm.v1.core.kv_cache_utils import (
@@ -225,7 +226,10 @@ def build_offloading_config(
         def spec_certifiable(spec: KVCacheSpec) -> bool:
             """Conservative static mirror of _layer_mapping's per-layer checks."""
             if isinstance(spec, MambaSpec):
-                return mamba_state_runs(spec, tp_size, 0) is not None
+                return (
+                    mamba_state_runs(spec, tp_size, 0) is not None
+                    or short_conv_state_runs(spec, tp_size, 0) is not None
+                )
             if not isinstance(spec, AttentionSpec):
                 return False
             if spec.kv_quant_mode.is_per_token_head:
