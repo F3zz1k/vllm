@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 
 from . import ref
 from .ref import log_scaling_tau, message_blend, rms_norm, route  # noqa: F401
@@ -269,6 +270,45 @@ def _fused_moe(moe):
                         activation_situ_linear_beta=moe.up_cap)
         moe._kernel = k
     return k
+
+
+def dense_format() -> str:
+    """VLLM_INKLING2_DENSE=bf16 (default) | int8: the attention projections."""
+    fmt = os.environ.get("VLLM_INKLING2_DENSE", "bf16").lower()
+    assert fmt in ("bf16", "int8"), fmt
+    return fmt
+
+
+def head_format() -> str:
+    """VLLM_INKLING2_HEAD=bf16 (default) | int8: the output layer."""
+    fmt = os.environ.get("VLLM_INKLING2_HEAD", "bf16").lower()
+    assert fmt in ("bf16", "int8"), fmt
+    return fmt
+
+
+def quant_rows_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """(N, K) float -> int8 (N, K) and fp32 (N,) scales: symmetric per row, RTN."""
+    q = torch.empty(w.shape, dtype=torch.int8, device=w.device)
+    s = torch.empty(w.shape[0], dtype=torch.float32, device=w.device)
+    step = max(1, (64 << 20) // (w.shape[1] * 4))
+    for i in range(0, w.shape[0], step):
+        blk = w[i:i + step].float()
+        sc = (blk.abs().amax(1) / 127.0).clamp(min=1e-8)
+        q[i:i + step] = torch.round(blk / sc[:, None]).clamp(-127, 127).to(torch.int8)
+        s[i:i + step] = sc
+    return q, s
+
+
+def linear(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor | None = None) -> torch.Tensor:
+    """x @ w.T: bf16, or W8A8 (int8 rows of `w` with fp32 `w_scale`; activations int8
+    per token, quantised here; oneDNN int8 GEMM, bf16 out)."""
+    if w.dtype != torch.int8:
+        return F.linear(x, w)
+    from vllm import _custom_ops as vops
+
+    xq, xs, _ = vops.scaled_int8_quant(x.contiguous(), None, None, True)
+    return torch.ops._xpu_C.int8_scaled_mm(xq, xs.reshape(-1).float(), w.t(), w_scale,
+                                           x.dtype, None)
 
 
 def route_fused(x, weight, bias, top_k: int, route_scale: float):

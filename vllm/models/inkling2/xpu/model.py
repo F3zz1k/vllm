@@ -115,11 +115,15 @@ class Inkling2Attention(nn.Module):
     def _project(self, xq, xk, xv):
         nq = sum(self.q_sizes)
         nk = self.k_size + self.dyn
+        w, s = self.qkvr, getattr(self, "qkvr_s", None)
+
+        def part(x, a, b):
+            return ops.linear(x, w[a:b], None if s is None else s[a:b])
+
         if xq is xk and xk is xv:
-            y = F.linear(xq, self.qkvr)
+            y = ops.linear(xq, w, s)
             return y[:, :nq], y[:, nq:nq + nk], y[:, nq + nk:]
-        return (F.linear(xq, self.qkvr[:nq]), F.linear(xk, self.qkvr[nq:nq + nk]),
-                F.linear(xv, self.qkvr[nq + nk:]))
+        return part(xq, 0, nq), part(xk, nq, nq + nk), part(xv, nq + nk, w.shape[0])
 
     def forward(self, positions, xq, xk, xv, tau, pass_idx: int) -> torch.Tensor:
         T = xq.shape[0]
@@ -156,7 +160,7 @@ class Inkling2Attention(nn.Module):
         else:  # sinks and the sigmoid output gate applied inside
             out = ops.attention(kv_owner, attn_md, q, rel_logits, sink, self.scale,
                                 self.window, self.rel_extent, gate=gate_lin)
-        return F.linear(out, self.wo)
+        return ops.linear(out, self.wo, getattr(self, "wo_s", None))
 
 
 class Inkling2MoE(nn.Module):
@@ -376,7 +380,30 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         return self.model(positions, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        hq = getattr(self, "head_q", None)
+        if hq is None:
+            return self.logits_processor(self.lm_head, hidden_states)
+        tc = self.text_config
+        logits = ops.linear(hidden_states, hq, self.head_s)[..., :tc.vocab_size]
+        cap = tc.final_logit_softcapping
+        return torch.tanh(logits / cap) * cap
+
+    def _quantize_dense(self) -> None:
+        """VLLM_INKLING2_DENSE / VLLM_INKLING2_HEAD = int8: per-row int8 weights (W8A8)."""
+        if ops.dense_format() == "int8":
+            for layer in self.model.layers:
+                a = layer.attn
+                for name in ("qkvr", "wo"):
+                    q, sc = ops.quant_rows_int8(getattr(a, name).data)
+                    setattr(a, name, nn.Parameter(q, requires_grad=False))
+                    a.register_buffer(f"{name}_s", sc, persistent=False)
+        if ops.head_format() == "int8":
+            q, sc = ops.quant_rows_int8(self.lm_head.weight.data)
+            self.register_buffer("head_q", q, persistent=False)
+            self.register_buffer("head_s", sc, persistent=False)
+            self.lm_head.weight.data = torch.empty(0, dtype=self.lm_head.weight.dtype,
+                                                   device=q.device)
+        torch.xpu.empty_cache() if torch.xpu.is_available() else None
 
     # ---------------------------------------------------------------- weights
 
@@ -462,6 +489,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 else:
                     raise KeyError(f"unexpected weight {ckpt_name}")
         self.model.finish_loading()
+        self._quantize_dense()
         missing = [n for n in params if n not in loaded]
         if missing:
             raise ValueError(f"Inkling2: weights not loaded: {missing[:10]} ({len(missing)})")

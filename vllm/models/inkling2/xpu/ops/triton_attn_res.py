@@ -92,12 +92,15 @@ def attn_res(stack: torch.Tensor, last: torch.Tensor, addend: torch.Tensor | Non
     assert last.stride(1) == 1 and (N == 0 or (stack.stride(1) == last.stride(0)
                                                and stack.stride(2) == 1))
     out = torch.empty((Q, T, D), dtype=torch.float32, device=last.device)
+    # decode sizes have only Q * T programs: give each one the whole row
+    # (measured 6-14 us vs 21-42 us per call at T=1; 4096/16 warps miscompiles)
+    blk, nw = (triton.next_power_of_2(D), 32) if T <= 16 else (1024, 8)
     if T:
         _attn_res_kernel[(Q, T)](
             stack if N else last, last, addend if addend is not None else last, queries,
             norm_weight if norm_weight is not None else queries, out,
             stack.stride(0) if N else 0, last.stride(0), out.stride(0), out.stride(1), eps,
             norm_eps, D=D, N_STACK=N, HAS_ADDEND=addend is not None,
-            APPLY_NORM=norm_weight is not None, BLOCK=512, NP2=triton.next_power_of_2(N + 1),
-            num_warps=4)
+            APPLY_NORM=norm_weight is not None, BLOCK=blk, NP2=triton.next_power_of_2(N + 1),
+            num_warps=nw)
     return out if norm_weight is None else out.to(torch.bfloat16)
