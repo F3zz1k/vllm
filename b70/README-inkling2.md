@@ -125,9 +125,9 @@ with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tok
 - Prefix caching works (the short-conv inputs are per-sequence recurrent states, three per visit, cached in
   vLLM's align mode). KV offload to CPU stores 37 KiB per cached token at 32k (out-of-window sliding-window
   blocks are not stored); a 32k restore takes 0.6 s against 15 s of prefill.
-- Not done yet: vision (not ported, text only), FP8 / INT8 KV cache, TP above 4, DSpark at TP=4 (needs a re-run
-  after the conv-state split), KV offload rows shared across TP sizes (canonical layout: written, not yet
-  validated), other GPUs.
+- TP=2 with KV offload to CPU and DSpark faulted the GPU at 32 concurrent long requests (out-of-bounds access,
+  under investigation); `--max-num-seqs 16` is stable. TP=1 and TP=4 pass the same load.
+- Not done yet: vision (not ported, text only), FP8 / INT8 KV cache, TP above 4, other GPUs.
 - Decode has ~2 ms per token of small-kernel overhead still being fused.
 
 ## Credits
