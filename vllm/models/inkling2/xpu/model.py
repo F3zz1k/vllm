@@ -372,6 +372,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(
             tc.padded_vocab_size, org_vocab_size=tc.vocab_size,
             soft_cap=tc.final_logit_softcapping)
+        # The config's fp32 head would cast the 0.9 GB weight to fp32 on every step
+        # (~9 ms/token on XPU); the reference runs the head in bf16, so do the same.
+        self.logits_processor.head_dtype = None
 
     def get_language_model(self) -> nn.Module:
         return self
