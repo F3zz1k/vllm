@@ -143,8 +143,24 @@ def rel_logits(r: torch.Tensor, proj: torch.Tensor, attn) -> torch.Tensor:
 def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
               rel_extent: int) -> torch.Tensor:
     """Attention over the visit's KV cache (K/V already stored by `conv`)."""
+    out = torch.zeros_like(q)
+    _attention_into(out, q, rel_logits, sinks, owner=owner, scale=scale, window=window,
+                    rel_extent=rel_extent)
+    return out
+
+
+def _attention_into(out, q, rel_logits, sinks, *, owner, scale, window, rel_extent):
+    """Writes `out` in place. The kernels take host-side lengths (max query / key
+    length, token count), so under breakable XPU graphs this is an eager break: on
+    replay it runs with the current step's metadata, looked up here, not the
+    capture's."""
+    from .. import cache  # the harness patches cache.layer_metadata
+
+    md = cache.layer_metadata(owner.prefix)
     n_req = md.query_start_loc.shape[0] - 1
-    if _use_sycl_attention():
+    n = md.num_actual_tokens
+    # the SYCL kernels are built for 64-token KV pages only (vLLM's XPU block size)
+    if _use_sycl_attention() and owner.kv_cache.shape[2] == 64:
         from . import sycl_attention
 
         decode = md.max_query_len <= 1
@@ -152,27 +168,31 @@ def attention(owner, md, q, rel_logits, sinks, scale: float, window: int | None,
         # split count it was captured with.
         splits = (int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
                   if window is None else 4) if decode else 1
-        out = torch.zeros_like(q)
-        n = md.num_actual_tokens
         sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n],
                                      md.block_table, md.seq_lens, md.query_start_loc,
                                      scale, window, md.max_query_len, md.max_seq_len,
                                      num_splits=splits, out=out[:n])
-        return out
+        return
     if BACKEND == "triton":
         from .triton_attention import rel_attention
 
         decode = md.max_query_len <= 8
         splits = (16 if window is None else 8) if decode else 1
-        return rel_attention(q, owner.kv_cache, rel_logits, sinks, md.block_table, md.seq_lens,
-                             md.query_start_loc, scale, window, rel_extent, n_req,
-                             out=torch.zeros_like(q), num_splits=splits, rel_reversed=True)
-    n = md.num_actual_tokens
-    out = torch.zeros_like(q)
+        rel_attention(q, owner.kv_cache, rel_logits, sinks, md.block_table, md.seq_lens,
+                      md.query_start_loc, scale, window, rel_extent, n_req, out=out,
+                      num_splits=splits, rel_reversed=True)
+        return
     out[:n] = ref.rel_attention(q[:n], rel_logits[:n], sinks[:n], owner.kv_cache,
                                 md.block_table, md.seq_lens, md.query_start_loc, scale,
                                 window, rel_extent)
-    return out
+
+
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+    _attention_into = eager_break_during_capture(_attention_into)
+except ImportError:  # pragma: no cover
+    pass
 
 
 def _fused_moe(moe):
@@ -190,67 +210,16 @@ def _fused_moe(moe):
     return k
 
 
-_SCRATCH: dict = {}
-
-
-def _nvfp4_via_scratch(moe, x, weights, ids, fp8: bool):
-    """NVFP4 storage, compute on XpuFusedMoe: decode the hit experts into one
-    scratch shared by every layer (fp8 with per-expert scales, or bf16)."""
-    from .triton_nvfp4_dequant import dequant_hit
-
-    t = moe.store.t
-    E, I2, H2 = t["w13_packed"].shape
-    H, I = 2 * H2, I2 // 2
-    key = (E, H, I, fp8, x.device)
-    sc = _SCRATCH.get(key)
-    if sc is None:
-        from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
-
-        dt = torch.float8_e4m3fn if fp8 else torch.bfloat16
-        w13 = torch.empty((E, H, 2 * I), dtype=dt, device=x.device)
-        w2 = torch.empty((E, I, H), dtype=dt, device=x.device)
-        s13 = torch.ones(E, dtype=torch.float32, device=x.device) if fp8 else None
-        s2 = torch.ones(E, dtype=torch.float32, device=x.device) if fp8 else None
-        k = XpuFusedMoe(w13=w13, w13_scales=s13, w13_bias=None, w2=w2, w2_scales=s2,
-                        w2_bias=None, n_experts_per_token=moe.top_k, activation="situ",
-                        num_experts=E, activation_situ_beta=moe.gate_cap,
-                        activation_situ_linear_beta=moe.up_cap)
-        ones = torch.ones(E, dtype=torch.float32, device=x.device)
-        sc = _SCRATCH[key] = (k, w13, w2, s13, s2, ones)
-    k, w13, w2, s13, s2, ones = sc
-    hit = torch.zeros(E, dtype=torch.int32, device=x.device).scatter_(
-        0, ids.reshape(-1).long(), 1)
-    dequant_hit(t["w13_packed"], t["w13_bscale"], t["w13_factor"],
-                t["w13_inv8"] if fp8 else ones, hit, w13)
-    dequant_hit(t["w2_packed"], t["w2_bscale"], t["w2_factor"],
-                t["w2_inv8"] if fp8 else ones, hit, w2)
-    if fp8:
-        s13.copy_(t["w13_s8"])
-        s2.copy_(t["w2_s8"])
-    out = torch.empty_like(x)
-    k.apply(out, x, weights, ids)
-    return out
-
-
 def experts(moe, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
     if BACKEND == "triton" and x.is_xpu and moe.store.fmt in ("bf16", "fp8"):
         out = torch.empty_like(x)
         _fused_moe(moe).apply(out, x, weights, ids)
         return out
-    # NVFP4 storage: VLLM_INKLING2_NVFP4_COMPUTE = auto (direct 4-bit Triton
-    # kernel for small batches, fp8 scratch + XpuFusedMoe for large ones;
-    # measured crossover ~64-128 routed rows), triton, fp8 or bf16.
-    mode = os.environ.get("VLLM_INKLING2_NVFP4_COMPUTE", "auto")
-    if mode == "auto":
-        thr = int(os.environ.get("VLLM_INKLING2_NVFP4_SCRATCH_MIN_TOKENS", "256"))
-        mode = "fp8" if x.shape[0] >= thr else "triton"
-    if BACKEND == "triton" and moe.store.fmt == "nvfp4" and x.is_xpu and mode in ("fp8", "bf16"):
-        return _nvfp4_via_scratch(moe, x, weights, ids, mode == "fp8")
-    if BACKEND == "triton" and moe.store.fmt == "nvfp4" and (x.is_xpu or ref_interp()):
-        from .triton_moe_nvfp4 import nvfp4_moe
+    if BACKEND == "triton" and x.is_xpu and moe.store.fmt == "nvfp4":
+        from . import moe_nvfp4
 
         t = moe.store.t
-        return nvfp4_moe(x, weights, ids, t["w13_packed"], t["w13_bscale"], t["w13_factor"],
-                         t["w2_packed"], t["w2_bscale"], t["w2_factor"], moe.gate_cap, moe.up_cap)
+        return moe_nvfp4.moe(x, weights, ids, t["w13_q"], t["w13_bscale"], t["w13_factor"],
+                             t["w2_q"], t["w2_bscale"], t["w2_factor"], moe.gate_cap, moe.up_cap)
     return ref.moe_experts(x, weights, ids, moe.expert_weights, moe.num_experts,
                            moe.gate_cap, moe.up_cap)

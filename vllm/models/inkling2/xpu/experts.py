@@ -13,12 +13,14 @@ A layer is converted at load time into one storage format, chosen with
 
   bf16   dequantized weights (reference precision)
   fp8    E4M3 with one fp32 scale per expert and matrix
-  nvfp4  the checkpoint bytes kept as they are (torch reference only for now);
-         the MXFP8 layers in VLLM_INKLING2_MXFP8 (fp8 default, or bf16)
+  nvfp4  the checkpoint bytes kept as they are, run by the NVFP4 grouped GEMM
+         (ops/moe_nvfp4.py); the MXFP8 layers in VLLM_INKLING2_MXFP8 (fp8
+         default, or bf16)
 
 bf16 / fp8 are stored in XpuFusedMoe's layout: `w13` `(E, H, 2I)` with the
 gate columns first, `w2` `(E, I, H)` (K-major); nvfp4 keeps the checkpoint
-row layout `w13` `(E, 2I, H/2)` (de-interleaved to [gate; up]).
+row layout `w13_q` `(E, 2I, H/2)` (de-interleaved to [gate; up]), E4M3 scales
+`(E, rows, cols/16)` as bytes and the per-expert factor.
 """
 
 from __future__ import annotations
@@ -91,14 +93,6 @@ def quant_fp8_per_expert(w: torch.Tensor, chunk: int = 8) -> tuple[torch.Tensor,
     return q, scale
 
 
-def unrepack(q: torch.Tensor) -> torch.Tensor:
-    """Inverse of `ops.triton_moe_nvfp4.repack`: back to checkpoint nibble order."""
-    blk = q.unflatten(-1, (-1, 64))
-    codes = torch.stack((blk & 15, blk >> 4), -2).flatten(-3)  # value order
-    pairs = codes.unflatten(-1, (-1, 2))
-    return (pairs[..., 0] | (pairs[..., 1] << 4)).contiguous()
-
-
 class ExpertStore:
     """One layer's routed experts in the chosen storage format."""
 
@@ -133,27 +127,14 @@ class ExpertStore:
                 self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "fp8")
             else:
                 for name in ("w13", "w2"):
-                    w, s = parts[f"{name}_weight"], parts[f"{name}_weight_scale"]
+                    w, sc = parts[f"{name}_weight"], parts[f"{name}_weight_scale"]
                     if name == "w13":
-                        w, s = deinterleave_rows(w), deinterleave_rows(s)
-                    from .ops.triton_moe_nvfp4 import repack
-
-                    # kernel nibble order (see ops/triton_moe_nvfp4.py)
-                    self.t[f"{name}_packed"] = repack(w.view(torch.uint8))
-                    self.t[f"{name}_bscale"] = s.view(torch.float8_e4m3fn).contiguous()
+                        w, sc = deinterleave_rows(w), deinterleave_rows(sc)
+                    self.t[f"{name}_q"] = w.view(torch.uint8).contiguous()
+                    self.t[f"{name}_bscale"] = sc.view(torch.uint8).contiguous()
                     self.t[f"{name}_factor"] = (
                         parts[f"{name}_weight_amax"].float()
                         / parts[f"{name}_weight_outer_scale_denominator"].float())
-                    # fp8 scratch scale per expert: amax of the decoded expert / 448
-                    e = w.shape[0]
-                    amax = torch.empty(e, dtype=torch.float32, device=device)
-                    for a in range(0, e, 16):
-                        sub = {k: (v[a:a + 16] if v.dim() > 1 or k.endswith("amax") else v)
-                               for k, v in parts.items() if k.startswith(name + "_")}
-                        amax[a:a + 16] = self.decode(sub, name).abs().amax(dim=(1, 2))
-                    scale = amax.clamp(min=1e-12) / FP8_MAX
-                    self.t[f"{name}_s8"] = scale
-                    self.t[f"{name}_inv8"] = 1.0 / scale
                 return
         for name in ("w13", "w2"):
             w = parts[f"{name}_weight"]
@@ -190,8 +171,8 @@ class ExpertStore:
                 out.append((self.t[name][e].t().float() * self.t[f"{name}_scale"][e]).to(
                     torch.bfloat16))
             else:
-                w = dequant_nvfp4(unrepack(self.t[f"{name}_packed"][e:e + 1]),
-                                  self.t[f"{name}_bscale"][e:e + 1],
+                w = dequant_nvfp4(self.t[f"{name}_q"][e:e + 1],
+                                  self.t[f"{name}_bscale"][e:e + 1].view(torch.float8_e4m3fn),
                                   self.t[f"{name}_factor"][e:e + 1], torch.bfloat16)
                 out.append(w[0])
         return out[0], out[1]
