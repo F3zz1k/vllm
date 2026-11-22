@@ -38,10 +38,24 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsEagle3
+from vllm.model_executor.models.interfaces import (
+    HasInnerState,
+    IsHybrid,
+    MultiModalEmbeddings,
+    SupportsEagle3,
+    SupportsMultiModal,
+)
+from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
+from ..processing import (
+    IMAGE_PLACEHOLDER,
+    Inkling2DummyInputsBuilder,
+    Inkling2MultiModalProcessor,
+    Inkling2ProcessingInfo,
+)
 from . import ops
 from .cache import Inkling2ConvState, Inkling2KVCache, layer_metadata
 from .experts import ExpertStore, expert_format, prefill_expert_format
@@ -425,8 +439,12 @@ class Inkling2LoopModel(nn.Module):
         return out
 
 
-class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, SupportsEagle3):
-    """Text path of Inkling 2 Mini on XPU (vision: not yet). Hybrid: every visit's
+@MULTIMODAL_REGISTRY.register_processor(Inkling2MultiModalProcessor,
+                                        info=Inkling2ProcessingInfo,
+                                        dummy_inputs=Inkling2DummyInputsBuilder)
+class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, SupportsEagle3,
+                                           SupportsMultiModal):
+    """Inkling 2 Mini on XPU, text and images (`vision.py`). Hybrid: every visit's
     short-conv inputs are a per-sequence state (`cache.Inkling2ConvState`)."""
 
     @classmethod
@@ -456,6 +474,13 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
         self.config = config
         self.text_config = tc = config.text_config
+        mm = vllm_config.model_config.multimodal_config
+        self.visual = None
+        if (config.vision_config is not None and mm is not None
+                and mm.get_limit_per_prompt("image")):
+            from .vision import Inkling2VisionEncoder
+
+            self.visual = Inkling2VisionEncoder(config.vision_config, tc.hidden_size)
         self.model = Inkling2LoopModel(tc, f"{prefix}model" if prefix else "model")
         self.lm_head = ParallelLMHead(tc.padded_vocab_size, tc.hidden_size)
         self.logits_processor = LogitsProcessor(
@@ -474,8 +499,30 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = tuple(layers)
 
-    def embed_input_ids(self, input_ids: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality.startswith("image"):
+            return IMAGE_PLACEHOLDER
+        raise ValueError("Only image modality is supported")
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        patches, grid_thw = kwargs.get("vision_pixels"), kwargs.get("vision_grid_thw")
+        if patches is None or grid_thw is None:
+            return ()
+        assert isinstance(patches, torch.Tensor) and isinstance(grid_thw, torch.Tensor)
+        assert self.visual is not None
+        return self.visual(patches, grid_thw).split(grid_thw.prod(-1).tolist())
+
+    def embed_input_ids(self, input_ids: torch.Tensor,
+                        multimodal_embeddings: MultiModalEmbeddings | None = None, *,
+                        is_multimodal: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+        embeds = self.model.embed_input_ids(input_ids)
+        if not multimodal_embeddings:
+            return embeds
+        assert is_multimodal is not None
+        return _merge_multimodal_embeddings(inputs_embeds=embeds,
+                                            multimodal_embeddings=multimodal_embeddings,
+                                            is_multimodal=is_multimodal)
 
     def forward(self, input_ids: torch.Tensor | None, positions: torch.Tensor,
                 intermediate_tensors: IntermediateTensors | None = None,
@@ -581,9 +628,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
                 dst.copy_(tensor)
             loaded.add(name)
 
+        visual: list[tuple[str, torch.Tensor]] = []
         for ckpt_name, tensor in weights:
+            if ckpt_name.startswith("model.visual."):
+                if self.visual is not None:
+                    visual.append((ckpt_name.removeprefix("model.visual."), tensor))
+                continue
             if not ckpt_name.startswith("model.llm."):
-                continue  # vision tower: not yet
+                continue
             for pat, repl in self._simple:
                 if re.match(pat, ckpt_name):
                     put(re.sub(pat, repl, ckpt_name), tensor)
@@ -611,6 +663,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
                     loaded.add(f"{base}.mlp.experts")
                 else:
                     raise KeyError(f"unexpected weight {ckpt_name}")
+        if self.visual is not None:
+            loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual)}
         self.model.finish_loading()
         self._quantize_dense()
         missing = [n for n in params if n not in loaded]
