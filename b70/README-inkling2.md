@@ -92,13 +92,15 @@ DSpark speculative decoding with the checkpoint's bundled drafter: add
 
 `--max-num-batched-tokens`: 8,192 at TP=1 (16,384 does not fit beside the weights on one card), 16,384 at TP=2/4.
 
-## Measured (32k context, int8 dense + head, NVFP4 experts, XPU graphs)
+## Measured (32k context, int8 dense + head, NVFP4 experts, XPU graphs, 230 W power cap)
 
 | TP | decode, 1 stream @32k | 32 streams | prefill (30k prompt) | top-1 vs BF16 reference |
 |--:|--:|--:|--:|--:|
-| 1 | 55 t/s | n/m | 4.0k t/s | 0.995 |
-| 2 | 63 t/s | 896 t/s | 6.2k t/s | 0.996 |
-| 4 | 77 t/s | 1,198 t/s | 8.0k t/s | 0.995 |
+| 1 | 56 t/s | n/m | 4.5k t/s | 0.994-0.995 |
+| 2 | 64.5 t/s | 939 t/s | 6.5k t/s | 0.995-0.996 |
+| 4 | 79 t/s | 1,183 t/s | 8.2k t/s | 0.995 |
+
+At a 200 W cap: 55 / 63 / 77 t/s decode, 896 / 1,198 t/s at 32 streams (TP=2 / 4).
 
 BF16 dense: 48 / 59 / 75 t/s decode at TP=1/2/4, top-1 0.996-0.998.
 
@@ -108,6 +110,7 @@ DSpark (TP=1, int8 dense + head, greedy, 256 tokens, the six prompts of the deco
 | workload | no speculation | DSpark k=7 | acceptance length |
 |---|--:|--:|--:|
 | task prompts, reasoning on | 64.4 t/s | 107.7 t/s | 3.23 |
+| task prompts, reasoning on, TP=2 | 77.5 t/s | 133.7 t/s | 2.98 |
 | task prompts, reasoning off | 64.5 t/s | 81.4 t/s | 2.67 |
 | short chat turns, reasoning off | 64.6 t/s | 63.8 t/s | 1.82 |
 
@@ -119,9 +122,12 @@ with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tok
 
 - KV pages must be 64 tokens (vLLM's XPU default): the SYCL attention kernels are built for that page size; other
   sizes fall back to a slower Triton path.
-- Prefix caching works (the short-conv inputs are a per-sequence recurrent state, cached in vLLM's align mode).
-- Not done yet: vision (not ported, text only), FP8 / INT8 KV cache, CPU KV offload (not validated), TP above
-  4, DSpark at TP > 1 (not tested), other GPUs.
+- Prefix caching works (the short-conv inputs are per-sequence recurrent states, three per visit, cached in
+  vLLM's align mode). KV offload to CPU stores 37 KiB per cached token at 32k (out-of-window sliding-window
+  blocks are not stored); a 32k restore takes 0.6 s against 15 s of prefill.
+- Not done yet: vision (not ported, text only), FP8 / INT8 KV cache, TP above 4, DSpark at TP=4 (needs a re-run
+  after the conv-state split), KV offload rows shared across TP sizes (canonical layout: written, not yet
+  validated), other GPUs.
 - Decode has ~2 ms per token of small-kernel overhead still being fused.
 
 ## Credits

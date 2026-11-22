@@ -187,6 +187,12 @@ class Inkling2ConvState(nn.Module, MambaBase):
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.SHORT_CONV
 
+    @property
+    def is_kv_cache_tp_replicated(self) -> bool:
+        """The attention / MLP stream states hold the full hidden size on every rank;
+        the K/V state holds this rank's KV heads."""
+        return self.layout.k_off < 0
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Inkling2ConvBackend
 

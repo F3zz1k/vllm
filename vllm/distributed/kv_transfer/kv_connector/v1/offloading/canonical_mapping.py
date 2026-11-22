@@ -321,6 +321,38 @@ def mamba_state_runs(
     return _coalesce_runs(runs)
 
 
+def short_conv_state_runs(
+    spec: MambaSpec, tp_size: int, tp_rank: int
+) -> tuple[tuple[CopyRun, ...], int, int, int] | None:
+    """(runs, canonical page bytes, num_writers, writer_index) for a short-conv state,
+    or None when the layer cannot be certified.
+
+    One (state_len, channels) array in the SD layout. A replicated state
+    (`tp_replicated`) is the same bytes on every rank: identity runs, the ranks take
+    turns writing. Otherwise TP shards the channels contiguously by rank (rank r holds
+    slice r of every row), so each local row lands at offset r of its canonical row.
+    """
+    if (
+        spec.mamba_type != MambaAttentionBackendEnum.SHORT_CONV
+        or len(spec.shapes) != 1
+        or len(spec.shapes[0]) != 2
+        or is_conv_state_dim_first()
+    ):
+        return None
+    rows, channels = spec.shapes[0]
+    elem = torch.empty((), dtype=spec.dtypes[0]).element_size()
+    row_bytes = channels * elem
+    page = rows * row_bytes
+    if spec.tp_replicated:
+        return (CopyRun(0, 0, page, 1, page, page),), page, tp_size, tp_rank
+    runs = tuple(
+        CopyRun(row * row_bytes, row * tp_size * row_bytes + tp_rank * row_bytes,
+                row_bytes, 1, row_bytes, row_bytes)
+        for row in range(rows)
+    )
+    return _coalesce_runs(list(runs)), tp_size * page, 1, 0
+
+
 def _is_packed_state_page(
     spec: MambaSpec, kv_cache: torch.Tensor | list[torch.Tensor] | None, num_blocks: int
 ) -> bool:
@@ -346,6 +378,17 @@ def _layer_mapping(
         # A state is per request, not per token: CP has nothing to shard.
         if ctx.cp_size > 1 or not _is_packed_state_page(spec, kv_cache, num_blocks):
             return None
+        sc = short_conv_state_runs(spec, ctx.tp_size, ctx.tp_rank)
+        if sc is not None:
+            runs, canonical_page, writers, writer = sc
+            return CanonicalPageMapping(
+                canonical_page_size_bytes=canonical_page,
+                local_page_size_bytes=spec.state_content_size_bytes,
+                runs=runs,
+                num_writers=writers,
+                writer_index=writer,
+                parallelism_agnostic=True,
+            )
         runs = mamba_state_runs(spec, ctx.tp_size, ctx.tp_rank)
         if runs is None:
             return None
