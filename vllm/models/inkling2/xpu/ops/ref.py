@@ -126,31 +126,27 @@ def _slot_split(slots: torch.Tensor, block_size: int):
     return slots // block_size, slots % block_size
 
 
-def conv_write(conv: torch.Tensor, layout: ConvLayout, stream: str, x: torch.Tensor,
-               slots: torch.Tensor) -> None:
-    """Store the conv inputs `x` `(T, H * w)` of `stream` at `slots`."""
+def conv_history_state(state: torch.Tensor, layout: ConvLayout, stream: str, x: torch.Tensor,
+                       query_start_loc: list[int], state_idx: list[int], has_init: list[bool],
+                       kernel: int) -> torch.Tensor:
+    """fp32 `(T, kernel, H * w)` oldest first: the step's own inputs `x`, and
+    before each request's first row its state slot (`[k - 1, H * W]`, zero
+    without history). Then writes each request's new state (its last k - 1
+    inputs)."""
     off, w = layout.stream(stream)
-    valid = slots >= 0
-    blk, pos = _slot_split(slots[valid], conv.shape[2])
-    rows = x[valid].view(-1, layout.num_heads, w).to(conv.dtype)
-    # conv[blk, :, pos, off:off+w] = rows   (advanced indexing on dims 0 and 2)
-    conv[blk, :, pos, off:off + w] = rows
-
-
-def conv_history(conv: torch.Tensor, layout: ConvLayout, stream: str, positions: torch.Tensor,
-                 block_table: torch.Tensor, req_idx: torch.Tensor, kernel: int) -> torch.Tensor:
-    """fp32 `(T, kernel, H * w)`: inputs at positions `p - kernel + 1 .. p`
-    (zero before the sequence start), read back from the conv cache."""
-    off, w = layout.stream(stream)
-    bs = conv.shape[2]
-    lags = torch.arange(kernel - 1, -1, -1, device=positions.device)  # oldest first
-    pos = positions[:, None] - lags[None, :]  # (T, K)
-    valid = pos >= 0
-    posc = pos.clamp(min=0)
-    blocks = block_table[req_idx[:, None], posc // bs]
-    vals = conv[blocks, :, posc % bs, off:off + w].float()  # (T, K, H, w)
-    vals = vals * valid[..., None, None]
-    return vals.reshape(pos.shape[0], kernel, -1)
+    H, W = layout.num_heads, layout.width
+    T, C = x.shape
+    hist = x.new_zeros((T, kernel, C), dtype=torch.float32)
+    for r in range(len(query_start_loc) - 1):
+        q0, q1 = query_start_loc[r], query_start_loc[r + 1]
+        st = state[state_idx[r]].view(kernel - 1, H, W)[..., off:off + w].reshape(kernel - 1, C)
+        old = st.float() if has_init[r] else torch.zeros_like(st, dtype=torch.float32)
+        seq = torch.cat([old, x[q0:q1].float()])  # (k - 1 + n, C)
+        for i in range(q1 - q0):
+            hist[q0 + i] = seq[i:i + kernel]
+        new = seq[-(kernel - 1):].to(state.dtype)
+        state[state_idx[r]].view(kernel - 1, H, W)[..., off:off + w] = new.view(kernel - 1, H, w)
+    return hist
 
 
 def static_conv(hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

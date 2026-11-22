@@ -107,42 +107,42 @@ def qr_norm(x: torch.Tensor, scale: torch.Tensor, clip: float,
     return y
 
 
-def _ref_history(owner, md, stream, x, positions):
-    T, k = x.shape[0], owner.kernel_size
-    if md is None or owner.kv_cache.numel() == 0:
-        hist = x.new_zeros((T, k, x.shape[1]), dtype=torch.float32)
-        hist[:, -1] = x.float()
-        return hist
-    ref.conv_write(owner.kv_cache, owner.layout, stream, x, md.slot_mapping[:T])
-    return ref.conv_history(owner.kv_cache, owner.layout, stream, positions[:T],
-                            md.block_table, md.seq_idx[:T].long(), k)
-
-
-def conv(owner, md, stream: str, x: torch.Tensor, positions: torch.Tensor,
-         weight: torch.Tensor, dyn: torch.Tensor | None = None, norm: int = 0,
-         clip: float = 0.0, eps: float = 1e-6, kv_owner=None, kv_md=None,
-         last: torch.Tensor | None = None, addend: torch.Tensor | None = None) -> torch.Tensor:
+def conv(owner, md, stream: str, x: torch.Tensor, weight: torch.Tensor,
+         dyn: torch.Tensor | None = None, norm: int = 0, clip: float = 0.0, eps: float = 1e-6,
+         kv_owner=None, kv_md=None, last: torch.Tensor | None = None,
+         addend: torch.Tensor | None = None) -> torch.Tensor:
     """Short conv of one stream over the visit's conv state (static taps, or
     dynamic with `dyn`), then optionally a per-head norm (1 = L2 clip, 2 =
     unweighted RMS) and a store into the visit's KV cache (K for stream 'k',
     V for 'v'). Returns bf16 `(T, C)`; with `last` (and `addend`), the layer output
-    last (+ addend) + conv in fp32, rounded once."""
+    last (+ addend) + conv in fp32, rounded once. Updates the conv state."""
     T = x.shape[0]
-    hph = owner.layout.stream(stream)[1]
-    have_md = md is not None and owner.kv_cache.numel() > 0
+    off, hph = owner.layout.stream(stream)
+    have_md = md is not None and owner.state.numel() > 0
     if BACKEND == "triton" and have_md:
         from .triton_sconv import short_conv
 
         kv = kv_owner.kv_cache if (kv_owner is not None and kv_md is not None) else None
-        return short_conv(x, owner.kv_cache, owner.layout.stream(stream)[0], hph,
-                          md.slot_mapping[:T], md.block_table, md.seq_idx[:T],
-                          md.query_start[:T], positions[:T], weight, dyn=dyn, norm=norm,
-                          clip=clip, eps=eps, kv=kv,
+        return short_conv(x, owner.state, off, hph, owner.layout.width, md.seq_idx[:T],
+                          md.query_start[:T], md.query_start_loc, md.block_table, md.seq_lens,
+                          weight, dyn=dyn, norm=norm, clip=clip, eps=eps, kv=kv,
                           kv_slots=None if kv is None else kv_md.slot_mapping[:T],
                           kv_off=0 if stream == "k" else hph,
                           last=None if last is None else last.contiguous(),
-                          addend=None if addend is None else addend.contiguous())
-    hist = _ref_history(owner, md if have_md else None, stream, x, positions)
+                          addend=None if addend is None else addend.contiguous(),
+                          align=md.align, state_block_size=md.state_block_size)
+    k = owner.kernel_size
+    if have_md:
+        nreq = md.num_reqs
+        qsl = md.query_start_loc[:nreq + 1].tolist()
+        lens = md.seq_lens[:nreq].tolist()
+        cols = [max(n - 1, 0) // md.state_block_size if md.align else 0 for n in lens]
+        slots = [int(md.block_table[r, cols[r]]) for r in range(nreq)]
+        init = [lens[r] > qsl[r + 1] - qsl[r] for r in range(nreq)]
+        hist = ref.conv_history_state(owner.state, owner.layout, stream, x, qsl, slots, init, k)
+    else:
+        hist = x.new_zeros((T, k, x.shape[1]), dtype=torch.float32)
+        hist[:, -1] = x.float()
     if dyn is None:
         y = ref.static_conv(hist, weight).to(torch.bfloat16)
     else:

@@ -27,11 +27,13 @@ from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.sequence import IntermediateTensors
 
 from ..configs import Inkling2MMConfig, Inkling2ModelConfig
@@ -145,14 +147,14 @@ class Inkling2Attention(nn.Module):
         # L2 clip (k) or unweighted RMS norm (v), stored into the KV cache.
         kw = dict(kv_owner=kv_owner, kv_md=attn_md)
         if self.is_local:
-            ops.conv(conv_owner, conv_md, "k", k_lin, positions, self.k_conv, norm=1,
+            ops.conv(conv_owner, conv_md, "k", k_lin, self.k_conv, norm=1,
                      clip=self.qk_clip, **kw)
-            ops.conv(conv_owner, conv_md, "v", v_lin, positions, self.v_conv, norm=2,
+            ops.conv(conv_owner, conv_md, "v", v_lin, self.v_conv, norm=2,
                      eps=self.eps, **kw)
         else:
-            ops.conv(conv_owner, conv_md, "k", k_lin, positions, self.k_static,
+            ops.conv(conv_owner, conv_md, "k", k_lin, self.k_static,
                      dyn=yk[:, self.k_size:], norm=1, clip=self.qk_clip, **kw)
-            ops.conv(conv_owner, conv_md, "v", v_lin, positions, self.v_static,
+            ops.conv(conv_owner, conv_md, "v", v_lin, self.v_static,
                      dyn=yv[:, self.v_size:], norm=2, eps=self.eps, **kw)
 
         if attn_md is None:
@@ -244,7 +246,7 @@ class Inkling2DecoderLayer(nn.Module):
             xq, xk, xv = ops.blend(self, slice(0, 3), dests, messages[:3], w, self.eps).unbind(0)
 
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx)
-        a = ops.conv(conv_owner, conv_md, "attn", a, positions, self.attn_conv)
+        a = ops.conv(conv_owner, conv_md, "attn", a, self.attn_conv)
         if self.boundary:
             stack[n].copy_(h)
             n += 1
@@ -260,7 +262,7 @@ class Inkling2DecoderLayer(nn.Module):
                           self.eps)[0]
         m = self.mlp(m)
         # the MLP-output conv also adds the residual (last (+ addend)): the layer output
-        return ops.conv(conv_owner, conv_md, "mlp", m, positions, self.mlp_conv, last=last,
+        return ops.conv(conv_owner, conv_md, "mlp", m, self.mlp_conv, last=last,
                         addend=addend), n
 
 
@@ -348,8 +350,25 @@ class Inkling2LoopModel(nn.Module):
                             self.eps)[0]
 
 
-class Inkling2LoopForConditionalGeneration(nn.Module):
-    """Text path of Inkling 2 Mini on XPU (vision: not yet)."""
+class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid):
+    """Text path of Inkling 2 Mini on XPU (vision: not yet). Hybrid: every visit's
+    short-conv inputs are a per-sequence state (`cache.Inkling2ConvState`)."""
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig):
+        tc = vllm_config.model_config.hf_config.text_config
+        assert (tc.swa_num_key_value_heads, tc.swa_head_dim) == (tc.num_key_value_heads,
+                                                                 tc.head_dim)
+        layout = ConvLayout.make(tc.num_key_value_heads, tc.head_dim, tc.hidden_size)
+        return (Inkling2ConvState.state_shape(layout, tc.sconv_kernel_size),)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig):
+        return (vllm_config.model_config.dtype,)
+
+    @classmethod
+    def get_mamba_state_copy_func(cls):
+        return MambaStateCopyFuncCalculator.short_conv_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
