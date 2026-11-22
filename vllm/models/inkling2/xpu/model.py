@@ -100,11 +100,20 @@ class Inkling2Attention(nn.Module):
         else:
             self.k_static = _param(self.kernel, Hk * D)
             self.v_static = _param(self.kernel, Hk * D)
-        self.layout = ConvLayout.make(Hk, D, c.hidden_size)
+        self.layouts = {part: ConvLayout.make(Hk, D, c.hidden_size, part)
+                        for part in ("kv", "attn", "mlp")}
         self.kv_caches = nn.ModuleList(
             Inkling2KVCache(f"{prefix}.kv.p{p}", H, Hk, D, self.window) for p in range(num_passes))
-        self.conv_states = nn.ModuleList(
-            Inkling2ConvState(f"{prefix}.conv.p{p}", self.layout, self.kernel)
+        # three conv states per pass: K/V, the attention-output stream, the MLP-output
+        # stream (see ConvLayout.make)
+        self.conv_kv = nn.ModuleList(
+            Inkling2ConvState(f"{prefix}.conv.p{p}", self.layouts["kv"], self.kernel)
+            for p in range(num_passes))
+        self.conv_attn = nn.ModuleList(
+            Inkling2ConvState(f"{prefix}.conv_attn.p{p}", self.layouts["attn"], self.kernel)
+            for p in range(num_passes))
+        self.conv_mlp = nn.ModuleList(
+            Inkling2ConvState(f"{prefix}.conv_mlp.p{p}", self.layouts["mlp"], self.kernel)
             for p in range(num_passes))
 
     # Row offsets of the fused projection's shards.
@@ -152,7 +161,7 @@ class Inkling2Attention(nn.Module):
         q_lin, r_lin, gate_lin, sink = yq.split(self.q_sizes, -1)
         k_lin, v_lin = yk[:, :self.k_size], yv[:, :self.v_size]
         kv_owner = self.kv_caches[pass_idx]
-        conv_owner = self.conv_states[pass_idx]
+        conv_owner = self.conv_kv[pass_idx]
         conv_md = layer_metadata(conv_owner.prefix)
         attn_md = layer_metadata(kv_owner.prefix)
 
@@ -273,8 +282,10 @@ class Inkling2DecoderLayer(nn.Module):
         """One visit. `h` is the layer input (bf16); `stack[:n]` the completed
         AttnRes blocks (a persistent buffer). Returns (layer output bf16, n):
         a block-boundary layer appends `h` to the stack."""
-        conv_owner = self.attn.conv_states[pass_idx]
-        conv_md = layer_metadata(conv_owner.prefix)
+        attn_owner = self.attn.conv_attn[pass_idx]
+        attn_md = layer_metadata(attn_owner.prefix)
+        mlp_owner = self.attn.conv_mlp[pass_idx]
+        mlp_md = layer_metadata(mlp_owner.prefix)
         xs = None  # (3, T, D) contiguous when q, k and v inputs differ
         rows_q = None  # int8 rows of the qkvr input(s), from the producing kernel
         if attn_query is None:  # layer 0: no mix
@@ -298,7 +309,7 @@ class Inkling2DecoderLayer(nn.Module):
         a = self.attn(positions, xq, xk, xv, None if self.is_local else tau, pass_idx,
                       stacked=xs if xs is not None and xs.is_contiguous() else None,
                       rows_q=rows_q)
-        a = ops.conv(conv_owner, conv_md, "attn", a, self.attn_conv)
+        a = ops.conv(attn_owner, attn_md, "attn", a, self.attn_conv)
         if self.boundary:
             stack[n].copy_(h)
             n += 1
@@ -314,7 +325,7 @@ class Inkling2DecoderLayer(nn.Module):
                           self.eps)[0]
         m = self.mlp(m)
         # the MLP-output conv also adds the residual (last (+ addend)): the layer output
-        return ops.conv(conv_owner, conv_md, "mlp", m, self.mlp_conv, last=last,
+        return ops.conv(mlp_owner, mlp_md, "mlp", m, self.mlp_conv, last=last,
                         addend=addend), n
 
 
@@ -424,7 +435,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
         assert (tc.swa_num_key_value_heads, tc.swa_head_dim) == (tc.num_key_value_heads,
                                                                  tc.head_dim)
         tp = vllm_config.parallel_config.tensor_parallel_size
-        layout = ConvLayout.make(tc.num_key_value_heads // tp, tc.head_dim, tc.hidden_size)
+        # the largest of the three states (attn / mlp: one hidden-size stream) sets the page
+        layout = ConvLayout.make(tc.num_key_value_heads // tp, tc.head_dim, tc.hidden_size,
+                                 "attn")
         from .cache import spec_tokens
 
         return (Inkling2ConvState.state_shape(layout, tc.sconv_kernel_size,

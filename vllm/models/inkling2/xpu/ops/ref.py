@@ -105,22 +105,33 @@ class ConvLayout:
     width: int  # row width W per head
 
     @staticmethod
-    def make(num_kv_heads: int, head_dim: int, hidden: int) -> ConvLayout:
+    def make(num_kv_heads: int, head_dim: int, hidden: int, part: str = "all") -> ConvLayout:
+        """`part`: the streams one state holds: "kv" (K and V), "attn" or "mlp" (one
+        hidden-size stream each), or "all" four. The model keeps three states per
+        visit (kv, attn, mlp) so each state page stays under the attention page and
+        the KV block stays at 64 tokens, with speculative rows, at any TP size.
+        Rows are unpadded for the same reason."""
         hph = hidden // num_kv_heads
-        # unpadded: the conv-state page must stay under the attention page so the KV
-        # block stays at 64 tokens (with speculative rows at TP=2 a padded row did not)
-        width = 2 * head_dim + 2 * hph
-        return ConvLayout(num_kv_heads, 0, head_dim, head_dim, head_dim,
-                          2 * head_dim, 2 * head_dim + hph, hph, width)
+        D = head_dim
+        if part == "kv":
+            return ConvLayout(num_kv_heads, 0, D, D, D, -1, -1, hph, 2 * D)
+        if part == "attn":
+            return ConvLayout(num_kv_heads, -1, D, -1, D, 0, -1, hph, hph)
+        if part == "mlp":
+            return ConvLayout(num_kv_heads, -1, D, -1, D, -1, 0, hph, hph)
+        assert part == "all", part
+        return ConvLayout(num_kv_heads, 0, D, D, D, 2 * D, 2 * D + hph, hph, 2 * D + 2 * hph)
 
     def stream(self, name: str) -> tuple[int, int]:
         """(offset, width per head) of a stream."""
-        return {
+        off, w = {
             "k": (self.k_off, self.k_width),
             "v": (self.v_off, self.v_width),
             "attn": (self.attn_off, self.hidden_per_head),
             "mlp": (self.mlp_off, self.hidden_per_head),
         }[name]
+        assert off >= 0, f"stream {name} is not in this conv state"
+        return off, w
 
 
 def _slot_split(slots: torch.Tensor, block_size: int):
