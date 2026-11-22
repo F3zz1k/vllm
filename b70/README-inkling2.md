@@ -92,20 +92,28 @@ DSpark speculative decoding with the checkpoint's bundled drafter: add
 
 `--max-num-batched-tokens`: 8,192 at TP=1 (16,384 does not fit beside the weights on one card), 16,384 at TP=2/4.
 
-## Measured (32k context, int8 dense + head, NVFP4 experts, XPU graphs, 230 W power cap)
+## Measured (int8 dense + head, NVFP4 experts, XPU graphs, 200 W power cap)
 
-| TP | decode, 1 stream @32k | 32 streams | prefill (30k prompt) | top-1 vs BF16 reference |
-|--:|--:|--:|--:|--:|
-| 1 | 56 t/s | n/m | 4.5k t/s | 0.994-0.995 |
-| 2 | 64.5 t/s | 939 t/s | 6.5k t/s | 0.995-0.996 |
-| 4 | 79 t/s | 1,183 t/s | 8.2k t/s | 0.995 |
+Decode in t/s, no speculation (DSpark k=7 in brackets): chat, greedy, 256 tokens, reasoning on, the six
+task prompts of the decode benchmark in
+[mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu); "@32k" puts ~32k tokens of
+filler before each prompt; 32 streams is aggregate.
 
-At a 200 W cap: 55 / 63 / 77 t/s decode, 896 / 1,198 t/s at 32 streams (TP=2 / 4).
+| TP | 1 stream | 1 stream @32k | 32 streams | prefill (30k prompt) | top-1 vs BF16 reference |
+|--:|--:|--:|--:|--:|--:|
+| 1 | 64.8 (101.7) | 53.8 (74.5) | 624 (412) | 4.5k t/s | 0.994-0.995 |
+| 2 | 78.4 (132.5) | 61.9 (99.0) | 917 (1,074) | 6.5k t/s | 0.995-0.996 |
+| 4 | 82.2 (165.6) | 76.5 (147.1) | 1,255 (1,345) | 8.2k t/s | 0.995 |
 
-BF16 dense: 48 / 59 / 75 t/s decode at TP=1/2/4, top-1 0.996-0.998.
+On one card at 32 streams the KV pool is nearly full and DSpark loses; elsewhere it gains 1.1-2x. Prefill
+and top-1 were measured at 230 W. BF16 dense (TP=1/2/4, 230 W): 48 / 59 / 75 t/s @32k, top-1 0.996-0.998.
 
-DSpark (TP=1, int8 dense + head, greedy, 256 tokens, the six prompts of the decode benchmark in
-[mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu)):
+Long context (TP=4, DSpark): a passcode hidden at 10% / 50% / 90% of varied filler was retrieved in 15 of 15
+prompts at 32k, 64k, 128k, 256k and 512k tokens (512k: ~120 s per answer, prefill included). int8 against
+BF16 dense at 32k and 128k: every needle found by both; greedy outputs identical to the end in 3 of 6, the
+others diverge in wording after 20-60 tokens.
+
+DSpark by workload (TP=1, 230 W, before the verify-attention change below):
 
 | workload | no speculation | DSpark k=7 | acceptance length |
 |---|--:|--:|--:|
@@ -125,8 +133,12 @@ with a transformers BF16 reference over 4,421 tokens (20 prompts up to 2,600 tok
 - Prefix caching works (the short-conv inputs are per-sequence recurrent states, three per visit, cached in
   vLLM's align mode). KV offload to CPU stores 37 KiB per cached token at 32k (out-of-window sliding-window
   blocks are not stored); a 32k restore takes 0.6 s against 15 s of prefill.
-- TP=2 with KV offload to CPU and DSpark faulted the GPU at 32 concurrent long requests (out-of-bounds access,
-  under investigation); `--max-num-seqs 16` is stable. TP=1 and TP=4 pass the same load.
+- DSpark's verify step (8 query tokens per request) runs on the split-K decode kernel, one row per token; on
+  the chunk-prefill kernel it had no KV split and DSpark fell below plain decode at depth (TP=4 @32k: 58.5
+  against 76.5 t/s, now 147.1).
+- TP=2 with KV offload to CPU, DSpark and 32 concurrent 8k requests is not stable: a GPU fault on the older
+  verify path, and on the current one an out-of-memory on one rank in the third round (the per-step verify
+  buffers sit outside vLLM's memory profile). `--max-num-seqs 16` is stable; TP=1 and TP=4 pass 32.
 - Images: the vision encoder runs replicated on every rank (torch ops, XPU varlen attention); text-only
   servers can pass `--limit-mm-per-prompt '{"image":0}'` to skip its memory profile.
 - TP=8 is not blocked (24 query / 8 KV heads and 128 experts divide; each rank then holds 3 query heads,
