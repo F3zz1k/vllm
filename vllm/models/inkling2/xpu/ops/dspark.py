@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Kernels of the Inkling2 DSpark draft, matching the reference implementation."""
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
@@ -254,6 +256,35 @@ def markov_gate(
     return out, latent
 
 
+# Global draft layers: "decode" (default) runs each draft row on the split-K decode kernel
+# (the varlen kernel has no KV split, so a few work-groups per layer at depth); "varlen" keeps
+# the vendor varlen kernel.
+_DRAFT_DECODE = os.environ.get("VLLM_INKLING2_DRAFT_ATTN", "decode") == "decode"
+
+
+def _decode_kernel_fits(q, key_cache) -> bool:
+    from . import sycl_attention
+
+    return (q.shape[-1] == 128 and key_cache.shape[1] in (16, 64)
+            and q.shape[1] // key_cache.shape[2] <= 8 and sycl_attention.available())
+
+
+def _block_attention_decode(q, key_cache, value_cache, out, block_table, cache_seqlens,
+                            block: int, scale: float):
+    """Global layers: the block is bidirectional, so every row of request r sees all of its
+    keys; one decode row per draft token with the request's block table and length."""
+    n, H = q.shape[0], q.shape[1]
+    req = torch.arange(n, device=q.device) // block
+    lse = torch.empty((H, n), dtype=torch.float32, device=q.device)
+    rel = torch.empty((n, H, 0), dtype=torch.bfloat16, device=q.device)
+    splits = int(os.environ.get("VLLM_INKLING2_DECODE_SPLITS_GLOBAL", "16"))
+    torch.ops._inkling2_C.rel_attention(
+        q, key_cache, value_cache, out, torch.arange(n + 1, dtype=torch.int32, device=q.device),
+        cache_seqlens.index_select(0, req), block_table.index_select(0, req), 1,
+        int(block_table.shape[1]) * key_cache.shape[1], scale, -1, rel, lse, splits)
+    return out
+
+
 def block_attention(q, key_cache, value_cache, out, block_table, cache_seqlens, block: int,
                     window: int, scale: float) -> torch.Tensor:
     """Bidirectional attention of each request's draft block (the last `block` positions
@@ -265,6 +296,9 @@ def block_attention(q, key_cache, value_cache, out, block_table, cache_seqlens, 
     lets the query at block offset b see from its own position - sliding_window, so it
     misses the b oldest keys of the window (at most block - 1 of sliding_window + block)
     and never reads a page outside the window."""
+    if not window and _DRAFT_DECODE and _decode_kernel_fits(q, key_cache):
+        return _block_attention_decode(q, key_cache, value_cache, out, block_table,
+                                       cache_seqlens, block, scale)
     from vllm._xpu_ops import xpu_ops
 
     num_reqs = cache_seqlens.shape[0]

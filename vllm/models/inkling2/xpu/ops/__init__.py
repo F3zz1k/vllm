@@ -417,7 +417,7 @@ def route_fused(x, weight, bias, top_k: int, route_scale: float):
 
 
 def experts(moe, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-    if BACKEND == "triton" and x.is_xpu and moe.store.fmt in ("bf16", "fp8"):
+    if BACKEND == "triton" and x.is_xpu and moe.store.fmt in ("bf16", "fp8", "mxfp8"):
         out = torch.empty_like(x)
         _fused_moe(moe).apply(out, x, weights, ids)
         return out

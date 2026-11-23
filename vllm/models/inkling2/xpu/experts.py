@@ -133,10 +133,21 @@ class ExpertStore:
         nvfp4_src = "w13_weight_amax" in parts
         if self.fmt == "nvfp4":
             if not nvfp4_src:
-                # MXFP8 layers have no NVFP4 bytes: VLLM_INKLING2_MXFP8 picks
-                # bf16 (default, exact, 2 GiB/layer) or fp8 with one scale per
-                # expert (1 GiB/layer, drops the per-32 block scales: lossy).
-                self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "bf16").lower()
+                # MXFP8 layers have no NVFP4 bytes: VLLM_INKLING2_MXFP8 picks mxfp8
+                # (default: the checkpoint bytes and per-32 scales, exact, 1 GiB/layer),
+                # bf16 (exact, 2 GiB/layer) or fp8 (one scale per expert: lossy).
+                self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "mxfp8").lower()
+                if self.fmt not in ("mxfp8", "bf16", "fp8"):
+                    raise ValueError(f"VLLM_INKLING2_MXFP8: mxfp8, bf16 or fp8, got {self.fmt!r}")
+                if self.fmt == "mxfp8":
+                    # XpuFusedMoe layout: e4m3 (E, K, N) with e8m0 scales (E, K/32, N)
+                    for name in ("w13", "w2"):
+                        w, sc = parts[f"{name}_weight"], parts[f"{name}_weight_scale"]
+                        if name == "w13":
+                            w, sc = deinterleave_rows(w), deinterleave_rows(sc)
+                        self.t[name] = w.view(torch.float8_e4m3fn).transpose(1, 2).contiguous()
+                        self.t[f"{name}_scale"] = sc.view(torch.uint8).transpose(1, 2).contiguous()
+                    return
             else:
                 for name in ("w13", "w2"):
                     w, sc = parts[f"{name}_weight"], parts[f"{name}_weight_scale"]
@@ -182,6 +193,9 @@ class ExpertStore:
             elif self.fmt == "fp8":
                 out.append((self.t[name][e].t().float() * self.t[f"{name}_scale"][e]).to(
                     torch.bfloat16))
+            elif self.fmt == "mxfp8":
+                s = torch.exp2(self.t[f"{name}_scale"][e].float() - 127).repeat_interleave(32, 0)
+                out.append((self.t[name][e].float() * s).t().to(torch.bfloat16))
             else:
                 w = dequant_nvfp4(self.t[f"{name}_q"][e:e + 1],
                                   self.t[f"{name}_bscale"][e:e + 1].view(torch.float8_e4m3fn),
