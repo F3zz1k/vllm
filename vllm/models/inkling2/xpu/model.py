@@ -473,6 +473,10 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        # oneDNN's fp32 GEMM on XPU reduces nondeterministically at small M (8-35 rows: the
+        # router logits in prefill and DSpark verify), so identical runs diverged. Deterministic
+        # mode costs nothing measurable on those GEMMs.
+        torch.backends.mkldnn.deterministic = True
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
         self.config = config
         self.text_config = tc = config.text_config

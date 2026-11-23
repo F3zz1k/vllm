@@ -54,7 +54,7 @@ COMMON=(--rm --network host --ipc=host --privileged --device /dev/dri -v /dev/dr
   -e CCL_SYCL_ALLREDUCE_TMP_BUF=1 -e CCL_SYCL_ALLGATHERV_TMP_BUF=1
   -e CCL_SYCL_REDUCE_SCATTER_TMP_BUF=1 -e CCL_SYCL_BROADCAST_TMP_BUF=1
   -e ExperimentalCopyThroughLock=0 -e ExperimentalH2DCpuCopyThreshold=0 -e ExperimentalD2HCpuCopyThreshold=0
-  -e VLLM_INKLING2_EXPERTS=nvfp4 -e VLLM_INKLING2_DENSE=int8 -e VLLM_INKLING2_HEAD=int8)
+  -e VLLM_INKLING2_DENSE=int8 -e VLLM_INKLING2_HEAD=int8 -e VLLM_INKLING2_MXFP8=fp8)
 SERVE=(serve /models/inkling-2-mini --served-model-name inkling-2-mini --trust-remote-code
   --max-model-len 32768 --gpu-memory-utilization 0.85 --max-num-seqs 32)
 ```
@@ -112,7 +112,7 @@ TP=1 is configured for 64k (@60k: 51.0 (83.3) t/s decode, 3.9k t/s prefill). DSp
 
 Quality: top-1 agreement with a transformers BF16 reference 0.994-0.995 (BF16 dense weights: 0.996-0.998; 4,421
 prompt tokens). Needle (passcode at 10/50/90% depth) found 15/15 at 32k-512k; int8 and BF16 dense give the same
-answers at 32k and 128k.
+answers at 32k and 128k. Greedy output is bit-identical across runs, with and without DSpark.
 
 ## Known limits
 
