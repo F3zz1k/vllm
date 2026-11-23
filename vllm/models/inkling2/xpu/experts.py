@@ -36,7 +36,7 @@ FORMATS = ("bf16", "fp8", "nvfp4")
 
 
 def expert_format() -> str:
-    fmt = os.environ.get("VLLM_INKLING2_EXPERTS", "fp8").lower()
+    fmt = os.environ.get("VLLM_INKLING2_EXPERTS", "nvfp4").lower()
     if fmt not in FORMATS:
         raise ValueError(f"VLLM_INKLING2_EXPERTS must be one of {FORMATS}, got {fmt!r}")
     return fmt
@@ -134,8 +134,9 @@ class ExpertStore:
         if self.fmt == "nvfp4":
             if not nvfp4_src:
                 # MXFP8 layers have no NVFP4 bytes: VLLM_INKLING2_MXFP8 picks
-                # fp8 per expert (default, 1 GiB/layer) or bf16 (exact, 2 GiB).
-                self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "fp8")
+                # bf16 (default, exact, 2 GiB/layer) or fp8 with one scale per
+                # expert (1 GiB/layer, drops the per-32 block scales: lossy).
+                self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "bf16").lower()
             else:
                 for name in ("w13", "w2"):
                     w, sc = parts[f"{name}_weight"], parts[f"{name}_weight_scale"]

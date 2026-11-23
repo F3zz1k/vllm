@@ -86,11 +86,12 @@ DSpark speculative decoding with the checkpoint's bundled drafter: add
 
 | variable | values (default first) | effect |
 |---|---|---|
-| `VLLM_INKLING2_EXPERTS` | `fp8`, `nvfp4`, `bf16` | experts of layers 0-19; `nvfp4` (recommended) runs the checkpoint's bytes directly (exact, fastest) |
+| `VLLM_INKLING2_EXPERTS` | `nvfp4`, `fp8`, `bf16` | experts of layers 0-19; `nvfp4` runs the checkpoint's bytes directly (exact, fastest); `fp8` re-quantises (lossy) |
+| `VLLM_INKLING2_MXFP8` | `bf16`, `fp8` | experts of layers 20-23 with `EXPERTS=nvfp4`; `bf16` is exact (2 GiB/layer), `fp8` keeps one scale per expert instead of per-32 blocks (lossy, 1 GiB/layer) |
 | `VLLM_INKLING2_DENSE` | `bf16`, `int8` | attention projections; `int8` = per-row W8A8, faster decode, top-1 -0.1 to -0.2 pt |
 | `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme |
 
-## Measured (230 W cap, int8 dense + head, NVFP4 experts, XPU graphs)
+## Measured (230 W cap, int8 dense + head, NVFP4 experts, layers 20-23 fp8, XPU graphs)
 
 t/s, no speculation (DSpark k=7). Chat, greedy, 256 tokens, reasoning on; short prompts are the six task prompts of
 [mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu)'s decode bench; "@N" = one fresh
