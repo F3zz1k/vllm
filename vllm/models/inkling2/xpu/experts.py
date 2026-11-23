@@ -133,10 +133,11 @@ class ExpertStore:
         nvfp4_src = "w13_weight_amax" in parts
         if self.fmt == "nvfp4":
             if not nvfp4_src:
-                # MXFP8 layers have no NVFP4 bytes: VLLM_INKLING2_MXFP8 picks mxfp8
-                # (default: the checkpoint bytes and per-32 scales, exact, 1 GiB/layer),
-                # bf16 (exact, 2 GiB/layer) or fp8 (one scale per expert: lossy).
-                self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "mxfp8").lower()
+                # MXFP8 layers have no NVFP4 bytes: VLLM_INKLING2_MXFP8 picks bf16
+                # (default: exact, 2 GiB/layer), mxfp8 (the checkpoint bytes and per-32
+                # scales: exact, 1 GiB/layer, but the vendor kernel is slower at decode
+                # sizes) or fp8 (one scale per expert: 1 GiB/layer, fastest, lossy).
+                self.fmt = os.environ.get("VLLM_INKLING2_MXFP8", "bf16").lower()
                 if self.fmt not in ("mxfp8", "bf16", "fp8"):
                     raise ValueError(f"VLLM_INKLING2_MXFP8: mxfp8, bf16 or fp8, got {self.fmt!r}")
                 if self.fmt == "mxfp8":
