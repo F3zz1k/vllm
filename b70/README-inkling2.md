@@ -96,23 +96,27 @@ The defaults reproduce the checkpoint (exact). One card with DSpark needs `--gpu
 
 ## Measured (230 W cap, int8 dense + head, NVFP4 experts, layers 20-23 fp8, XPU graphs)
 
-t/s, no speculation (DSpark k=7). Chat, greedy, 256 tokens, reasoning on; short prompts are the six task prompts of
+Decode t/s without speculation ("plain") and with DSpark speculative decoding (k=7). Chat, greedy, 256 tokens,
+reasoning on; short prompts are the six task prompts of
 [mgaruccio/vllm-inkling2-xpu](https://github.com/mgaruccio/vllm-inkling2-xpu)'s decode bench; "@N" = one fresh
-prompt of N tokens of varied filler plus a task; 32 streams = aggregate on short prompts.
+prompt of N tokens of varied filler plus a task; 32 streams = aggregate t/s on short prompts.
 
-| | TP=1 | TP=2 | TP=4 |
-|---|--:|--:|--:|
-| decode, short prompts | 65.0 (97.7) | 78.0 (134.1) | 82.7 (160.7) |
-| decode @32k | 55.1 (95.0) | 61.2 (155.3) | 77.2 (190.3) |
-| decode @128k | n/a | 48.2 (103.0) | 70.9 (173.9) |
-| decode @256k | n/a | 35.9 (69.1) | 63.7 (120.3) |
-| decode @512k | n/a | n/a | 53.1 (88.0) |
-| 32 streams | 628 (445) | 929 (1,005) | 1,229 (1,423) |
-| prefill @32k / 128k / 256k / 512k | 4.2k / n/a | 6.5k / 5.3k / 4.1k | 8.1k / 7.2k / 6.0k / 4.6k |
+| | TP=1 plain | TP=1 DSpark | TP=2 plain | TP=2 DSpark | TP=4 plain | TP=4 DSpark |
+|---|--:|--:|--:|--:|--:|--:|
+| short prompts | 65.0 | 97.7 | 78.0 | 134.1 | 82.7 | 160.7 |
+| @32k | 55.1 | 95.0 | 61.2 | 155.3 | 77.2 | 190.3 |
+| @60k | 51.0 | 85.3 | | | | |
+| @128k | n/a | n/a | 48.2 | 103.0 | 70.9 | 173.9 |
+| @256k | n/a | n/a | 35.9 | 69.1 | 63.7 | 120.3 |
+| @512k | n/a | n/a | n/a | n/a | 53.1 | 88.0 |
+| 32 streams | 628 | 445 | 929 | 1,005 | 1,229 | 1,423 |
 
-TP=1 is configured for 64k (@60k: 51.0 (85.3) t/s decode, 3.9k t/s prefill). Exact defaults on one card: 54.8 (83.4)
-short, 47.8 (94.1) @30k. DSpark loses on one card at 32 streams (KV pool nearly full) and on short chat with
-reasoning off. DSpark t/s depends on the prompt (two 32k fillers on one card: 79.9 and 95.0).
+Prefill t/s (same with or without DSpark): TP=1 4.2k @32k, 3.9k @60k; TP=2 6.5k / 5.3k / 4.1k @32k / 128k / 256k;
+TP=4 8.1k / 7.2k / 6.0k / 4.6k @32k / 128k / 256k / 512k. TP=1 is configured for 64k.
+
+Exact defaults on one card (bf16 dense, head and layers 20-23): plain 54.8 short, 47.8 @30k; DSpark 83.4 short,
+94.1 @30k. DSpark loses on one card at 32 streams (KV pool nearly full) and on short chat with reasoning off. DSpark
+t/s depends on the prompt (two 32k fillers on one card: 79.9 and 95.0).
 
 Quality: top-1 agreement with a transformers BF16 reference 0.994-0.995 (BF16 dense weights: 0.996-0.998; 4,421
 prompt tokens). Needle (passcode at 10/50/90% depth) found 15/15 at 32k-512k; int8 and BF16 dense give the same
