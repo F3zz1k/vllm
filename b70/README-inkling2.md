@@ -92,7 +92,9 @@ DSpark speculative decoding with the checkpoint's bundled drafter: add
 | `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme; `bf16` matches the reference implementation, `fp32` (the config's dtype) costs ~9 ms/token |
 
 The defaults reproduce the checkpoint (exact). One card with DSpark needs `--gpu-memory-utilization 0.92` for 32k
-(or `MXFP8=mxfp8` at 0.85). The table below uses the fast set: `DENSE=int8 HEAD=int8 MXFP8=fp8`.
+(or `MXFP8=mxfp8` at 0.85). The table below uses the fast set: `DENSE=int8 HEAD=int8 MXFP8=fp8`. It is
+slightly lossy: top-1 agreement with the BF16 reference 0.994-0.995 against 0.996-0.998 for the exact defaults (the
+reference itself in BF16 vs FP32 on CPU: 0.994), for about +15% plain decode on one card; needle results unchanged.
 
 ## Measured (230 W cap, int8 dense + head, NVFP4 experts, layers 20-23 fp8, XPU graphs)
 
@@ -118,7 +120,7 @@ Exact defaults on one card (bf16 dense, head and layers 20-23): plain 54.8 short
 94.1 @30k. DSpark loses on one card at 32 streams (KV pool nearly full) and on short chat with reasoning off. DSpark
 t/s depends on the prompt (two 32k fillers on one card: 79.9 and 95.0).
 
-Quality: top-1 agreement with a transformers BF16 reference 0.994-0.995 (BF16 dense weights: 0.996-0.998; 4,421
+Quality: top-1 agreement with a transformers BF16 reference 0.994-0.995 for the fast set (exact defaults: 0.996-0.998; 4,421
 prompt tokens). Needle (passcode at 10/50/90% depth) found 15/15 at 32k-512k; int8 and BF16 dense give the same
 answers at 32k and 128k. Greedy output is bit-identical across runs, with and without DSpark.
 
