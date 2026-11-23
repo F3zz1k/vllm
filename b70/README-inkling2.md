@@ -87,9 +87,12 @@ DSpark speculative decoding with the checkpoint's bundled drafter: add
 | variable | values (default first) | effect |
 |---|---|---|
 | `VLLM_INKLING2_EXPERTS` | `nvfp4`, `fp8`, `bf16` | experts of layers 0-19; `nvfp4` runs the checkpoint's bytes directly (exact, fastest); `fp8` re-quantises (lossy) |
-| `VLLM_INKLING2_MXFP8` | `bf16`, `fp8` | experts of layers 20-23 with `EXPERTS=nvfp4`; `bf16` is exact (2 GiB/layer), `fp8` keeps one scale per expert instead of per-32 blocks (lossy, 1 GiB/layer) |
+| `VLLM_INKLING2_MXFP8` | `bf16`, `mxfp8`, `fp8` | experts of layers 20-23 with `EXPERTS=nvfp4`: `bf16` exact (2 GiB/layer); `mxfp8` the checkpoint bytes, exact, 1 GiB/layer, ~2% slower DSpark; `fp8` one scale per expert instead of per-32 blocks (lossy, 1 GiB/layer, fastest) |
 | `VLLM_INKLING2_DENSE` | `bf16`, `int8` | attention projections; `int8` = per-row W8A8, faster decode, top-1 -0.1 to -0.2 pt |
-| `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme |
+| `VLLM_INKLING2_HEAD` | `bf16`, `int8`, `fp32` | output layer, same scheme; `bf16` matches the reference implementation, `fp32` (the config's dtype) costs ~9 ms/token |
+
+The defaults reproduce the checkpoint (exact). One card with DSpark needs `--gpu-memory-utilization 0.92` for 32k
+(or `MXFP8=mxfp8` at 0.85). The table below uses the fast set: `DENSE=int8 HEAD=int8 MXFP8=fp8`.
 
 ## Measured (230 W cap, int8 dense + head, NVFP4 experts, layers 20-23 fp8, XPU graphs)
 
@@ -99,16 +102,17 @@ prompt of N tokens of varied filler plus a task; 32 streams = aggregate on short
 
 | | TP=1 | TP=2 | TP=4 |
 |---|--:|--:|--:|
-| decode, short prompts | 64.7 (94.1) | 78.0 (130.4) | 82.7 (168.1) |
-| decode @32k | 55.1 (88.1) | 61.2 (123.8) | 77.2 (176.6) |
-| decode @128k | n/a | 48.2 (98.7) | 70.9 (107.5) |
-| decode @256k | n/a | 35.9 (57.9) | 63.7 (69.4) |
-| decode @512k | n/a | n/a | 53.1 (42.1) |
-| 32 streams | 628 (457) | 929 (1,026) | 1,229 (1,319) |
+| decode, short prompts | 65.0 (97.7) | 78.0 (134.1) | 82.7 (160.7) |
+| decode @32k | 55.1 (95.0) | 61.2 (155.3) | 77.2 (190.3) |
+| decode @128k | n/a | 48.2 (103.0) | 70.9 (173.9) |
+| decode @256k | n/a | 35.9 (69.1) | 63.7 (120.3) |
+| decode @512k | n/a | n/a | 53.1 (88.0) |
+| 32 streams | 628 (445) | 929 (1,005) | 1,229 (1,423) |
 | prefill @32k / 128k / 256k / 512k | 4.2k / n/a | 6.5k / 5.3k / 4.1k | 8.1k / 7.2k / 6.0k / 4.6k |
 
-TP=1 is configured for 64k (@60k: 51.0 (83.3) t/s decode, 3.9k t/s prefill). DSpark loses on one card at 32 streams
-(KV pool nearly full), at 512k, and on short chat with reasoning off (63.8 vs 64.6 t/s).
+TP=1 is configured for 64k (@60k: 51.0 (85.3) t/s decode, 3.9k t/s prefill). Exact defaults on one card: 54.8 (83.4)
+short, 47.8 (94.1) @30k. DSpark loses on one card at 32 streams (KV pool nearly full) and on short chat with
+reasoning off. DSpark t/s depends on the prompt (two 32k fillers on one card: 79.9 and 95.0).
 
 Quality: top-1 agreement with a transformers BF16 reference 0.994-0.995 (BF16 dense weights: 0.996-0.998; 4,421
 prompt tokens). Needle (passcode at 10/50/90% depth) found 15/15 at 32k-512k; int8 and BF16 dense give the same
