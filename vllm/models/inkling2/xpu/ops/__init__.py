@@ -45,7 +45,7 @@ def attn_res(stack: torch.Tensor, n: int, last: torch.Tensor, addend: torch.Tens
     one mix per query row: fp32 `(Q, T, D)`, or bf16 RMS-normalized with the
     matching row of `norm_weight` `(Q, D)` (the next sublayer's norm, fused). With
     `quant`: (out, int8 rows or None), the rows for an int8 GEMM, fused at decode sizes."""
-    if BACKEND == "triton" and last.is_xpu or (BACKEND == "triton" and ref_interp()):
+    if BACKEND == "triton" and (last.is_xpu or ref_interp()):
         from .triton_attn_res import attn_res as tri
 
         return tri(stack[:n], last.contiguous(), None if addend is None else addend.contiguous(),

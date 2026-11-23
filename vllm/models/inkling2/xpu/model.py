@@ -566,7 +566,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module, HasInnerState, IsHybrid, S
             if not self._keep_head_bf16:
                 self.lm_head.weight.data = torch.empty(0, dtype=self.lm_head.weight.dtype,
                                                        device=q.device)
-        torch.xpu.empty_cache() if torch.xpu.is_available() else None
+        if torch.xpu.is_available():
+            torch.xpu.empty_cache()
 
     # ---------------------------------------------------------------- weights
 
