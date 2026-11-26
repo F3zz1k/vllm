@@ -45,8 +45,9 @@ def rel_attention(q: torch.Tensor, kv: torch.Tensor, rel: torch.Tensor, sinks: t
                   block_table: torch.Tensor, seq_lens: torch.Tensor, cu_q: torch.Tensor,
                   scale: float, window: int | None, max_q: int, max_k: int,
                   num_splits: int = 1, out: torch.Tensor | None = None,
-                  return_lse: bool = False):
-    """q (T, Hq, D) bf16; kv [B, Hk, page, 2D] (K | V); rel (T, Hq, E) bf16 with
+                  return_lse: bool = False, kv_scales=(None, None)):
+    """q (T, Hq, D) bf16; kv [B, Hk, page, 2D] (K | V) bf16, or fp8 with `kv_scales`
+    (k_scale, v_scale: one-element fp32 tensors); rel (T, Hq, E) bf16 with
     column d = bias at distance d; sinks (T, Hq); returns (T, Hq, D) bf16. With
     `return_lse`, the sinks are not applied: returns (out, lse (Hq, T) fp32)."""
     D = q.shape[-1]
@@ -57,7 +58,8 @@ def rel_attention(q: torch.Tensor, kv: torch.Tensor, rel: torch.Tensor, sinks: t
     lse = torch.empty((q.shape[1], q.shape[0]), dtype=torch.float32, device=q.device)
     torch.ops._inkling2_C.rel_attention(
         q, k, v, out, cu_q, seq_lens, block_table, max_q, max_k, scale,
-        -1 if window is None else window - 1, rel, lse, num_splits)
+        -1 if window is None else window - 1, rel, lse, num_splits,
+        *(() if kv_scales[0] is None else kv_scales))  # bf16: the pre-fp8 op signature too
     if return_lse:
         return out, lse
     gate = torch.sigmoid(lse.t() - sinks.float())  # (T, Hq)

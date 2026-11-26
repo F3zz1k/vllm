@@ -45,6 +45,9 @@ from vllm.v1.kv_cache_interface import (
 
 from .ops.ref import ConvLayout
 
+_FP8_VIEW = {"fp8": torch.float8_e4m3fn, "fp8_e4m3": torch.float8_e4m3fn,
+             "fp8_e5m2": torch.float8_e5m2}
+
 
 def _register(prefix: str, layer: nn.Module) -> None:
     ctx = get_current_vllm_config().compilation_config.static_forward_context
@@ -74,10 +77,37 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
         vllm_config = get_current_vllm_config()
         self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.dtype = kv_cache_dtype_str_to_dtype(self.kv_cache_dtype, vllm_config.model_config)
+        # fp8 KV (`--kv-cache-dtype fp8` / `fp8_e4m3` / `fp8_e5m2`): vLLM allocates uint8 pages;
+        # the conv kernel stores into, and the SYCL attention reads, the fp8 view. Per-tensor
+        # scale 1.0: K is L2-clipped (<= qk_l2_clip_threshold, 22.6) and V RMS-normalized, so
+        # both sit well inside e4m3's range.
+        self.fp8_dtype = _FP8_VIEW.get(self.kv_cache_dtype)
+        if self.kv_cache_dtype.startswith("fp8") and self.fp8_dtype is None:
+            raise ValueError(f"Inkling2: unsupported KV cache dtype {self.kv_cache_dtype!r}")
+        if self.fp8_dtype is not None:
+            block = vllm_config.cache_config.block_size
+            if block != 64:
+                # The hybrid allocator raises the attention block until a page holds the
+                # largest conv state (one hidden-size stream of 3 + num_speculative_tokens
+                # bf16 rows); the SYCL kernels serve 64-token pages only.
+                raise ValueError(
+                    f"Inkling2 fp8 KV needs 64-token KV pages, but the conv state page sets "
+                    f"{block} at this TP size and speculative length (an fp8 page of 64 tokens "
+                    f"is smaller than the state); use bf16 KV here, a smaller TP size, or "
+                    f"fewer speculative tokens")
+        self.register_buffer("kv_scale", torch.ones(1, dtype=torch.float32), persistent=False)
         self.kv_cache = torch.tensor([])
         _register(prefix, self)
 
     def forward(self): ...
+
+    def kv(self) -> torch.Tensor:
+        """The cache the kernels read and write: the fp8 view of the uint8 pages under fp8 KV."""
+        return self.kv_cache if self.fp8_dtype is None else self.kv_cache.view(self.fp8_dtype)
+
+    def scales(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """(k_scale, v_scale) for the SYCL attention: the 1.0 tensors under fp8 KV, else None."""
+        return (None, None) if self.fp8_dtype is None else (self.kv_scale, self.kv_scale)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return FlashAttentionBackend
@@ -93,7 +123,7 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
 
     def view(self) -> torch.Tensor:
         """The visit's cache as [num_blocks, H, block_size, 2 * D]."""
-        return self.kv_cache
+        return self.kv()
 
 
 @dataclass

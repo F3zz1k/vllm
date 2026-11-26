@@ -16,8 +16,11 @@ from vllm.models.inkling2.xpu.ops.triton_sconv import short_conv
 DEV = os.environ.get("INKLING2_TEST_DEVICE", "cpu")
 
 
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("mode", ["static", "dynamic_k", "dynamic_v", "attn", "resid"])
-def test_short_conv_steps(mode):
+def test_short_conv_steps(mode, fp8):
+    if fp8 and mode not in ("dynamic_k", "dynamic_v"):
+        pytest.skip("fp8 KV: only the K / V streams store")
     g = torch.Generator().manual_seed(1)
     H, hd, hidden, k = 2, 32, 128, 4
     layout = ref.ConvLayout.make(H, hd, hidden)
@@ -30,6 +33,9 @@ def test_short_conv_steps(mode):
     st_tri = st_ref.clone().to(DEV)
     kv_ref = torch.zeros(20, H, 16, 2 * hd).bfloat16()
     kv_tri = kv_ref.clone().to(DEV)
+    if fp8:  # the model's view of vLLM's uint8 fp8 pages
+        kv_tri = torch.zeros(kv_ref.shape, dtype=torch.uint8, device=DEV).view(
+            torch.float8_e4m3fn)
     dyn_mode = mode.startswith("dynamic")
     weight = (torch.randn((k, C) if dyn_mode else (C, k), generator=g) * 0.4)
     if dyn_mode:
@@ -80,7 +86,12 @@ def test_short_conv_steps(mode):
         if norm:
             o = 0 if mode == "dynamic_k" else hd
             stored = kv_tri.cpu()[kvs // 16, :, kvs % 16, o:o + hd]
-            assert (stored.float() - got.view(T, H, hd).float()).abs().max() == 0
+            want_kv = got.view(T, H, hd).float()
+            if fp8:  # one e4m3 rounding of the stored value (3 mantissa bits)
+                diff = (stored.float() - want_kv).abs()
+                assert (diff <= want_kv.abs() * 2.0**-4 + 2.0**-9).all(), diff.max()
+            else:
+                assert (stored.float() - want_kv).abs().max() == 0
         assert torch.equal(st_tri.cpu(), st_ref), step
 
 

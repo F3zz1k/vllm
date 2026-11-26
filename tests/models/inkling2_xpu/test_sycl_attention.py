@@ -47,3 +47,26 @@ def test_sycl_rel_attention(window, page, qlens, ctxs, splits):
                           window, max(qlens), int(sl.max()), num_splits=splits).cpu()
     err = (got.float() - want.float()).abs().max().item()
     assert err < 3e-2, err
+
+
+@pytest.mark.parametrize("window", [None, 100])
+@pytest.mark.parametrize("fp8", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("qlens,ctxs,splits", [([37], [0], 1), ([1, 1], [700, 40], 4),
+                                               ([9, 1, 200], [40, 3, 170], 1)])
+def test_sycl_rel_attention_fp8(window, fp8, qlens, ctxs, splits):
+    """fp8 KV pages (scale 1): the kernel must match the reference over the same fp8 values."""
+    if DEV == "cpu":
+        pytest.skip("XPU only")
+    from vllm.models.inkling2.xpu.ops import sycl_attention as S
+    assert S.available()
+    E = 128
+    q, kv, rel, sinks, bt, sl, cu = _case(qlens, ctxs, E, page=64)
+    kv8 = kv.to(fp8)
+    want = ref.rel_attention(q, rel, sinks, kv8.bfloat16(), bt, sl, cu, 128 ** -0.5, window, E)
+    d = lambda t: t.to(DEV)
+    one = torch.ones(1, dtype=torch.float32, device=DEV)
+    got = S.rel_attention(d(q), d(kv8), d(rel), d(sinks), d(bt), d(sl), d(cu), 128 ** -0.5,
+                          window, max(qlens), int(sl.max()), num_splits=splits,
+                          kv_scales=(one, one)).cpu()
+    err = (got.float() - want.float()).abs().max().item()
+    assert err < 3e-2, err

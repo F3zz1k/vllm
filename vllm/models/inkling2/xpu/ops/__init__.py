@@ -128,7 +128,7 @@ def conv(owner, md, stream: str, x: torch.Tensor, weight: torch.Tensor,
     if BACKEND == "triton" and have_md:
         from .triton_sconv import short_conv
 
-        kv = kv_owner.kv_cache if (kv_owner is not None and kv_md is not None) else None
+        kv = kv_owner.kv() if (kv_owner is not None and kv_md is not None) else None
         return short_conv(x, owner.state, off, hph, owner.layout.width, md.seq_idx[:T],
                           md.query_start[:T], md.query_start_loc, md.block_table, md.seq_lens,
                           weight, dyn=dyn, norm=norm, clip=clip, eps=eps, kv=kv,
@@ -163,7 +163,7 @@ def conv(owner, md, stream: str, x: torch.Tensor, weight: torch.Tensor,
     if kv_owner is not None and kv_md is not None and kv_owner.kv_cache.numel() > 0:
         slots = kv_md.slot_mapping[:T]
         valid = slots >= 0
-        cache = kv_owner.kv_cache
+        cache = kv_owner.kv()
         page = cache.shape[2]
         o = 0 if stream == "k" else hph
         cache[slots[valid] // page, :, slots[valid] % page, o:o + hph] = (
@@ -299,8 +299,9 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
             from .triton_glue import attn_post, attn_post_q
 
             _, lse = sycl_attention.rel_attention(
-                q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], bt, lens, qsl, scale, window,
-                max_q, md.max_seq_len, num_splits=splits, out=out[:n], return_lse=True)
+                q[:n], owner.kv(), rel_logits[:n], sinks[:n], bt, lens, qsl, scale, window,
+                max_q, md.max_seq_len, num_splits=splits, out=out[:n], return_lse=True,
+                kv_scales=owner.scales())
             if (_ROWWISE_CHECK and md.max_query_len > 1
                     and not torch.xpu.is_current_stream_capturing()):
                 bad = ~torch.isfinite(out[:n].float()).all(-1).all(-1)
@@ -315,10 +316,13 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
             else:
                 attn_post(out, lse, sinks, gate, gated, n)
             return
-        sycl_attention.rel_attention(q[:n], owner.kv_cache, rel_logits[:n], sinks[:n], bt, lens,
+        sycl_attention.rel_attention(q[:n], owner.kv(), rel_logits[:n], sinks[:n], bt, lens,
                                      qsl, scale, window, max_q, md.max_seq_len,
-                                     num_splits=splits, out=out[:n])
+                                     num_splits=splits, out=out[:n], kv_scales=owner.scales())
         return
+    if owner.fp8_dtype is not None:
+        raise NotImplementedError("Inkling2 fp8 KV runs on the SYCL attention only "
+                                  "(VLLM_INKLING2_ATTN=sycl, 64-token pages)")
     if BACKEND == "triton":
         from .triton_attention import rel_attention
 

@@ -28,7 +28,8 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+from vllm.platforms import current_platform
+from vllm.utils.torch_utils import canonicalize_singleton_dim_strides, is_quantized_kv_cache
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -233,7 +234,13 @@ class Inkling2DraftSelfAttention(nn.Module):
                 v.view(-1, self.num_kv_heads, self.head_dim),
                 md.slot_mapping[: q.shape[0]],
             )
-            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+            kv_cache = self.attn.kv_cache
+            scales = None
+            if is_quantized_kv_cache(self.attn.kv_cache_dtype):
+                # fp8 KV: the impl stored the fp8 bytes (scale 1.0) into the uint8 pages
+                kv_cache = kv_cache.view(current_platform.fp8_dtype())
+                scales = (self.attn._k_scale, self.attn._v_scale)
+            key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_dim, dim=-1
             )
             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
@@ -242,7 +249,7 @@ class Inkling2DraftSelfAttention(nn.Module):
             block_attention(
                 q[:num_tokens].view(num_tokens, self.num_heads, self.head_dim),
                 key_cache, value_cache, o, md.block_table[:num_reqs], md.seq_lens[:num_reqs],
-                self.block, self.window, self.head_dim**-0.5)
+                self.block, self.window, self.head_dim**-0.5, scales)
         return linear(out, self.o_proj.weight)
 
     def store_context_kv(

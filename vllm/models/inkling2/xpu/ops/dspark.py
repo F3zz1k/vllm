@@ -270,7 +270,7 @@ def _decode_kernel_fits(q, key_cache) -> bool:
 
 
 def _block_attention_decode(q, key_cache, value_cache, out, block_table, cache_seqlens,
-                            block: int, scale: float):
+                            block: int, scale: float, scales=None):
     """Global layers: the block is bidirectional, so every row of request r sees all of its
     keys; one decode row per draft token with the request's block table and length."""
     n, H = q.shape[0], q.shape[1]
@@ -281,12 +281,13 @@ def _block_attention_decode(q, key_cache, value_cache, out, block_table, cache_s
     torch.ops._inkling2_C.rel_attention(
         q, key_cache, value_cache, out, torch.arange(n + 1, dtype=torch.int32, device=q.device),
         cache_seqlens.index_select(0, req), block_table.index_select(0, req), 1,
-        int(block_table.shape[1]) * key_cache.shape[1], scale, -1, rel, lse, splits)
+        int(block_table.shape[1]) * key_cache.shape[1], scale, -1, rel, lse, splits,
+        *(() if scales is None else (scales[0].reshape(1), scales[1].reshape(1))))
     return out
 
 
 def block_attention(q, key_cache, value_cache, out, block_table, cache_seqlens, block: int,
-                    window: int, scale: float) -> torch.Tensor:
+                    window: int, scale: float, scales=None) -> torch.Tensor:
     """Bidirectional attention of each request's draft block (the last `block` positions
     of its sequence) over the paged cache: every key of the block, plus for local layers
     the sliding window before it (`window` = sliding_window + block, 0 = all keys).
@@ -295,10 +296,10 @@ def block_attention(q, key_cache, value_cache, out, block_table, cache_seqlens, 
     The XPU varlen kernel takes one left window for all queries: (window - block, block - 1)
     lets the query at block offset b see from its own position - sliding_window, so it
     misses the b oldest keys of the window (at most block - 1 of sliding_window + block)
-    and never reads a page outside the window."""
+    and never reads a page outside the window. `scales` = (k_scale, v_scale) for fp8 views."""
     if not window and _DRAFT_DECODE and _decode_kernel_fits(q, key_cache):
         return _block_attention_decode(q, key_cache, value_cache, out, block_table,
-                                       cache_seqlens, block, scale)
+                                       cache_seqlens, block, scale, scales)
     from vllm._xpu_ops import xpu_ops
 
     num_reqs = cache_seqlens.shape[0]
@@ -308,5 +309,8 @@ def block_attention(q, key_cache, value_cache, out, block_table, cache_seqlens, 
                                    int(block_table.shape[1]) * key_cache.shape[1],
                                    softmax_scale=scale, causal=False, out=out,
                                    block_table=block_table, window_size=ws,
-                                   seqused_k=cache_seqlens)
+                                   seqused_k=cache_seqlens,
+                                   **({} if scales is None else dict(
+                                       k_descale=scales[0].expand(num_reqs, key_cache.shape[2]),
+                                       v_descale=scales[1].expand(num_reqs, key_cache.shape[2]))))
     return out

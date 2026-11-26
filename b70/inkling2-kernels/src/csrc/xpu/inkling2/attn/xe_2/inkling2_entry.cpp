@@ -22,13 +22,31 @@ void rel_attention(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
                    const at::Tensor& seqused_k, const at::Tensor& block_table,
                    int64_t max_seqlen_q, int64_t max_seqlen_k, double softmax_scale,
                    int64_t window_left, const at::Tensor& rel, at::Tensor& lse,
-                   int64_t num_splits) {
+                   int64_t num_splits, const std::optional<at::Tensor>& k_scale,
+                   const std::optional<at::Tensor>& v_scale) {
   TORCH_CHECK(q.dim() == 3 && q.stride(-1) == 1, "q: [T, Hq, D], contiguous D");
   TORCH_CHECK(rel.scalar_type() == at::kBFloat16 && rel.stride(-1) == 1,
               "rel: bf16 [T, Hq, E]");
   TORCH_CHECK(lse.scalar_type() == at::kFloat && lse.is_contiguous() &&
                   lse.size(0) == q.size(1) && lse.size(1) == q.size(0),
               "lse: fp32 [Hq, T]");
+  // fp8 KV (e4m3 / e5m2 views of the cache): per-tensor scales, one fp32 element each.
+  // The kernels fold k_scale into the softmax scale, so the relative bias (added before
+  // that scale, divided by softmax_scale) is exact only at k_scale == 1, which is what
+  // the model passes.
+  const bool fp8_kv = k.scalar_type() == at::ScalarType::Float8_e4m3fn ||
+                      k.scalar_type() == at::ScalarType::Float8_e5m2;
+  TORCH_CHECK(v.scalar_type() == k.scalar_type(), "k and v caches: one dtype");
+  TORCH_CHECK(!fp8_kv || (k_scale.has_value() && v_scale.has_value()),
+              "fp8 KV needs k_scale and v_scale");
+  std::optional<const at::Tensor> ks, vs;
+  if (fp8_kv) {
+    TORCH_CHECK(k_scale->scalar_type() == at::kFloat && k_scale->numel() == 1 &&
+                    v_scale->scalar_type() == at::kFloat && v_scale->numel() == 1,
+                "k_scale / v_scale: one fp32 element each");
+    ks = *k_scale;
+    vs = *v_scale;
+  }
   auto& queue = vllm::xpu::vllmGetQueue(q.device().index());
   xe2::g_rel = {rel.data_ptr(), static_cast<int>(rel.stride(0)),
                 static_cast<int>(rel.stride(1)), static_cast<int>(rel.size(2))};
@@ -41,7 +59,7 @@ void rel_attention(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
     // chunk prefill serves every row (decode rows too): no mixed-batch split
     xe2::cutlass_chunk_prefill_xe2(
         queue, q, k, v, out, block_table, cu_seqlens_q, seqused_k,
-        static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k), none, none,
+        static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k), ks, vs,
         softmax_scale, none, wl, wr, /*is_varlen=*/true, /*is_paged=*/true,
         /*is_causal=*/true, is_local, /*is_sink=*/false, lse_opt, none);
   } else {
@@ -55,7 +73,7 @@ void rel_attention(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
     std::optional<at::Tensor> no_t;
     xe2::cutlass_paged_decode_xe2(
         queue, q, k, v, out, tmp_out, lse_accum, block_table, cu_seqlens_q, seqused_k,
-        static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k), none, none,
+        static_cast<int>(max_seqlen_q), static_cast<int>(max_seqlen_k), ks, vs,
         softmax_scale, none, eff_left, eff_right, /*is_varlen=*/true,
         /*is_paged=*/true, /*is_causal=*/false, is_local, /*is_sink=*/false, splits,
         none, no_t, no_t, lse_opt);
