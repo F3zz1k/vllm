@@ -179,7 +179,9 @@ class Inkling2DraftSelfAttention(nn.Module):
         self.k_norm_ctx = _RMSNorm(self.head_dim, self.eps)
         # Owns the paged KV cache only; the same spec as the target's layers
         # (the scheduler keeps the last sliding_window_size positions before
-        # the block, which is what the draft reads).
+        # the block, which is what the draft reads). The cache config carries the
+        # KV dtype: without it the draft keeps bf16 pages under fp8 KV, twice the
+        # target's page, and vLLM doubles the target's KV block to unify them.
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -188,6 +190,7 @@ class Inkling2DraftSelfAttention(nn.Module):
             per_layer_sliding_window=config.sliding_window_size if is_local else None,
             prefix=f"{prefix}.attn",
             attn_backend=FlashAttentionBackend,
+            cache_config=get_current_vllm_config().cache_config,
         )
         # Keys a block sees: itself and, if local, the window before it.
         self.window = config.sliding_window_size + self.block if is_local else 0

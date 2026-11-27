@@ -326,6 +326,11 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
         # SYCL path serves those. Their output is discarded; the Triton kernels have no fp8.
         if not _use_sycl_attention():
             raise NotImplementedError("Inkling2 fp8 KV needs VLLM_INKLING2_ATTN=sycl")
+        if owner.kv_cache.numel() > 0:
+            logger.warning_once(
+                "inkling2 fp8 KV: attention skipped on a cache of shape %s (not 64-token pages); "
+                "harmless in a profile run, wrong output in serving",
+                tuple(owner.kv_cache.shape))
         return
     if BACKEND == "triton":
         from .triton_attention import rel_attention
