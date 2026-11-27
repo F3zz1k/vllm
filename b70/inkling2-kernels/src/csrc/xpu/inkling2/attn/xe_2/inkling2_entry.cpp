@@ -39,14 +39,16 @@ void rel_attention(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
   TORCH_CHECK(v.scalar_type() == k.scalar_type(), "k and v caches: one dtype");
   TORCH_CHECK(!fp8_kv || (k_scale.has_value() && v_scale.has_value()),
               "fp8 KV needs k_scale and v_scale");
-  std::optional<const at::Tensor> ks, vs;
   if (fp8_kv) {
     TORCH_CHECK(k_scale->scalar_type() == at::kFloat && k_scale->numel() == 1 &&
                     v_scale->scalar_type() == at::kFloat && v_scale->numel() == 1,
                 "k_scale / v_scale: one fp32 element each");
-    ks = *k_scale;
-    vs = *v_scale;
   }
+  // const optionals are not assignable: construct them once
+  std::optional<const at::Tensor> ks =
+      fp8_kv ? std::optional<const at::Tensor>(*k_scale) : std::nullopt;
+  std::optional<const at::Tensor> vs =
+      fp8_kv ? std::optional<const at::Tensor>(*v_scale) : std::nullopt;
   auto& queue = vllm::xpu::vllmGetQueue(q.device().index());
   xe2::g_rel = {rel.data_ptr(), static_cast<int>(rel.stride(0)),
                 static_cast<int>(rel.stride(1)), static_cast<int>(rel.size(2))};
