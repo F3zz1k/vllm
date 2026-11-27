@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     SlidingWindowSpec,
+    get_kv_quant_mode,
 )
 
 from .ops.ref import ConvLayout
@@ -113,12 +114,17 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
                 f"{block_size} at this TP size and speculative length (an fp8 page of 64 "
                 f"tokens is smaller than the state); use bf16 KV here, a smaller TP size, "
                 f"or fewer speculative tokens")
+        # kv_quant_mode as vLLM's Attention sets it (the DSpark draft layers): the hybrid
+        # grouping buckets layers by spec, and a draft spec that differs from the target's
+        # only in this field leaves one-layer buckets, i.e. one KV cache group per layer
+        # (195 groups under fp8, each building its metadata every step).
+        qm = get_kv_quant_mode(self.kv_cache_dtype)
         if self.sliding_window is not None:
             return SlidingWindowSpec(block_size=block_size, num_kv_heads=self.num_kv_heads,
                                      head_size=self.head_dim, dtype=self.dtype,
-                                     sliding_window=self.sliding_window)
+                                     kv_quant_mode=qm, sliding_window=self.sliding_window)
         return FullAttentionSpec(block_size=block_size, num_kv_heads=self.num_kv_heads,
-                                 head_size=self.head_dim, dtype=self.dtype)
+                                 head_size=self.head_dim, dtype=self.dtype, kv_quant_mode=qm)
 
     def view(self) -> torch.Tensor:
         """The visit's cache as [num_blocks, H, block_size, 2 * D]."""
