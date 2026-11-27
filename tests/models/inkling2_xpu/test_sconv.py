@@ -115,7 +115,11 @@ def test_short_conv_spec(mode):
     d = lambda t: t.to(DEV)
     i32 = lambda v: torch.tensor(v, dtype=torch.int32, device=DEV)
     # per step: (req, rows); decode rows (1 + S) first, as vLLM orders them
-    steps = [[(0, 6)], [(0, 4), (1, 9)], [(0, 4), (1, 4)], [(0, 4), (1, 4)], [(1, 4), (0, 2)]]
+    # verify rows shorter than 1 + S (a dynamic draft-length schedule, drafts cut at
+    # max_model_len) followed by more steps, so the next step reads the state they left
+    steps = [[(0, 6)], [(0, 4), (1, 9)], [(0, 4), (1, 4)], [(0, 4), (1, 4)], [(1, 4), (0, 2)],
+             [(0, 4), (1, 2)], [(0, 3), (1, 4)], [(0, 1), (1, 3)], [(0, 2), (1, 1)],
+             [(0, 4), (1, 4)]]
     for step in steps:
         qsl = [0]
         for _, n in step:

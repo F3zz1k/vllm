@@ -166,6 +166,16 @@ class Inkling2ConvMetadataBuilder(ShortConvAttentionMetadataBuilder):
                        query_start_loc=m.query_start_loc, block_table=m.block_table_tensor,
                        align=self.align, state_block_size=self.kv_cache_spec.block_size)
 
+    def build_for_cudagraph_capture(self, common_attn_metadata: CommonAttentionMetadata):
+        """Decode-only capture, as the base, but for any verify length up to 1 + spec (a
+        dynamic draft-length schedule captures shorter decode tiers); the conv kernel takes
+        each request's length from query_start_loc."""
+        m = common_attn_metadata
+        assert m.max_query_len <= 1 + self.num_spec_tokens, m.max_query_len
+        assert m.num_reqs <= self.decode_cudagraph_max_bs, m.num_reqs
+        num_accepted = torch.diff(m.query_start_loc) if self.num_spec_tokens > 0 else None
+        return self.build(0, m, num_accepted_tokens=num_accepted)
+
     def update_block_table(self, metadata, blk_table, slot_mapping):
         return replace(super().update_block_table(metadata, blk_table, slot_mapping),
                        block_table=blk_table)

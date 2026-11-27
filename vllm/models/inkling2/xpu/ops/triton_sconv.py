@@ -125,15 +125,18 @@ def _sconv_kernel(
                           DYNAMIC=DYNAMIC, NORM=NORM, STORE_KV=STORE_KV, KV_PAGE=KV_PAGE,
                           RESID=RESID, HAS_ADD=HAS_ADD)
         # new state, all loads before the stores. Prefill rows: rows 0..K-2 = the last K - 1
-        # inputs (older ones from the old state). Decode rows (S > 0): the window shifted by
-        # one, then the step's inputs: rows j < R - L from old row w + 1 + j, the rest from x.
+        # inputs (older ones from the old state). Decode rows (S > 0): the K - 2 inputs before
+        # the step (old rows w + 1 + j), then the step's L inputs at rows K - 2 .. K - 3 + L, so
+        # the next step's window from row num_accepted - 1 ends at its last accepted token for
+        # any L <= 1 + S (a verify of fewer drafts: dynamic draft lengths, or drafts cut at
+        # max_model_len); rows past the step's inputs are not read and stay as they were.
         R = K - 1 + S
         rows = tl.arange(0, KP)
         if is_dec:
-            from_old = rows < R - L
+            from_old = rows < K - 2
             old_row = tl.minimum(w + 1 + rows, R - 1)
-            src = rows - (R - L)
-            rm = rows < R
+            src = rows - (K - 2)
+            rm = rows < K - 2 + L
         else:
             src = L - (K - 1) + rows
             from_old = src < 0
