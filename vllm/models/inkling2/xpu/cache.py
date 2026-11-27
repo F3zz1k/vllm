@@ -85,6 +85,13 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
         self.fp8_dtype = _FP8_VIEW.get(self.kv_cache_dtype)
         if self.kv_cache_dtype.startswith("fp8") and self.fp8_dtype is None:
             raise ValueError(f"Inkling2: unsupported KV cache dtype {self.kv_cache_dtype!r}")
+        if (self.fp8_dtype is not None and vllm_config.speculative_config is not None
+                and vllm_config.parallel_config.tensor_parallel_size > 1):
+            # Validated: fp8 + DSpark at TP=1, fp8 without speculation at TP=2. fp8 + DSpark at
+            # TP=2 loses the device under concurrent mixed batches (BUGS.md
+            # bug-inkling2-fp8-kv-dspark-tp2-device-lost); every kernel passes in isolation.
+            raise ValueError("Inkling2 fp8 KV with DSpark is validated at TP=1 only; at TP>1 "
+                             "use fp8 without --speculative-config, or bf16 KV")
         self.register_buffer("kv_scale", torch.ones(1, dtype=torch.float32), persistent=False)
         self.kv_cache = torch.tensor([])
         _register(prefix, self)
