@@ -84,17 +84,6 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
         self.fp8_dtype = _FP8_VIEW.get(self.kv_cache_dtype)
         if self.kv_cache_dtype.startswith("fp8") and self.fp8_dtype is None:
             raise ValueError(f"Inkling2: unsupported KV cache dtype {self.kv_cache_dtype!r}")
-        if self.fp8_dtype is not None:
-            block = vllm_config.cache_config.block_size
-            if block != 64:
-                # The hybrid allocator raises the attention block until a page holds the
-                # largest conv state (one hidden-size stream of 3 + num_speculative_tokens
-                # bf16 rows); the SYCL kernels serve 64-token pages only.
-                raise ValueError(
-                    f"Inkling2 fp8 KV needs 64-token KV pages, but the conv state page sets "
-                    f"{block} at this TP size and speculative length (an fp8 page of 64 tokens "
-                    f"is smaller than the state); use bf16 KV here, a smaller TP size, or "
-                    f"fewer speculative tokens")
         self.register_buffer("kv_scale", torch.ones(1, dtype=torch.float32), persistent=False)
         self.kv_cache = torch.tensor([])
         _register(prefix, self)
@@ -114,6 +103,16 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size = vllm_config.cache_config.block_size
+        if self.fp8_dtype is not None and block_size != 64:
+            # Final here (the platform sets it after the layers are built): the hybrid
+            # allocator raises the attention block until a page holds the largest conv state
+            # (one hidden-size stream of 3 + num_speculative_tokens bf16 rows); the SYCL
+            # kernels serve 64-token pages only.
+            raise ValueError(
+                f"Inkling2 fp8 KV needs 64-token KV pages, but the conv state page sets "
+                f"{block_size} at this TP size and speculative length (an fp8 page of 64 "
+                f"tokens is smaller than the state); use bf16 KV here, a smaller TP size, "
+                f"or fewer speculative tokens")
         if self.sliding_window is not None:
             return SlidingWindowSpec(block_size=block_size, num_kv_heads=self.num_kv_heads,
                                      head_size=self.head_dim, dtype=self.dtype,
