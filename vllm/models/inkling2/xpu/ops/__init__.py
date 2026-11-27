@@ -320,7 +320,7 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
                                      qsl, scale, window, max_q, md.max_seq_len,
                                      num_splits=splits, out=out[:n], kv_scales=owner.scales())
         return
-    if owner.fp8_dtype is not None:
+    if owner.fp8_dtype is not None and owner.kv_cache.numel() > 0:  # (profile runs: no pages)
         raise NotImplementedError("Inkling2 fp8 KV runs on the SYCL attention only "
                                   "(VLLM_INKLING2_ATTN=sycl, 64-token pages)")
     if BACKEND == "triton":
