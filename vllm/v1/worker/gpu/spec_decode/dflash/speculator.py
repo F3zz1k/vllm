@@ -147,6 +147,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.device,
             cudagraph_mode,
             decode_query_len=self.num_query_per_req,
+            # the draft runs its whole block (num_query_per_req rows) every step; a dynamic
+            # schedule only truncates the drafts afterwards, so one decode tier
+            dynamic_decode_tiers=False,
         )
 
     def capture(self) -> None:

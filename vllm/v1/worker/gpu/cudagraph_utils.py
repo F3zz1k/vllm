@@ -152,8 +152,13 @@ class CudaGraphManager:
         lora_capture_cases: list[int] | None = None,
         varlen_decode: bool = False,
         ubatch_runner: "UBatchRunner | None" = None,
+        dynamic_decode_tiers: bool = True,
     ):
+        """`dynamic_decode_tiers`: under a dynamic draft-length schedule, capture one decode
+        tier per scheduled verify length (the target model). False for a drafter whose
+        query per request is fixed whatever the schedule (DFlash family)."""
         self.vllm_config = vllm_config
+        self.dynamic_decode_tiers = dynamic_decode_tiers
         self.device = device
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.compilation_config = vllm_config.compilation_config
@@ -272,6 +277,7 @@ class CudaGraphManager:
         if (
             speculative_config
             and speculative_config.uses_dynamic_speculative_decoding()
+            and self.dynamic_decode_tiers
             and self.decode_query_len > self.vllm_config.num_speculative_tokens
         ):
             # decode_query_len = num_speculative_steps + num_new_sampled_tokens
