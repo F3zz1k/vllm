@@ -320,9 +320,13 @@ def _attention_into(out, q, rel_logits, sinks, gated, gate, xq, xs, *, owner, sc
                                      qsl, scale, window, max_q, md.max_seq_len,
                                      num_splits=splits, out=out[:n], kv_scales=owner.scales())
         return
-    if owner.fp8_dtype is not None and owner.kv_cache.numel() > 0:  # (profile runs: no pages)
-        raise NotImplementedError("Inkling2 fp8 KV runs on the SYCL attention only "
-                                  "(VLLM_INKLING2_ATTN=sycl, 64-token pages)")
+    if owner.fp8_dtype is not None:
+        # Only profile runs get here (no pages, or the graph-memory profile's temporary
+        # cache): get_kv_cache_spec refuses fp8 unless real pages are 64 tokens, and the
+        # SYCL path serves those. Their output is discarded; the Triton kernels have no fp8.
+        if not _use_sycl_attention():
+            raise NotImplementedError("Inkling2 fp8 KV needs VLLM_INKLING2_ATTN=sycl")
+        return
     if BACKEND == "triton":
         from .triton_attention import rel_attention
 
