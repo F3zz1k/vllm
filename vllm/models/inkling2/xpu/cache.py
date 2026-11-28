@@ -85,13 +85,6 @@ class Inkling2KVCache(nn.Module, AttentionLayerBase):
         self.fp8_dtype = _FP8_VIEW.get(self.kv_cache_dtype)
         if self.kv_cache_dtype.startswith("fp8") and self.fp8_dtype is None:
             raise ValueError(f"Inkling2: unsupported KV cache dtype {self.kv_cache_dtype!r}")
-        if (self.fp8_dtype is not None and vllm_config.speculative_config is not None
-                and vllm_config.parallel_config.tensor_parallel_size > 1):
-            # Validated: fp8 + DSpark at TP=1, fp8 without speculation at TP=2. fp8 + DSpark at
-            # TP=2 loses the device under concurrent mixed batches (BUGS.md
-            # bug-inkling2-fp8-kv-dspark-tp2-device-lost); every kernel passes in isolation.
-            raise ValueError("Inkling2 fp8 KV with DSpark is validated at TP=1 only; at TP>1 "
-                             "use fp8 without --speculative-config, or bf16 KV")
         self.register_buffer("kv_scale", torch.ones(1, dtype=torch.float32), persistent=False)
         self.kv_cache = torch.tensor([])
         _register(prefix, self)
@@ -163,6 +156,12 @@ class Inkling2ConvMetadataBuilder(ShortConvAttentionMetadataBuilder):
         n_tok = vllm_config.scheduler_config.max_num_batched_tokens
         self.seq_idx_buf = torch.zeros(n_tok, dtype=torch.int32, device=device)
         self.query_start_buf = torch.zeros(n_tok, dtype=torch.int32, device=device)
+        # Speculative decoding: per-request accepted counts. The runner passes a new tensor
+        # every step, and a PIECEWISE graph replays the conv kernel with the address it was
+        # captured with, so the kernel must always read this one buffer.
+        self.num_accepted_buf = (
+            torch.ones(vllm_config.scheduler_config.max_num_seqs, dtype=torch.int32,
+                       device=device) if self.num_spec_tokens > 0 else None)
         self.align = vllm_config.cache_config.mamba_cache_mode == "align"
 
     def build(self, common_prefix_len: int, common_attn_metadata: CommonAttentionMetadata,
@@ -173,6 +172,15 @@ class Inkling2ConvMetadataBuilder(ShortConvAttentionMetadataBuilder):
         n_pad = m.slot_mapping.shape[0]
         sconv_seq_metadata(m.query_start_loc, m.num_reqs, n_act, self.seq_idx_buf,
                            self.query_start_buf, n_pad)
+        acc = kw.get("num_accepted_tokens")
+        if self.num_accepted_buf is not None and acc is not None:
+            # all requests' counts (the base keeps a view of the decode rows only), so every
+            # row the kernel may read holds what the eager path would read
+            n = acc.shape[0]
+            assert n <= self.num_accepted_buf.shape[0], (n, self.num_accepted_buf.shape)
+            self.num_accepted_buf[:n].copy_(acc, non_blocking=True)
+            self.num_accepted_buf[n:].fill_(1)
+            md = replace(md, num_accepted_tokens=self.num_accepted_buf)
         return replace(md, seq_idx=self.seq_idx_buf[:n_pad],
                        query_start=self.query_start_buf[:n_pad],
                        query_start_loc=m.query_start_loc, block_table=m.block_table_tensor,
